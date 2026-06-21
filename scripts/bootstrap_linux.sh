@@ -29,8 +29,13 @@ rustup component add rustfmt clippy
 rustup toolchain install nightly --profile minimal
 rustup +nightly component add miri
 
-cargo install --locked just || true
-cargo install --locked cargo-audit cargo-deny cargo-nextest dprint typos-cli || true
+if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+  cargo install --locked just
+  cargo install --locked cargo-audit cargo-deny cargo-nextest dprint typos-cli
+else
+  cargo install --locked just || true
+  cargo install --locked cargo-audit cargo-deny cargo-nextest dprint typos-cli || true
+fi
 
 pipx ensurepath
 pipx install pre-commit || true
