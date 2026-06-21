@@ -1,0 +1,68 @@
+name: codeql
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 10 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: codeql
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Detect compiled languages
+        id: detect
+        shell: bash
+        run: |
+          languages=()
+          if git ls-files '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hpp' '*.hxx' 'CMakeLists.txt' 'cmake/**' | grep -q .; then
+            languages+=("c-cpp")
+          fi
+          if git ls-files '*.rs' 'Cargo.toml' 'Cargo.lock' | grep -q .; then
+            languages+=("rust")
+          fi
+          if [ "${#languages[@]}" -eq 0 ]; then
+            echo "has_languages=false" >> "$GITHUB_OUTPUT"
+            echo "No C/C++ or Rust files detected; skipping CodeQL analysis."
+          else
+            echo "has_languages=true" >> "$GITHUB_OUTPUT"
+            IFS=,
+            echo "languages=${languages[*]}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bootstrap Linux
+        if: steps.detect.outputs.has_languages == 'true'
+        run: ./scripts/bootstrap_linux.sh
+
+      - name: Initialize CodeQL
+        if: steps.detect.outputs.has_languages == 'true'
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ steps.detect.outputs.languages }}
+          queries: security-extended,security-and-quality
+
+      - name: Build C++ and Rust
+        if: steps.detect.outputs.has_languages == 'true'
+        run: |
+          if [ -f CMakeLists.txt ]; then
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+            cmake --build build
+          fi
+          if [ -f Cargo.toml ]; then
+            cargo build --all-features --locked
+          fi
+
+      - name: Perform CodeQL Analysis
+        if: steps.detect.outputs.has_languages == 'true'
+        uses: github/codeql-action/analyze@v3

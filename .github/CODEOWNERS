@@ -1,0 +1,12 @@
+# Build and CI ownership
+/.github/ @akhilnairCSE110
+/CMakeLists.txt @akhilnairCSE110
+/cmake/ @akhilnairCSE110
+/justfile @akhilnairCSE110
+/scripts/ @akhilnairCSE110
+
+# Core source
+/src/ @akhilnairCSE110
+/include/ @akhilnairCSE110
+/Cargo.toml @akhilnairCSE110
+/Cargo.lock @akhilnairCSE110
