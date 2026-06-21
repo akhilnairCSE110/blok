@@ -1,0 +1,1 @@
+LLM weights must be written to flash in large, sequential blocks. The storage path should prioritize high-throughput reads, reduced fragmentation, and predictable access patterns so the runtime can stream model data efficiently.

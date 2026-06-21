@@ -1,0 +1,1 @@
+This directory is where target models will be stored. Blok is an on-device runtime, so the models should ultimately live on the device and be organized for predictable local loading, caching, and execution.

@@ -1,0 +1,3 @@
+This directory will contain our runtime algorithms. The runtime work should converge around the same thesis: maximize large batched matrix multiplications, minimize memory movement, minimize data movement, make reads large, and use tiling when it improves locality or throughput.
+
+The priority is maximal compute utilization through compute-bound fused operations. This includes techniques such as continuous batching, fused-kernel attention, FlashAttention, speculative decoding, and Eagle 3 speculative decoding.
