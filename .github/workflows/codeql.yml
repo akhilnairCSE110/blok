@@ -26,7 +26,9 @@ jobs:
         shell: bash
         run: |
           languages=()
-          if git ls-files '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hpp' '*.hxx' 'CMakeLists.txt' 'cmake/**' | grep -q .; then
+          if git ls-files \
+            '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hpp' '*.hxx' \
+            'CMakeLists.txt' 'cmake/**' | grep -q .; then
             languages+=("c-cpp")
           fi
           if git ls-files '*.rs' 'Cargo.toml' 'Cargo.lock' | grep -q .; then

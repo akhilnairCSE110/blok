@@ -1,3 +1,5 @@
-The CPU should not remain idle. It should take over as much orchestration, preprocessing, scheduling, memory preparation, and runtime bookkeeping as possible so the GPU can stay focused on matrix multiplications.
+The CPU should not remain idle. It should take over orchestration, preprocessing, scheduling, memory
+preparation, and runtime bookkeeping so the GPU can stay focused on matrix multiplications.
 
-Many runtime algorithms will execute on the CPU. If the CPU is responsible for preparing data, organizing batches, managing transfers, and keeping queues full, the GPU can remain focused on sustained computation.
+Many runtime algorithms will execute on the CPU. If the CPU prepares data, organizes batches,
+manages transfers, and keeps queues full, the GPU can remain focused on sustained computation.

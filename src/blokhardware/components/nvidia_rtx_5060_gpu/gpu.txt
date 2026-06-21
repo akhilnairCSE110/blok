@@ -1,3 +1,11 @@
-We need to keep the GPU statically saturated at all times. GPU work should be organized so kernels remain compute-bound, queues stay full, and host-side stalls are minimized.
+We need to keep the GPU statically saturated at all times. GPU work should be organized so kernels
+remain compute-bound, queues stay full, and host-side stalls are minimized.
 
-GPUDirect Storage should be implemented where supported. PTX should be used for low-level GPU control when necessary, keeping the execution path as close to the hardware as practical while still operating within the Linux and CUDA stack.
+GPU Direct Storage should target uGDS first where supported. uGDS is the open-source path we will
+use for direct SSD-to-GPU DMA: user space builds NVMe commands, the kernel module handles PCI BAR
+mapping and GPU page pinning, and data moves between NVMe and GPU memory over PCIe without the
+kernel NVMe/filesystem path.
+
+NVIDIA GDS remains the comparison baseline for compatibility and benchmarking. PTX should be used
+for low-level GPU control when necessary, keeping the execution path close to the hardware while
+still operating within the Linux, NVIDIA driver, CUDA, and uGDS stack.

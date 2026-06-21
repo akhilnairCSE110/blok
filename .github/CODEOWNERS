@@ -4,6 +4,8 @@
 /cmake/ @akhilnairCSE110
 /justfile @akhilnairCSE110
 /scripts/ @akhilnairCSE110
+/docs/ @akhilnairCSE110
+/README.md @akhilnairCSE110
 
 # Core source
 /src/ @akhilnairCSE110
