@@ -60,7 +60,9 @@ jobs:
             cmake --build build
           fi
           if [ -f Cargo.toml ]; then
-            cargo build --all-features --locked
+            lock_flag=()
+            [ -f Cargo.lock ] && lock_flag+=(--locked)
+            cargo build --all-features "${lock_flag[@]}"
           fi
 
       - name: Perform CodeQL Analysis

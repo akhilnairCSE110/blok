@@ -30,7 +30,7 @@ jobs:
             ~/.cargo/git
             ~/.cargo/bin
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
             cargo-${{ runner.os }}-
 

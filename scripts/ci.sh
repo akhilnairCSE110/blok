@@ -109,8 +109,11 @@ cxx_linux() {
     run_if_available clang-tidy clang-tidy "${selected_files[@]}" -p build
   fi
 
-  if test -d src || test -d include; then
-    run_if_available cppcheck cppcheck --enable=warning,style,performance,portability --error-exitcode=1 --inline-suppr src include
+  local dirs=()
+  test -d src && dirs+=(src)
+  test -d include && dirs+=(include)
+  if [ "${#dirs[@]}" -gt 0 ]; then
+    run_if_available cppcheck cppcheck --enable=warning,style,performance,portability --error-exitcode=1 --inline-suppr "${dirs[@]}"
   fi
 
   ctest --test-dir build --output-on-failure
@@ -163,6 +166,10 @@ deps() {
     return 0
   fi
 
+  if [ ! -f Cargo.lock ]; then
+    echo "skip: no Cargo.lock"
+    return 0
+  fi
   run_if_available cargo-deny cargo deny check
   run_if_available cargo-audit cargo audit
 }
@@ -193,7 +200,9 @@ release_linux() {
   fi
 
   if has_cargo_project; then
-    cargo build --release --locked
+    local lock_flag=()
+    test -f Cargo.lock && lock_flag+=(--locked)
+    cargo build --release "${lock_flag[@]}"
   else
     echo "skip: no Cargo.toml"
   fi

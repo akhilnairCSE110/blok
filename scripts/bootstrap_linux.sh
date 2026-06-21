@@ -25,6 +25,9 @@ fi
 # shellcheck source=/dev/null
 source "$HOME/.cargo/env"
 
+if [ -n "${GITHUB_PATH:-}" ]; then
+  printf '%s\n' "$HOME/.cargo/bin" >>"$GITHUB_PATH"
+fi
 rustup component add rustfmt clippy
 rustup toolchain install nightly --profile minimal
 rustup +nightly component add miri
