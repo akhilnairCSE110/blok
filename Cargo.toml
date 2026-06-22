@@ -1,0 +1,16 @@
+[workspace]
+members = [".", "xtask"]
+resolver = "2"
+
+[package]
+name = "blok"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "SSD-resident inference runtime"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
