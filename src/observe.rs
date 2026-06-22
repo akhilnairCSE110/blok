@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::{Graph, Manifest, RuntimeConfig};
+use crate::{FetchPlan, Graph, Manifest, RuntimeConfig};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerateIntent {
@@ -15,6 +15,7 @@ pub struct CommandReport {
     status: &'static str,
     decision: &'static str,
     generate: Option<GenerateIntent>,
+    fetch: Option<String>,
     manifest: Option<String>,
     config: RuntimeConfig,
 }
@@ -26,8 +27,33 @@ impl CommandReport {
             status: "ok",
             decision: "diagnostic_only_no_payload_bytes_touched",
             generate: None,
+            fetch: None,
             manifest: None,
             config,
+        }
+    }
+
+    pub fn fetch(config: &RuntimeConfig, plan: &FetchPlan) -> Self {
+        Self {
+            command: "fetch",
+            status: "running",
+            decision: "download_full_kimi_k2_6_to_nvme_with_hf_xet",
+            generate: None,
+            fetch: Some(format!(
+                concat!(
+                    "{{\"repo\":{},\"revision\":{},\"local_dir\":{},\"cache_dir\":{},",
+                    "\"expected_bytes\":{},\"files\":{},\"safetensors\":{}}}"
+                ),
+                j(plan.repo),
+                j(plan.revision),
+                j(&plan.local_dir.display().to_string()),
+                j(&plan.cache_dir.display().to_string()),
+                plan.expected_bytes,
+                plan.files,
+                plan.safetensors
+            )),
+            manifest: None,
+            config: config.clone(),
         }
     }
 
@@ -37,6 +63,7 @@ impl CommandReport {
             status: "ok",
             decision: "metadata_only_payload_bytes_not_touched",
             generate: None,
+            fetch: None,
             manifest: Some(format!(
                 concat!(
                     "{{\"architecture\":{},\"layout\":{},\"tensors\":{},",
@@ -61,6 +88,7 @@ impl CommandReport {
             status: "blocked",
             decision: "manifest_layout_and_direct_io_are_required_before_payload_reads",
             generate: Some(generate),
+            fetch: None,
             manifest: None,
             config,
         }
@@ -79,13 +107,17 @@ impl CommandReport {
             .manifest
             .as_ref()
             .map_or(String::new(), |m| format!(",\"manifest\":{m}"));
+        let fetch = self
+            .fetch
+            .as_ref()
+            .map_or(String::new(), |f| format!(",\"fetch\":{f}"));
 
         format!(
             concat!(
                 "{{\"schema_version\":1,\"crate\":\"blok\",\"version\":{},",
                 "\"command\":{},\"status\":{},\"decision\":{},",
                 "\"config\":{{\"blok_home\":{},\"model_root\":{},\"report_root\":{},",
-                "\"strict_direct_io\":{}}},\"target_host\":{}{}{} }}"
+                "\"strict_direct_io\":{}}},\"target_host\":{}{}{}{} }}"
             ),
             j(env!("CARGO_PKG_VERSION")),
             j(self.command),
@@ -96,6 +128,7 @@ impl CommandReport {
             j(&self.config.report_root.display().to_string()),
             self.config.strict_direct_io,
             target_host_json(),
+            fetch,
             manifest,
             generate
         )
