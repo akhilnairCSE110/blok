@@ -1,0 +1,18 @@
+Checks: >
+  bugprone-*,
+  clang-analyzer-*,
+  cppcoreguidelines-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*
+WarningsAsErrors: >
+  bugprone-*,
+  clang-analyzer-*,
+  performance-*,
+  portability-*
+HeaderFilterRegex: '^(src|include)/'
+FormatStyle: file
+CheckOptions:
+  - key: readability-identifier-length.IgnoredParameterNames
+    value: '^[a-z]$'

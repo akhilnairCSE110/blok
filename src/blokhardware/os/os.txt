@@ -1,3 +1,11 @@
-I will be installing the latest Ubuntu release, Ubuntu 26.04. All agent work should assume this operating system target and remain compatible with its kernel, driver, package, and filesystem conventions.
+I will be installing the latest Ubuntu release, Ubuntu 26.04. All agent work should assume this
+operating system target and remain compatible with its kernel, driver, package, and filesystem
+conventions.
 
-The original direction was to run completely bare metal, but Linux provides useful scheduling, memory, storage, and driver optimizations that we should take advantage of where they improve throughput without weakening the low-level hardware control goals.
+The original direction was to run completely bare metal, but Linux provides useful scheduling,
+memory, storage, and driver optimizations that we should take advantage of where they improve
+throughput without weakening the low-level hardware control goals.
+
+System setup requirements live in docs/system-requirements.md. Keep CI bootstrap focused on
+developer/build tools; hardware drivers, firmware tools, CUDA, and uGDS belong in the machine
+provisioning path.

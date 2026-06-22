@@ -1,3 +1,6 @@
-This directory will store auxiliary models related to the runtime pipeline, such as Eagle 3 speculative decoding models, predictive memory models, and other supporting checkpoints.
+This directory will store auxiliary models related to the runtime pipeline, such as Eagle 3
+speculative decoding models, predictive memory models, and other supporting checkpoints.
 
-These are checkpoints for AI models that the runtime actively uses internally. They are not the target models served directly to the user; they support the serving pipeline by improving prediction, scheduling, memory behavior, or decoding throughput.
+These are checkpoints for AI models that the runtime actively uses internally. They are not the
+target models served directly to the user; they support the serving pipeline by improving
+prediction, scheduling, memory behavior, or decoding throughput.
