@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::RuntimeConfig;
+use crate::{Graph, Manifest, RuntimeConfig};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerateIntent {
@@ -15,6 +15,7 @@ pub struct CommandReport {
     status: &'static str,
     decision: &'static str,
     generate: Option<GenerateIntent>,
+    manifest: Option<String>,
     config: RuntimeConfig,
 }
 
@@ -25,6 +26,31 @@ impl CommandReport {
             status: "ok",
             decision: "diagnostic_only_no_payload_bytes_touched",
             generate: None,
+            manifest: None,
+            config,
+        }
+    }
+
+    pub fn inspect(config: RuntimeConfig, manifest: &Manifest, graph: &Graph) -> Self {
+        Self {
+            command: "inspect",
+            status: "ok",
+            decision: "metadata_only_payload_bytes_not_touched",
+            generate: None,
+            manifest: Some(format!(
+                concat!(
+                    "{{\"architecture\":{},\"layout\":{},\"tensors\":{},",
+                    "\"payload_bytes\":{},\"max_alignment\":{},",
+                    "\"graph_ops\":{},\"graph_payload_bytes\":{}}}"
+                ),
+                j(manifest.architecture.as_str()),
+                j(manifest.layout.as_str()),
+                manifest.tensors.len(),
+                manifest.payload_bytes(),
+                manifest.max_alignment(),
+                graph.ops.len(),
+                graph.payload_bytes()
+            )),
             config,
         }
     }
@@ -35,6 +61,7 @@ impl CommandReport {
             status: "blocked",
             decision: "manifest_layout_and_direct_io_are_required_before_payload_reads",
             generate: Some(generate),
+            manifest: None,
             config,
         }
     }
@@ -48,13 +75,17 @@ impl CommandReport {
                 g.tokens
             )
         });
+        let manifest = self
+            .manifest
+            .as_ref()
+            .map_or(String::new(), |m| format!(",\"manifest\":{m}"));
 
         format!(
             concat!(
                 "{{\"schema_version\":1,\"crate\":\"blok\",\"version\":{},",
                 "\"command\":{},\"status\":{},\"decision\":{},",
                 "\"config\":{{\"blok_home\":{},\"model_root\":{},\"report_root\":{},",
-                "\"strict_direct_io\":{}}},\"target_host\":{}{} }}"
+                "\"strict_direct_io\":{}}},\"target_host\":{}{}{} }}"
             ),
             j(env!("CARGO_PKG_VERSION")),
             j(self.command),
@@ -65,6 +96,7 @@ impl CommandReport {
             j(&self.config.report_root.display().to_string()),
             self.config.strict_direct_io,
             target_host_json(),
+            manifest,
             generate
         )
     }

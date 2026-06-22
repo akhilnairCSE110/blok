@@ -1,9 +1,9 @@
 # Source Plan
 
-`src/` is currently a planning surface, not executable code. The first code pass creates one Rust
-crate named `blok` plus one `xtask` package. Until then, subsystem directories hold structured
-plans that must be converted into module docs, types, probes, reports, and tests as implementation
-lands.
+`src/` now contains the first executable Rust surface. The current code owns CLI validation,
+configuration, typed errors, deterministic reports, normalized manifest parsing, and first-token
+graph descriptors. Subsystem directories still hold structured plans that must be converted into
+module docs, types, probes, reports, and tests only as implementation lands.
 
 ## Requirements To Question
 
@@ -21,16 +21,18 @@ lands.
 - Automate static rejection of payload `mmap`, unbounded hot-path allocation, accidental f16 on
   `sm_120`, and hidden staged I/O.
 
-## First Code Shape
+## Current Code Shape
 
 - `src/main.rs`: CLI only.
 - `src/lib.rs`: crate invariants and module exports.
 - `src/config.rs`: typed constants and environment parsing.
 - `src/error.rs`: capability, validation, I/O, CUDA, graph, and layout errors.
 - `src/observe.rs`: deterministic report schemas.
+- `src/manifest.rs`: normalized sidecar manifest parser and validator.
+- `src/graph.rs`: first-token declared working-set descriptors.
 
-Do not create CUDA, I/O, manifest, layout, or decode files until the typed report/error/config
-foundation exists.
+Do not create CUDA, I/O, layout, arena, or decode files until the descriptor boundary they own is
+real and tested.
 
 ## Gate
 

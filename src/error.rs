@@ -8,6 +8,7 @@ pub enum Error {
     Capability(&'static str),
     Cli(String),
     Config(String),
+    Manifest(String),
     Io(io::Error),
 }
 
@@ -17,6 +18,7 @@ impl Error {
             Self::Cli(_) => 64,
             Self::Config(_) => 78,
             Self::Capability(_) => 78,
+            Self::Manifest(_) => 65,
             Self::Io(_) => 74,
         }
     }
@@ -28,6 +30,7 @@ impl Display for Error {
             Self::Capability(code) => write!(f, "capability error: {code}"),
             Self::Cli(message) => write!(f, "cli error: {message}"),
             Self::Config(message) => write!(f, "config error: {message}"),
+            Self::Manifest(message) => write!(f, "manifest error: {message}"),
             Self::Io(error) => write!(f, "io error: {error}"),
         }
     }

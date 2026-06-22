@@ -1,22 +1,27 @@
 pub mod config;
 pub mod error;
+pub mod graph;
+pub mod manifest;
 pub mod observe;
 
 use std::ffi::OsString;
+use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
 pub use config::RuntimeConfig;
 pub use error::{Error, Result};
+pub use graph::Graph;
+pub use manifest::Manifest;
 pub use observe::{CommandReport, GenerateIntent};
 
-const USAGE: &str =
-    "usage: blok {doctor|report|generate --model <path> --prompt <text> --tokens <count>}\n";
+const USAGE: &str = "usage: blok {doctor|report|inspect --manifest <path>|generate --model <path> --prompt <text> --tokens <count>}\n";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
     Doctor,
     Report,
+    Inspect(PathBuf),
     Generate(GenerateIntent),
     Help,
     Version,
@@ -37,6 +42,14 @@ where
         }
         Command::Report => {
             write_report(out, CommandReport::ok("report", RuntimeConfig::from_env()?))
+        }
+        Command::Inspect(path) => {
+            let manifest = Manifest::parse(&fs::read_to_string(path)?)?;
+            let graph = Graph::first_token(&manifest);
+            write_report(
+                out,
+                CommandReport::inspect(RuntimeConfig::from_env()?, &manifest, &graph),
+            )
         }
         Command::Generate(intent) => {
             write_report(
@@ -70,6 +83,7 @@ where
         "-V" | "--version" | "version" => Ok(Command::Version),
         "doctor" => no_trailing(args, Command::Doctor),
         "report" => no_trailing(args, Command::Report),
+        "inspect" => parse_inspect(args),
         "generate" => parse_generate(args),
         other => Err(Error::Cli(format!("unknown command: {other}"))),
     }
@@ -86,6 +100,17 @@ where
         )));
     }
     Ok(command)
+}
+
+fn parse_inspect<I>(args: I) -> Result<Command>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    match (args.next(), args.next(), args.next()) {
+        (Some(flag), Some(path), None) if flag == "--manifest" => Ok(Command::Inspect(path.into())),
+        _ => Err(Error::Cli("inspect requires --manifest <path>".to_owned())),
+    }
 }
 
 fn parse_generate<I>(args: I) -> Result<Command>

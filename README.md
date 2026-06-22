@@ -29,10 +29,11 @@ memory use, and no hidden payload `mmap` or page-cache path.
 
 ## Development State
 
-This repository is intentionally pre-code. The current task is to iterate the granular plans until
-the requirements are questioned, simplified, sourced, and measurable. The next code pass creates one
-Rust crate named `blok` plus `xtask`, preserving the current `just` and `scripts/ci.sh` entry
-points.
+This repository now has the first executable Rust crate named `blok` plus `xtask`, preserving the
+current `just` and `scripts/ci.sh` entry points. The implemented surface is intentionally narrow:
+`doctor` and `report` emit deterministic JSON context; `inspect --manifest <path>` validates
+metadata and compiles first-token graph descriptors without touching payload bytes; `generate`
+validates the user intent and blocks until manifest, layout, arena, and I/O descriptors are present.
 
 Do not add passive placeholder modules. Every new source file must define a real type, command,
 report, parser, probe, or test used by the current milestone.
