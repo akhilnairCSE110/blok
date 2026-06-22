@@ -14,7 +14,7 @@ Recommended:
 - AMD uProf for CPU profiling
 - AOCC only if compiler benchmarking shows a measurable win over Clang/GCC
 
-## GPU: NVIDIA RTX 5060
+## GPU: NVIDIA RTX 5060 Ti
 
 Required:
 - NVIDIA GPU driver with open kernel modules, version 550 or newer
@@ -31,7 +31,7 @@ Required for uGDS:
 Compatibility baseline:
 - NVIDIA GDS/cuFile for side-by-side validation against uGDS
 
-## Storage: Samsung EVO NVMe
+## Storage: Samsung PM9C1a / 990 EVO Plus NVMe
 
 Required:
 - `nvme-cli`
@@ -64,3 +64,16 @@ Required:
 - `shfmt`
 
 Rust/dev tools are installed by `scripts/bootstrap_linux.sh`.
+
+## Provisioning References
+
+- NVIDIA GDS overview and O_DIRECT behavior:
+  https://docs.nvidia.com/gpudirect-storage/overview-guide/index.html
+- CUDA documentation:
+  https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html
+- ScaleX-IO uGDS:
+  https://github.com/ScaleX-IO/uGDS
+- Ubuntu packages:
+  https://packages.ubuntu.com/
+- Rust installation:
+  https://rustup.rs/

@@ -1,49 +1,47 @@
-# blok
+# Blok
 
-Key architecture insights:
-1. Transformer inference is deterministic at the graph and tensor-operation level. Runtime work
-   should exploit that determinism instead of treating inference like an unpredictable control-flow
-   problem.
+Blok is an SSD-resident inference runtime. Model weights, prompts, KV state, auxiliary runtime
+checkpoints, layout indexes, and benchmark artifacts live on NVMe by default. GPU VRAM and system
+RAM are scratchpads for a deterministic execution schedule.
 
-2. The useful work in inference is multiplication of activations against model weights. The runtime
-   should fuse operations, predict data movement, and create large saturated batches that maximize
-   math while minimizing weight movement.
+The central bet is simple: transformer inference is deterministic enough to schedule payload
+movement before compute needs it. Blok should store tensors in flash-friendly layouts, move only the
+bytes required by the current graph, use sparsity where it reduces total wall time, fuse operations
+aggressively, and keep the GPU compute-bound instead of depending on whole-model memory residency.
 
-3. Input tokens, output tokens, and model size will all grow. The pipeline must optimize for prompt
-   length, generation length, weight size, and KV cache size together.
+The first target is:
 
-4. Model data (KV cache, prompts, model weights, etc.) should be stored on NVMe by default, not
-   assumed to fit in memory. The winning strategy is first-principles scheduling: model weights are
-   already stored in NVMe flash, prompts can be staged there, and the KV cache can spill there.
-   Linear optimization should schedule tensor placement and movement across GPU, CPU, and disk, as
-   demonstrated by FlexGen.
-   The GPU should stay compute-bound through up-front scheduling, and system memory plus VRAM should
-   act as scratchpad capacity that supports the NVMe-backed execution plan.
+```sh
+blok generate --model <huge-moe-model> --prompt "Hi" --tokens 1
+```
 
-5. Memory (GPU VRAM, system LPDDR/DRAM) should be scratchpad capacity for scheduled NVMe-to-GPU
-   pipelines. The preferred GDS path is the open-source uGDS stack from ScaleX-IO, which provides a
-   user-space GPU Direct Storage path where the CPU constructs NVMe commands and the SSD DMAs
-   directly to and from GPU memory. NVIDIA GDS remains useful as a compatibility baseline, but the
-   repo target is uGDS where the hardware and kernel driver state support it.
+That command must emit one token on the Linux target with measured NVMe-to-VRAM bytes, kernel time,
+memory use, and no hidden payload `mmap` or page-cache path.
 
-6. NVMe SSDs are strongest at large, sequential, batched reads compared with random reads. AI
-   serving should not blindly generate random IO; deterministic inference lets us lay out model
-   weights and runtime pipelines for predictable flash access. Apple's "LLM in a flash" paper is the
-   reference for reducing transferred data and reading larger contiguous chunks from flash.
+## Source of Truth
 
-7. NVMe SSDs can use RAID-style layouts when they provide useful parallelism, but the first
-   requirement is predictable device ownership and measurable sequential bandwidth.
+- [Plan index](docs/plan-index.md): granular subsystem plans and the development method.
+- [Golden implementation plan](docs/06_21_plan.md): target, invariants, research notes, milestone
+  gates, and implementation order.
+- [System requirements](docs/system-requirements.md): Ubuntu, CUDA, uGDS, NVMe, and build-tool
+  prerequisites.
+- [scripts/ci.sh](scripts/ci.sh): local and CI command surface used by `just`.
 
-8. CUDA is the default integration layer. PTX and inline PTX are reserved for narrow hot paths where
-   generated code blocks the execution model we need.
+## Development State
 
-9. The GPU has enough compute and the SSD has enough storage. The runtime should schedule work up
-   front, limit memory movement, and run safely instead of depending on whole-model memory residency.
+This repository is intentionally pre-code. The current task is to iterate the granular plans until
+the requirements are questioned, simplified, sourced, and measurable. The next code pass creates one
+Rust crate named `blok` plus `xtask`, preserving the current `just` and `scripts/ci.sh` entry
+points.
 
-10. Keep the codebase tight. Whenever code is added, look for stale or redundant lines to remove.
-    Every line should carry architectural or product weight.
+Do not add passive placeholder modules. Every new source file must define a real type, command,
+report, parser, probe, or test used by the current milestone.
 
-Core references:
+## Core References
+
 - uGDS: https://github.com/ScaleX-IO/uGDS
+- NVIDIA GDS: https://docs.nvidia.com/gpudirect-storage/overview-guide/index.html
 - FlexGen: https://arxiv.org/abs/2303.06865
 - LLM in a flash: https://arxiv.org/abs/2312.11514
+- FlashAttention: https://arxiv.org/abs/2205.14135
+- PagedAttention: https://arxiv.org/abs/2309.06180
