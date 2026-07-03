@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-import json, os, subprocess, sys
+# 1. Avoid tiny random reads: model storage must favor large aligned sequential chunks because flash latency to first byte dominates small I/O.
+# 2. Keep dense weights resident: embeddings and attention weights are DRAM/VRAM candidates, while sparse FFN and expert weights are flash-resident.
+# 3. Predict before fetching: activation sparsity only helps if a cheap predictor names active neurons before their FFN weights are read.
+# 4. Bundle by neuron: each active FFN neuron should map to one contiguous row-column block containing its up/gate input slice and down output slice.
+# 5. Do not bundle by coactivation until measured: popular neurons create redundant reads and can make nearest-neighbor bundling slower.
+# 6. Preallocate runtime slots: streamed neuron blocks move into fixed arenas with pointer maps and last-k activity state, never hot-path allocation.
+# 7. Separate acquisition from execution: downloading may be naive, but layout metadata must preserve enough tensor identity for later repacking.
+import json, os, re, struct, subprocess, sys
 from pathlib import Path
 
 MODELS = {
@@ -7,7 +14,7 @@ MODELS = {
 }
 
 def die():
-    print(f"usage: {sys.argv[0]} kimi-k2.6 {{plan|status|fetch|detach}}", file=sys.stderr)
+    print(f"usage: {sys.argv[0]} kimi-k2.6 {{plan|status|fetch|detach|layout}}", file=sys.stderr)
     raise SystemExit(64)
 
 def ctx(name):
@@ -39,11 +46,49 @@ def fetch(c):
                     "--local-dir", str(c["local_dir"])], check=True, env=env)
     (c["meta_dir"] / "fetch-status.json").write_text(json.dumps(status(c), separators=(",", ":")) + "\n")
 
+def headers(c):
+    out = {}
+    for p in c["local_dir"].glob("*.safetensors"):
+        with p.open("rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            h = json.loads(f.read(n))
+        out |= {k: dict(file=str(p), dtype=v["dtype"], shape=v["shape"],
+                        offsets=v["data_offsets"]) for k, v in h.items() if k != "__metadata__"}
+    return out
+
+def kind(t):
+    if any(x in t for x in ("q_proj","k_proj","v_proj","o_proj","q_a_proj","q_b_proj","kv_a_proj","kv_b_proj")): return "attention_dram"
+    if any(x in t for x in ("up_proj","gate_proj","w1","w3")): return "ffn_up_flash"
+    if any(x in t for x in ("down_proj","w2")): return "ffn_down_flash"
+    return "resident_or_aux"
+
+def group(t):
+    layer = re.search(r"layers?\.(\d+)", t)
+    expert = re.search(r"experts?\.(\d+)", t)
+    return (layer.group(1) if layer else "-", expert.group(1) if expert else "-")
+
+def layout(c):
+    h, groups = headers(c), {}
+    for t in h: groups.setdefault(group(t), {}).setdefault(kind(t), []).append(t)
+    bundles = [dict(layer=k[0], expert=k[1], up=v.get("ffn_up_flash", []),
+                    down=v.get("ffn_down_flash", []), layout="row_column_bundle")
+               for k, v in groups.items() if v.get("ffn_up_flash") and v.get("ffn_down_flash")]
+    plan = dict(model=c["model"], source=str(c["local_dir"]), policy=dict(
+        attention="dram_resident", ffn="flash_resident_row_column_bundle",
+        experts="expert_contiguous", cache="sliding_window_static_slots"),
+        tensors=len(h), bytes=sum(v["offsets"][1]-v["offsets"][0] for v in h.values()),
+        bundles=bundles)
+    if h:
+        c["meta_dir"].mkdir(parents=True, exist_ok=True)
+        (c["meta_dir"] / "layout-plan.json").write_text(json.dumps(plan, separators=(",", ":")) + "\n")
+    return plan
+
 def main():
     if len(sys.argv) != 3: die()
     c, mode = ctx(sys.argv[1]), sys.argv[2]
     if mode in ("plan", "status"): print(json.dumps(status(c), separators=(",", ":")))
     elif mode == "fetch": fetch(c); print(json.dumps(status(c), separators=(",", ":")))
+    elif mode == "layout": print(json.dumps(layout(c), separators=(",", ":")))
     elif mode == "detach":
         c["meta_dir"].mkdir(parents=True, exist_ok=True)
         log = open(c["meta_dir"] / "fetch.log", "ab")
