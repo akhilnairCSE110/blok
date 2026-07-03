@@ -47,9 +47,9 @@ fn host(sandboxed: bool) -> String {
             "{{\"hostname\":{},\"os\":{},\"kernel\":{},\"sandboxed\":{},",
             "\"probe_utc\":{}}}"
         ),
-        q(trimmed("/proc/sys/kernel/hostname")),
+        q(&trimmed("/proc/sys/kernel/hostname")),
         q(&os()),
-        q(trimmed("/proc/sys/kernel/osrelease")),
+        q(&trimmed("/proc/sys/kernel/osrelease")),
         sandboxed,
         q(&format!(
             "unix:{}",
@@ -72,7 +72,7 @@ fn cpu(cpuinfo: &str) -> String {
         concat!(
             "{{\"model\":{},\"vendor\":{},\"sockets\":{},\"physical_cores\":{},",
             "\"logical_cpus\":{},\"numa_nodes\":{},\"frequency_governor\":{},",
-            "\"scaling_driver\":{},\"ccd_plan\":{}}}"
+            "\"scaling_driver\":{},\"isolated_cpus\":{},\"ccd_plan\":{}}}"
         ),
         q(&model),
         q(&vendor),
@@ -80,12 +80,13 @@ fn cpu(cpuinfo: &str) -> String {
         physical,
         logical,
         dir_count("/sys/devices/system/node", "node").max(1),
-        q(trimmed(
-            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+        q(&trimmed(
+            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
         )),
-        q(trimmed(
-            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_driver"
+        q(&trimmed(
+            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_driver",
         )),
+        opt_q(Some(&trimmed("/sys/devices/system/cpu/isolated"))),
         q(if vendor == "AuthenticAMD" && physical >= 16 {
             "ccd0_cuda_submission_ccd1_io_polling"
         } else {
@@ -113,7 +114,9 @@ fn gpu_json(gpu: Option<&PathBuf>, smi: Option<&SmiGpu>) -> String {
         .unwrap_or_else(|| lspci_label(bdf));
     format!(
         concat!(
-            "{{\"pci_bdf\":{},\"name\":{},\"device_id\":{},\"kernel_driver\":{},",
+            "{{\"pci_bdf\":{},\"name\":{},\"vendor_id\":{},\"device_id\":{},",
+            "\"subsystem_vendor_id\":{},\"subsystem_device_id\":{},\"numa_node\":{},",
+            "\"local_cpulist\":{},\"kernel_driver\":{},",
             "\"nvidia_module_version\":{},\"nvidia_smi_ok\":{},",
             "\"compute_capability\":{},\"vram_bytes\":{},\"pcie_link_gen\":{},",
             "\"pcie_link_width\":{},\"pcie_max_link_gen\":{},\"pcie_max_link_width\":{},",
@@ -121,9 +124,14 @@ fn gpu_json(gpu: Option<&PathBuf>, smi: Option<&SmiGpu>) -> String {
         ),
         q(bdf),
         q(&name),
+        q(&p.map_or(String::new(), |p| trimmed_path(&p.join("vendor")))),
         q(&device),
-        q(p.and_then(driver).unwrap_or("")),
-        q(module_version()),
+        q(&p.map_or(String::new(), |p| trimmed_path(&p.join("subsystem_vendor")))),
+        q(&p.map_or(String::new(), |p| trimmed_path(&p.join("subsystem_device")))),
+        p.map_or("null".to_owned(), |p| trimmed_path(&p.join("numa_node"))),
+        opt_q(p.map(|p| trimmed_path(&p.join("local_cpulist"))).as_deref()),
+        q(&p.and_then(driver).unwrap_or_default()),
+        q(&module_version()),
         smi.is_some(),
         opt_q(smi.map(|s| s.compute.as_str())),
         smi.map_or("null".to_owned(), |s| (s.vram_mib * 1024 * 1024)
@@ -172,9 +180,11 @@ fn nvme(mounts: &[(String, String)]) -> Vec<String> {
         out.push(format!(
             concat!(
                 "{{\"pci_bdf\":{},\"block\":{},\"model\":{},\"controller\":{},",
-                "\"kernel_driver\":{},",
+                "\"vendor_id\":{},\"device_id\":{},\"numa_node\":{},",
+                "\"local_cpulist\":{},\"kernel_driver\":{},",
                 "\"mountpoints\":[{}],\"logical_block_bytes\":{},",
-                "\"physical_block_bytes\":{},\"pcie_link_gen\":{},\"pcie_link_width\":{},",
+                "\"physical_block_bytes\":{},\"read_ahead_kb\":{},\"nr_requests\":{},",
+                "\"scheduler\":{},\"write_cache\":{},\"pcie_link_gen\":{},\"pcie_link_width\":{},",
                 "\"pcie_max_link_gen\":{},\"pcie_max_link_width\":{},",
                 "\"role\":{},\"ugds_rebind_allowed\":{}}}"
             ),
@@ -184,10 +194,27 @@ fn nvme(mounts: &[(String, String)]) -> Vec<String> {
             q(&pci.as_ref().map_or(String::new(), |p| {
                 lspci_label(file_name(p).unwrap_or(""))
             })),
-            q(pci.as_deref().and_then(driver).unwrap_or("")),
+            q(&pci
+                .as_ref()
+                .map_or(String::new(), |p| { trimmed_path(&p.join("vendor")) })),
+            q(&pci
+                .as_ref()
+                .map_or(String::new(), |p| { trimmed_path(&p.join("device")) })),
+            pci.as_ref()
+                .map_or("null".to_owned(), |p| trimmed_path(&p.join("numa_node"))),
+            opt_q(
+                pci.as_ref()
+                    .map(|p| trimmed_path(&p.join("local_cpulist")))
+                    .as_deref()
+            ),
+            q(&pci.as_deref().and_then(driver).unwrap_or_default()),
             mps.join(","),
             num_or_null(&dev.join("queue/logical_block_size")),
             num_or_null(&dev.join("queue/physical_block_size")),
+            num_or_null(&dev.join("queue/read_ahead_kb")),
+            num_or_null(&dev.join("queue/nr_requests")),
+            q(&trimmed_path(&dev.join("queue/scheduler"))),
+            q(&trimmed_path(&dev.join("queue/write_cache"))),
             opt_q(
                 pci.as_ref()
                     .map(|p| trimmed_path(&p.join("current_link_speed")))
@@ -405,11 +432,12 @@ fn module(modules: &str, name: &str) -> &'static str {
     }
 }
 
-fn module_version() -> &'static str {
+fn module_version() -> String {
     trimmed("/proc/driver/nvidia/version")
         .split_whitespace()
         .find(|s| s.chars().next().is_some_and(|c| c.is_ascii_digit()))
         .unwrap_or("")
+        .to_owned()
 }
 
 fn cmd(name: &str) -> &'static str {
@@ -418,11 +446,10 @@ fn cmd(name: &str) -> &'static str {
         .map_or("missing", |_| "present")
 }
 
-fn driver(path: &Path) -> Option<&str> {
+fn driver(path: &Path) -> Option<String> {
     fs::read_link(path.join("driver"))
         .ok()
         .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-        .map(|s| Box::leak(s.into_boxed_str()) as &str)
 }
 
 fn file_name(path: &Path) -> Option<&str> {
@@ -444,10 +471,8 @@ fn num_or_null(path: &Path) -> String {
         .map_or("null".to_owned(), |n| n.to_string())
 }
 
-fn trimmed(path: &str) -> &'static str {
-    read(path)
-        .map(|s| Box::leak(s.trim().to_owned().into_boxed_str()) as &str)
-        .unwrap_or("")
+fn trimmed(path: &str) -> String {
+    read(path).map(|s| s.trim().to_owned()).unwrap_or_default()
 }
 
 fn trimmed_path(path: &Path) -> String {
