@@ -3,3 +3,5 @@ build/
 build-*/
 dist/
 target/
+__pycache__/
+*.pyc

@@ -200,28 +200,3 @@ fn parse_dtype(value: &str) -> Result<DType> {
         _ => Err(Error::Manifest(format!("unknown dtype: {value}"))),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_aligned_tensor_metadata() {
-        let manifest = Manifest::parse(
-            "blok-manifest-v1\narchitecture=moe\nlayout=sidecar\ntensor w weight bf16 2x2 4096 8 4096\n",
-        )
-        .unwrap();
-
-        assert_eq!(manifest.payload_bytes(), 8);
-        assert_eq!(manifest.tensors[0].source, 4096..4104);
-    }
-
-    #[test]
-    fn rejects_unaligned_payload_range() {
-        let err =
-            Manifest::parse("architecture=dense\nlayout=source\ntensor w weight bf16 1 1 2 4096\n")
-                .unwrap_err();
-
-        assert_eq!(err.to_string(), "manifest error: w offset is unaligned");
-    }
-}

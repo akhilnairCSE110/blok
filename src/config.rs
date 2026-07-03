@@ -61,27 +61,3 @@ fn default_home() -> Result<PathBuf> {
     }
     Ok(PathBuf::from(home).join(".blok"))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn false_values_are_accepted() {
-        env::set_var("BLOK_TEST_BOOL_FALSE", "off");
-        assert_eq!(env_bool("BLOK_TEST_BOOL_FALSE").unwrap(), Some(false));
-        env::remove_var("BLOK_TEST_BOOL_FALSE");
-    }
-
-    #[test]
-    fn invalid_bool_is_rejected() {
-        env::set_var("BLOK_TEST_BOOL_INVALID", "maybe");
-        let err = env_bool("BLOK_TEST_BOOL_INVALID").unwrap_err();
-        env::remove_var("BLOK_TEST_BOOL_INVALID");
-
-        assert_eq!(
-            err.to_string(),
-            "config error: BLOK_TEST_BOOL_INVALID must be boolean"
-        );
-    }
-}

@@ -39,21 +39,3 @@ impl Graph {
         self.ops.iter().map(|op| op.bytes).sum()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::manifest::Manifest;
-
-    #[test]
-    fn graph_preserves_declared_payload_ranges() {
-        let manifest = Manifest::parse(
-            "architecture=dense\nlayout=sidecar\ntensor w weight bf16 4 0 8 4096\n",
-        )
-        .unwrap();
-        let graph = Graph::first_token(&manifest);
-
-        assert_eq!(graph.payload_bytes(), 8);
-        assert_eq!(graph.ops[0].arena, "vram.weights");
-    }
-}

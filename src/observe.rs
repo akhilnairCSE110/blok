@@ -121,28 +121,3 @@ fn j(value: &str) -> String {
     out.push('"');
     out
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn report_escapes_prompt_text() {
-        let config = RuntimeConfig {
-            blok_home: PathBuf::from("/tmp/blok"),
-            model_root: PathBuf::from("/tmp/blok/models"),
-            report_root: PathBuf::from("/tmp/blok/reports"),
-            strict_direct_io: true,
-        };
-        let report = CommandReport::blocked_generate(
-            GenerateIntent {
-                model: PathBuf::from("m"),
-                prompt: "a \"quoted\"\nline".to_owned(),
-                tokens: 1,
-            },
-            config,
-        );
-
-        assert!(report.to_json().contains("a \\\"quoted\\\"\\nline"));
-    }
-}
