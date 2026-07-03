@@ -1,11 +1,10 @@
 pub mod config;
 pub mod error;
 pub mod graph;
+pub mod hardware;
 pub mod manifest;
 pub mod observe;
-pub mod storage;
 
-use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
@@ -14,28 +13,20 @@ use std::path::PathBuf;
 pub use config::RuntimeConfig;
 pub use error::{Error, Result};
 pub use graph::Graph;
+pub use hardware::HardwareReport;
 pub use manifest::Manifest;
 pub use observe::{CommandReport, GenerateIntent};
-pub use storage::FetchPlan;
 
-const USAGE: &str = "usage: blok {doctor|report|fetch kimi-k2.6|inspect --manifest <path>|generate --model <path> --prompt <text> --tokens <count>}\n";
+const USAGE: &str = "usage: blok {doctor|report|inspect --manifest <path>|generate --model <path> --prompt <text> --tokens <count>}\n";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
     Doctor,
     Report,
-    FetchKimi(FetchMode),
     Inspect(PathBuf),
     Generate(GenerateIntent),
     Help,
     Version,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FetchMode {
-    Blocking,
-    Detached,
-    Status,
 }
 
 pub fn run<I, W>(args: I, out: &mut W) -> Result<()>
@@ -53,37 +44,6 @@ where
         }
         Command::Report => {
             write_report(out, CommandReport::ok("report", RuntimeConfig::from_env()?))
-        }
-        Command::FetchKimi(FetchMode::Blocking) => {
-            let config = RuntimeConfig::from_env()?;
-            let plan = FetchPlan::kimi(&config);
-            write_report(out, CommandReport::fetch(&config, &plan))?;
-            storage::fetch_kimi(&config, &hf_bin())
-        }
-        Command::FetchKimi(FetchMode::Detached) => {
-            let config = RuntimeConfig::from_env()?;
-            let plan = FetchPlan::kimi(&config);
-            write_report(out, CommandReport::fetch(&config, &plan))?;
-            let pid = storage::fetch_kimi_detached(&config, &hf_bin())?;
-            writeln!(out, "{{\"fetch_pid\":{pid}}}")?;
-            Ok(())
-        }
-        Command::FetchKimi(FetchMode::Status) => {
-            let config = RuntimeConfig::from_env()?;
-            let plan = FetchPlan::kimi(&config);
-            let status = storage::kimi_status(&config)?;
-            writeln!(
-                out,
-                "{{\"repo\":\"{}\",\"downloaded_bytes\":{},\"expected_bytes\":{},\"safetensors\":{},\"expected_safetensors\":{},\"complete\":{},\"pid\":{}}}",
-                plan.repo,
-                status.downloaded_bytes,
-                plan.expected_bytes,
-                status.safetensors,
-                plan.safetensors,
-                status.complete,
-                status.pid.map_or("null".to_owned(), |pid| pid.to_string())
-            )?;
-            Ok(())
         }
         Command::Inspect(path) => {
             let manifest = Manifest::parse(&fs::read_to_string(path)?)?;
@@ -125,36 +85,9 @@ where
         "-V" | "--version" | "version" => Ok(Command::Version),
         "doctor" => no_trailing(args, Command::Doctor),
         "report" => no_trailing(args, Command::Report),
-        "fetch" => parse_fetch(args),
         "inspect" => parse_inspect(args),
         "generate" => parse_generate(args),
         other => Err(Error::Cli(format!("unknown command: {other}"))),
-    }
-}
-
-fn hf_bin() -> PathBuf {
-    env::var_os("BLOK_HF_BIN").map_or_else(
-        || PathBuf::from("/home/akhil-nair/Desktop/home/.blok/tools/hf/bin/hf"),
-        PathBuf::from,
-    )
-}
-
-fn parse_fetch<I>(args: I) -> Result<Command>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match (args.next(), args.next(), args.next()) {
-        (Some(model), None, None) if model == "kimi-k2.6" => {
-            Ok(Command::FetchKimi(FetchMode::Blocking))
-        }
-        (Some(model), Some(flag), None) if model == "kimi-k2.6" && flag == "--detach" => {
-            Ok(Command::FetchKimi(FetchMode::Detached))
-        }
-        (Some(model), Some(flag), None) if model == "kimi-k2.6" && flag == "--status" => {
-            Ok(Command::FetchKimi(FetchMode::Status))
-        }
-        _ => Err(Error::Cli("fetch requires kimi-k2.6".to_owned())),
     }
 }
 

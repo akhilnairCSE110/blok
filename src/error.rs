@@ -9,7 +9,6 @@ pub enum Error {
     Cli(String),
     Config(String),
     Manifest(String),
-    Storage(String),
     Io(io::Error),
 }
 
@@ -20,7 +19,6 @@ impl Error {
             Self::Config(_) => 78,
             Self::Capability(_) => 78,
             Self::Manifest(_) => 65,
-            Self::Storage(_) => 74,
             Self::Io(_) => 74,
         }
     }
@@ -33,7 +31,6 @@ impl Display for Error {
             Self::Cli(message) => write!(f, "cli error: {message}"),
             Self::Config(message) => write!(f, "config error: {message}"),
             Self::Manifest(message) => write!(f, "manifest error: {message}"),
-            Self::Storage(message) => write!(f, "storage error: {message}"),
             Self::Io(error) => write!(f, "io error: {error}"),
         }
     }

@@ -17,10 +17,13 @@ fn main() -> ExitCode {
 }
 
 fn run(program: &str, args: impl IntoIterator<Item = String>) -> ExitCode {
-    let status = Command::new(program)
-        .args(args)
-        .status()
-        .unwrap_or_else(|error| panic!("failed to run {program}: {error}"));
+    let status = match Command::new(program).args(args).status() {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("failed to run {program}: {error}");
+            return ExitCode::from(74);
+        }
+    };
     match status.code() {
         Some(code) => ExitCode::from(code as u8),
         None => ExitCode::from(74),
