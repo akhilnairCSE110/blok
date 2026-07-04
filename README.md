@@ -33,7 +33,9 @@ This repository now has the first executable Rust crate named `blok` plus `xtask
 current `just` and `scripts/ci.sh` entry points. The implemented surface is intentionally narrow:
 `doctor` and `report` emit deterministic JSON context; `inspect --manifest <path>` validates
 metadata and compiles first-token graph descriptors without touching payload bytes; `generate`
-validates the user intent and blocks until manifest, layout, arena, and I/O descriptors are present.
+validates the user intent, compiles graph/arena/I/O descriptors, runs the first aligned Linux
+direct-I/O probe when the manifest carries a source file, and then blocks until CUDA, tokenizer, and
+token emission are implemented.
 
 Do not add passive placeholder modules. Every new source file must define a real type, command,
 report, parser, probe, or test used by the current milestone.

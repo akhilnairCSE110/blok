@@ -2,8 +2,9 @@
 
 `src/` now contains the first executable Rust surface. The current code owns CLI validation,
 configuration, typed errors, deterministic reports, normalized manifest parsing, and first-token
-graph descriptors. Subsystem directories still hold structured plans that must be converted into
-module docs, types, probes, reports, and tests only as implementation lands.
+graph, arena, and direct-I/O transfer descriptors. Subsystem directories still hold structured
+plans that must be converted into module docs, types, probes, reports, and tests only as
+implementation lands.
 
 ## Requirements To Question
 
@@ -30,8 +31,10 @@ module docs, types, probes, reports, and tests only as implementation lands.
 - `src/command_report_json.rs`: deterministic report schemas.
 - `src/tensor_manifest_parser.rs`: normalized sidecar manifest parser and validator.
 - `src/first_token_execution_graph.rs`: first-token declared working-set descriptors.
+- `src/arena.rs`: first-token VRAM arena views derived from the graph.
+- `src/io.rs`: aligned transfer windows and the first Linux direct-I/O probe.
 
-Do not create CUDA, I/O, layout, arena, or decode files until the descriptor boundary they own is
+Do not create CUDA, layout, KV, kernel, or decode files until the descriptor boundary they own is
 real and tested.
 
 ## Gate

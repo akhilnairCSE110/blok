@@ -32,6 +32,33 @@ real token through the target Linux path. Keep it short and enforce it in code r
   counts, and materialization must reject incomplete sources.
 - Do not let default paths split state between `~/.blok` and the repo-local `.blok`. Use the active
   Blok home consistently.
+- Do not resurrect ARC's multi-crate shape. Useful ARC ideas must be converted into small typed
+  descriptors in the current crate: safetensors header records, transfer windows, arena views,
+  stream/event dependencies, KV page descriptors, and token-output gates.
+- Do not carry ARC's final `mmap` fallback forward. It is acceptable only as a negative fixture or
+  explicit unsupported-path error; payload success requires direct I/O, GDS, or uGDS reporting.
+- Do not treat `mlock` failure as a warning on a path that depends on pinned host memory. If pinned
+  memory is required for async behavior, failure is a capability error or the report must mark a
+  deliberately staged backend.
+- Do not let "preflight" names hide fake execution. A direct-read preflight is an I/O capability
+  check, not D1, not GDS, and not a token path.
+- Do not let tests download gated models unless authentication has already passed. Gated download
+  commands must fail before resuming transfer when the Hugging Face token is absent or invalid.
+
+## Useful Material To Preserve From ARC
+
+- Keep the progressive validation ladder: tiny model first, enforce a minimum generated-token count,
+  and fail logs that never prove real token emission.
+- Keep safetensors header parsing discipline: file path, header length, data base offset, tensor
+  dtype, shape, absolute offset, and byte length are metadata descriptors, not payload reads.
+- Keep direct handle reporting: file size, alignment, backend, and registered-handle status belong
+  in reports before any transfer is trusted.
+- Keep the schedule split between transfer, dense compute, and attention/KV work. Express it as
+  Blok descriptors first; only later wire CUDA streams and events.
+- Keep arena high-water thinking, but size arenas from graph descriptors and measured device limits,
+  not from fixed giant allocations.
+- Keep storage safety rules for any future raw NVMe path: mounted devices and filesystem signatures
+  are hard stops for writes.
 
 ## Current Rule
 

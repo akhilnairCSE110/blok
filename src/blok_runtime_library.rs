@@ -1,3 +1,5 @@
+#[path = "arena.rs"]
+pub mod arena;
 #[path = "runtime_environment_config.rs"]
 pub mod config;
 #[path = "blok_runtime_error.rs"]
@@ -6,6 +8,8 @@ pub mod error;
 pub mod graph;
 #[path = "linux_hardware_probe_report.rs"]
 pub mod hardware;
+#[path = "io.rs"]
+pub mod io;
 #[path = "tensor_manifest_parser.rs"]
 pub mod manifest;
 #[path = "command_report_json.rs"]
@@ -15,12 +19,13 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
 
+pub use arena::ArenaPlan;
 pub use config::RuntimeConfig;
 pub use error::{Error, Result};
 pub use graph::Graph;
 pub use hardware::HardwareReport;
+pub use io::{DirectIoProbe, TransferPlan};
 pub use manifest::Manifest;
 pub use observe::{CommandReport, GenerateIntent};
 
@@ -65,11 +70,15 @@ where
             let manifest_path = find_manifest(&intent.model)?;
             let manifest = Manifest::parse(&fs::read_to_string(manifest_path)?)?;
             let graph = Graph::first_token(&manifest);
+            let arena = ArenaPlan::first_token(&graph)?;
+            let transfers = TransferPlan::first_token(&manifest, &graph)?;
             validate_schedule(&intent, &graph)?;
-            verify_first_direct_read(&manifest)?;
+            DirectIoProbe::first_window(&transfers).run()?;
             write_report(
                 out,
-                CommandReport::generate_descriptors(intent, config, &manifest, &graph),
+                CommandReport::generate_descriptors(
+                    intent, config, &manifest, &graph, &arena, &transfers,
+                ),
             )?;
             Err(Error::Capability(
                 "generate_requires_direct_io_cuda_tokenizer",
@@ -177,35 +186,6 @@ fn validate_schedule(intent: &GenerateIntent, graph: &Graph) -> Result<()> {
     Ok(())
 }
 
-fn verify_first_direct_read(manifest: &Manifest) -> Result<()> {
-    let Some(tensor) = manifest.tensors.first() else {
-        return Ok(());
-    };
-    let Some(file) = &tensor.file else {
-        return Ok(());
-    };
-    let block = tensor.alignment.max(4096);
-    let status = ProcessCommand::new("dd")
-        .args([
-            &format!("if={file}"),
-            "of=/dev/null",
-            "iflag=direct",
-            &format!("bs={block}"),
-            &format!("skip={}", tensor.source.start / block),
-            &format!(
-                "count={}",
-                (tensor.source.end - tensor.source.start) / block
-            ),
-            "status=none",
-        ])
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(Error::Capability("direct_io_probe_failed"))
-    }
-}
-
 fn parse_token_count(value: &str) -> Result<u64> {
     let tokens = value
         .parse::<u64>()
@@ -311,6 +291,8 @@ mod tests {
             "\"decision\":\"direct_io_cuda_and_tokenizer_required_before_payload_reads\""
         ));
         assert!(report.contains("\"scheduled_bytes\""));
+        assert!(report.contains("\"arena\""));
+        assert!(report.contains("\"io\""));
         assert!(report.contains("\"top_k\":4"));
         assert!(report.contains("\"agents\":8"));
         assert!(report.contains("\"context_tokens\":1000000"));

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::{Graph, HardwareReport, Manifest, RuntimeConfig};
+use crate::{ArenaPlan, Graph, HardwareReport, Manifest, RuntimeConfig, TransferPlan};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerateIntent {
@@ -20,6 +20,8 @@ pub struct CommandReport {
     hardware: HardwareReport,
     manifest: Option<String>,
     graph: Option<String>,
+    arena: Option<String>,
+    io: Option<String>,
     schedule: Option<String>,
     config: RuntimeConfig,
 }
@@ -34,6 +36,8 @@ impl CommandReport {
             hardware: HardwareReport::probe(),
             manifest: None,
             graph: None,
+            arena: None,
+            io: None,
             schedule: None,
             config,
         }
@@ -61,6 +65,8 @@ impl CommandReport {
                 graph.payload_bytes()
             )),
             graph: Some(graph_json(graph)),
+            arena: None,
+            io: None,
             schedule: None,
             config,
         }
@@ -71,6 +77,8 @@ impl CommandReport {
         config: RuntimeConfig,
         manifest: &Manifest,
         graph: &Graph,
+        arena: &ArenaPlan,
+        transfers: &TransferPlan,
     ) -> Self {
         let schedule = schedule_json(&generate, graph);
         Self {
@@ -91,6 +99,8 @@ impl CommandReport {
                 manifest.max_alignment(),
             )),
             graph: Some(graph_json(graph)),
+            arena: Some(arena_json(arena)),
+            io: Some(io_json(transfers)),
             schedule: Some(schedule),
             config,
         }
@@ -115,6 +125,14 @@ impl CommandReport {
             .graph
             .as_ref()
             .map_or(String::new(), |m| format!(",\"graph\":{m}"));
+        let arena = self
+            .arena
+            .as_ref()
+            .map_or(String::new(), |m| format!(",\"arena\":{m}"));
+        let io = self
+            .io
+            .as_ref()
+            .map_or(String::new(), |m| format!(",\"io\":{m}"));
         let schedule = self
             .schedule
             .as_ref()
@@ -124,7 +142,7 @@ impl CommandReport {
                 "{{\"schema_version\":1,\"crate\":\"blok\",\"version\":{},",
                 "\"command\":{},\"status\":{},\"decision\":{},",
                 "\"config\":{{\"blok_home\":{},\"model_root\":{},\"report_root\":{},",
-                "\"strict_direct_io\":{}}},\"hardware\":{}{}{}{}{} }}"
+                "\"strict_direct_io\":{}}},\"hardware\":{}{}{}{}{}{}{} }}"
             ),
             j(env!("CARGO_PKG_VERSION")),
             j(self.command),
@@ -137,6 +155,8 @@ impl CommandReport {
             self.hardware.json,
             manifest,
             graph,
+            arena,
+            io,
             schedule,
             generate
         )
@@ -177,6 +197,43 @@ fn graph_json(graph: &Graph) -> String {
         graph.expert_bytes,
         graph.top_k,
         graph.expert_layers
+    )
+}
+
+fn arena_json(arena: &ArenaPlan) -> String {
+    format!(
+        "{{\"views\":{},\"reserved_bytes\":{},\"max_alignment\":{},\"tier\":\"vram\"}}",
+        arena.views.len(),
+        arena.reserved_bytes,
+        arena.max_alignment
+    )
+}
+
+fn io_json(transfers: &TransferPlan) -> String {
+    let first = transfers.windows.first().map_or(String::from("null"), |w| {
+        format!(
+            concat!(
+                "{{\"tensor\":{},\"file_present\":{},\"offset\":{},\"bytes\":{},",
+                "\"alignment\":{},\"arena_offset\":{},\"backend\":{}}}"
+            ),
+            j(&w.tensor),
+            w.file.is_some(),
+            w.offset,
+            w.bytes,
+            w.alignment,
+            w.arena_offset,
+            j(w.backend)
+        )
+    });
+    format!(
+        concat!(
+            "{{\"windows\":{},\"scheduled_bytes\":{},\"max_alignment\":{},",
+            "\"first_window\":{},\"probe\":\"dd_iflag_direct_first_aligned_block\"}}"
+        ),
+        transfers.windows.len(),
+        transfers.scheduled_bytes,
+        transfers.max_alignment,
+        first
     )
 }
 

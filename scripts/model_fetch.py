@@ -66,8 +66,18 @@ def fetch(c):
                             HF_XET_CACHE=str(c["cache_dir"]/"xet"), HF_XET_HIGH_PERFORMANCE="1",
                             HF_XET_NUM_CONCURRENT_RANGE_GETS=os.getenv("HF_XET_NUM_CONCURRENT_RANGE_GETS","32"),
                             HF_HUB_DOWNLOAD_TIMEOUT=os.getenv("HF_HUB_DOWNLOAD_TIMEOUT","60"))
+    preflight_hf_auth(c, env)
     subprocess.run([c["hf"], "download", c["repo"], "--revision", c["revision"], "--local-dir", str(c["local_dir"])], check=True, env=env)
     (c["meta_dir"]/"fetch-status.json").write_text(js(status(c))+"\n")
+
+def preflight_hf_auth(c, env):
+    token = env.get("HF_TOKEN") or env.get("HUGGING_FACE_HUB_TOKEN")
+    if not token:
+        raise SystemExit("HF_TOKEN or HUGGING_FACE_HUB_TOKEN is required before fetch starts")
+    result = subprocess.run([c["hf"], "auth", "whoami"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "hf auth whoami failed"
+        raise SystemExit(f"Hugging Face authentication failed; download not started: {detail}")
 
 def align(n, a): return ((n + a - 1) // a) * a
 def align_down(n, a): return (n // a) * a
