@@ -35,6 +35,7 @@ pub struct Tensor {
     pub shape: Vec<u64>,
     pub source: Range<u64>,
     pub alignment: u64,
+    pub file: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,6 +113,12 @@ impl Manifest {
                     tensor.name
                 )));
             }
+            if (tensor.source.end - tensor.source.start) % tensor.alignment != 0 {
+                return Err(Error::Manifest(format!(
+                    "{} size is unaligned",
+                    tensor.name
+                )));
+            }
         }
         Ok(())
     }
@@ -141,9 +148,9 @@ impl Layout {
 
 fn parse_tensor(rest: &str, line_no: usize) -> Result<Tensor> {
     let parts: Vec<_> = rest.split_whitespace().collect();
-    if parts.len() != 7 {
+    if !(7..=8).contains(&parts.len()) {
         return Err(Error::Manifest(format!(
-            "line {line_no} tensor requires 7 fields"
+            "line {line_no} tensor requires 7 or 8 fields"
         )));
     }
     let offset = u64_field(parts[4], "offset")?;
@@ -161,6 +168,7 @@ fn parse_tensor(rest: &str, line_no: usize) -> Result<Tensor> {
             .collect::<Result<_>>()?,
         source: offset..end,
         alignment: u64_field(parts[6], "alignment")?,
+        file: parts.get(7).map(|s| (*s).to_owned()),
     })
 }
 

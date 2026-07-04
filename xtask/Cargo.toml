@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
+[[bin]]
+name = "xtask"
+path = "src/xtask_command_line_entrypoint.rs"
+
 [lints.rust]
 unsafe_code = "forbid"
 

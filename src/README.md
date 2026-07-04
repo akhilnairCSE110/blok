@@ -23,13 +23,13 @@ module docs, types, probes, reports, and tests only as implementation lands.
 
 ## Current Code Shape
 
-- `src/main.rs`: CLI only.
-- `src/lib.rs`: crate invariants and module exports.
-- `src/config.rs`: typed constants and environment parsing.
-- `src/error.rs`: capability, validation, I/O, CUDA, graph, and layout errors.
-- `src/observe.rs`: deterministic report schemas.
-- `src/manifest.rs`: normalized sidecar manifest parser and validator.
-- `src/graph.rs`: first-token declared working-set descriptors.
+- `src/blok_command_line_entrypoint.rs`: CLI only.
+- `src/blok_runtime_library.rs`: crate invariants and module exports.
+- `src/runtime_environment_config.rs`: typed constants and environment parsing.
+- `src/blok_runtime_error.rs`: capability, validation, I/O, CUDA, graph, and layout errors.
+- `src/command_report_json.rs`: deterministic report schemas.
+- `src/tensor_manifest_parser.rs`: normalized sidecar manifest parser and validator.
+- `src/first_token_execution_graph.rs`: first-token declared working-set descriptors.
 
 Do not create CUDA, I/O, layout, arena, or decode files until the descriptor boundary they own is
 real and tested.

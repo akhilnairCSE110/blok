@@ -9,6 +9,13 @@ edition = "2021"
 license = "Apache-2.0"
 description = "SSD-resident inference runtime"
 
+[lib]
+path = "src/blok_runtime_library.rs"
+
+[[bin]]
+name = "blok"
+path = "src/blok_command_line_entrypoint.rs"
+
 [lints.rust]
 unsafe_code = "forbid"
 

@@ -3,7 +3,7 @@
 # 2. Expert MoE layout is per-layer contiguous expert blocks: offset = expert_id * expert_size, read with pread, no file lookup.
 # 3. Dense sparse-FFN layout is neuron row-column bundling: up/gate neuron input slice plus matching down output slice are contiguous.
 # 4. Never mmap streamed expert payloads: large random expert reads should be explicit pread/GDS/uGDS transfers into fixed arenas.
-# 5. Trust OS cache until Linux measurements prove otherwise; do not add an app LRU that steals DRAM from page cache.
+# 5. Generation must not use payload mmap or unreported buffered reads; direct I/O/CUDA gates own payload movement.
 # 6. K is a quality contract, not just speed: default top_k=4 for routed experts and reject K<4 unless explicitly overridden later.
 # 7. Runtime memory is static: download and layout planning may allocate, generation hot paths must use fixed slots and pointer maps.
 # 8. Repacking is separate from fetching: this file may download and plan; destructive/raw layout writes require a later explicit gate.
@@ -27,7 +27,7 @@ def rd(p):
 def ctx(m):
     if m not in MODELS: die()
     repo, rev, bytes_, st = MODELS[m]
-    home = Path(os.getenv("BLOK_HOME", Path.home() / ".blok"))
+    home = Path(os.getenv("BLOK_HOME", Path(__file__).resolve().parents[3] / ".blok"))
     root = Path(os.getenv("BLOK_MODEL_ROOT", home / "models")) / repo
     return dict(model=m, repo=repo, revision=rev, expected_bytes=bytes_, expected_safetensors=st,
                 local_dir=root / "source/hf" / rev, meta_dir=root / "blok",
@@ -50,12 +50,13 @@ def hw(c):
                 cuda="present" if Path("/dev/nvidiactl").exists() else "permission_blocked",
                 direct_repack_allowed=not root, destructive_ops_allowed=False,
                 signed_off="source_download_and_metadata_plan_only_on_root_nvme" if root else "model_nvme_layout_writes_require_operator_gate",
-                transfer="pread_now_gds_or_ugds_later")
+                transfer="direct_io_or_cuda_required_before_generate")
 
 def status(c):
     fs = list(c["local_dir"].rglob("*")) if c["local_dir"].is_dir() else []
-    got = sum(p.stat().st_size for p in fs if p.is_file())
-    st = sum(p.name.endswith(".safetensors") for p in fs if p.is_file())
+    files = [p for p in fs if p.is_file() and ".cache" not in p.relative_to(c["local_dir"]).parts]
+    got = sum(p.stat().st_size for p in files)
+    st = sum(p.name.endswith(".safetensors") for p in files)
     return {k: str(v) if k.endswith("_dir") else v for k, v in c.items() if k not in ("hf","meta_dir")} | \
            dict(downloaded_bytes=got, safetensors=st, complete=got >= c["expected_bytes"] and st >= c["expected_safetensors"], hardware=hw(c))
 
@@ -69,6 +70,7 @@ def fetch(c):
     (c["meta_dir"]/"fetch-status.json").write_text(js(status(c))+"\n")
 
 def align(n, a): return ((n + a - 1) // a) * a
+def align_down(n, a): return (n // a) * a
 def dtype(d): return d.lower().replace("float", "f").replace("bfloat", "bf")
 
 def tensors(c):
@@ -100,14 +102,14 @@ def layout(c):
     for (l,e), ts in expert_groups.items(): by_layer.setdefault(l, []).append((e, ts))
     expert_layers = [dict(layer=l, experts=len(v), layout="expert_contiguous_layer_file",
                           read="pread(fd[layer], arena, expert_size, expert_id*expert_size)")
-                     for l, v in sorted(by_layer.items())]
+                     for l, v in sorted(by_layer.items(), key=lambda x: int(x[0]) if x[0].isdigit() else -1)]
     rowcol = [dict(layer=l, layout="row_column_bundle", up=groups.get((l,"-", "dense_ffn_up_flash"), []),
                    down=groups.get((l,"-", "dense_ffn_down_flash"), []))
               for l in sorted({k[0] for k in groups}) if groups.get((l,"-", "dense_ffn_up_flash")) and groups.get((l,"-", "dense_ffn_down_flash"))]
     bytes_by_role = {}
     for t, v in h.items(): bytes_by_role[role(t)] = bytes_by_role.get(role(t), 0) + v["bytes"]
     return dict(model=c["model"], source=str(c["local_dir"]), hardware=hardware,
-                policy=dict(top_k=c["top_k"], expert_io="pread_aligned_os_cache", custom_lru=False,
+                policy=dict(top_k=c["top_k"], expert_io="direct_io_required", custom_lru=False,
                             mmap_experts=False, dense_ffn="row_column_bundle", moe="expert_contiguous"),
                 tensors=len(h), bytes_by_role=bytes_by_role, expert_layers=expert_layers,
                 dense_ffn_bundles=rowcol, resident=[t for t in h if role(t) in ("resident","attention_resident")])
@@ -225,17 +227,36 @@ def materialize_experts(c, h, groups, records, align_bytes):
                 write_padding(f, block_start + expert_size - offset)
         tmp.replace(out)
 
-def manifest_text(records):
-    lines = ["blok-manifest-v1", "architecture=hybrid", "layout=repacked"]
+def manifest_text(records, layout_="repacked"):
+    lines = ["blok-manifest-v1", "architecture=hybrid", f"layout={layout_}"]
     for r in sorted(records, key=lambda x: (x["file"], x["offset"], x["name"])):
         shape = "x".join(str(v) for v in r["shape"])
-        lines.append(f"tensor {r['name']} {r['role']} {r['dtype']} {shape} {r['offset']} {r['bytes']} {r['alignment']}")
+        lines.append(f"tensor {r['name']} {r['role']} {r['dtype']} {shape} {r['offset']} {r['bytes']} {r['alignment']} {r['file']}")
     return "\n".join(lines) + "\n"
 
 def materialize(c):
     s = status(c)
     if not s["complete"]: raise SystemExit("source download is incomplete; run fetch or detach first")
     if c["top_k"] < 4: raise SystemExit("top_k below 4 is disabled: prior MoE results show quality collapse")
+    if os.getenv("BLOK_REPACK_LAYOUT") != "1":
+        h, records = tensors(c), []
+        align_bytes = max(4096, hw(c)["block_bytes"])
+        for n in sorted(h, key=tensor_sort_key):
+            start = align_down(h[n]["source_offset"], align_bytes)
+            end = align(h[n]["source_offset"] + h[n]["bytes"], align_bytes)
+            records.append(dict(name=n, role=role(n), dtype=dtype(h[n]["dtype"]), shape=h[n]["shape"],
+                                file=h[n]["file"], offset=start, bytes=end-start, tensor_delta=h[n]["source_offset"]-start,
+                                tensor_bytes=h[n]["bytes"], alignment=align_bytes,
+                                source_file=h[n]["file"], source_offset=h[n]["source_offset"]))
+        c["meta_dir"].mkdir(parents=True, exist_ok=True)
+        index = dict(schema="blok.layout.v1", model=c["model"], repo=c["repo"], revision=c["revision"],
+                     layout="sidecar", root=str(c["local_dir"]), alignment=align_bytes,
+                     policy=layout(c)["policy"], tensors=records)
+        (c["meta_dir"]/"layout-index.json").write_text(js(index)+"\n")
+        (c["meta_dir"]/"manifest.blok").write_text(manifest_text(records, "sidecar"))
+        return dict(model=c["model"], layout_dir=str(c["local_dir"]), layout="sidecar",
+                    tensors=len(records), bytes=sum(r["bytes"] for r in records),
+                    manifest=str(c["meta_dir"]/"manifest.blok"), index=str(c["meta_dir"]/"layout-index.json"))
     if c["layout_dir"].exists() and os.getenv("BLOK_OVERWRITE_LAYOUT") != "1":
         raise SystemExit(f"{c['layout_dir']} exists; set BLOK_OVERWRITE_LAYOUT=1 to replace Blok-owned layout files")
     if c["layout_dir"].exists(): shutil.rmtree(c["layout_dir"])
