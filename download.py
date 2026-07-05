@@ -9,7 +9,7 @@ from pathlib import Path
 
 MODEL = "kimi-k2.6"
 DEFAULT_BLOK_HOME = Path("/home/akhil-nair/Desktop/home/.blok")
-DEFAULT_HF_BIN = DEFAULT_BLOK_HOME / "tools/hf/bin/hf"
+DEFAULT_HF_BIN = Path("/home/akhil-nair/Desktop/home/venvs/blok-hf/bin/hf")
 SCRIPT = Path(__file__).resolve().parent / "scripts/model_fetch.py"
 MIN_FREE_BUFFER_BYTES = 50 * 1024 * 1024 * 1024
 
@@ -47,16 +47,9 @@ def validate(args):
         fail(f"missing fetch script: {SCRIPT}")
 
     blok_home = Path(args.blok_home).expanduser().resolve()
-    token = os.environ.get("HF_TOKEN", "").strip()
-    cache_token = blok_home / "hf-cache/token"
-    stored_tokens = blok_home / "hf-cache/stored_tokens"
+    token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
     if token and any(c.isspace() for c in token):
         fail("HF_TOKEN contains whitespace")
-    if not token and not cache_token.is_file() and not stored_tokens.is_file():
-        fail(
-            "Hugging Face auth was not found; set HF_TOKEN or run "
-            f"`HF_HOME={blok_home / 'hf-cache'} hf auth login`"
-        )
 
     hf_bin = Path(args.hf_bin).expanduser().resolve()
     if not hf_bin.is_file():
@@ -81,6 +74,10 @@ def validate(args):
 
     run([sys.executable, "-m", "py_compile", str(SCRIPT)], env=env)
     hf_version = run([str(hf_bin), "--version"], env=env, capture=True).stdout.strip()
+    if token:
+        env["HF_TOKEN"] = token
+        env["HUGGING_FACE_HUB_TOKEN"] = token
+    run([str(hf_bin), "auth", "whoami"], env=env, capture=True)
     status = load_status(env)
 
     expected = int(status["expected_bytes"])

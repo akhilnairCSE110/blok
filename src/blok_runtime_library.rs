@@ -14,6 +14,8 @@ pub mod io;
 pub mod manifest;
 #[path = "command_report_json.rs"]
 pub mod observe;
+#[path = "tokenizer.rs"]
+pub mod tokenizer;
 
 use std::ffi::OsString;
 use std::fs;
@@ -28,6 +30,7 @@ pub use hardware::HardwareReport;
 pub use io::{DirectIoProbe, TransferPlan};
 pub use manifest::Manifest;
 pub use observe::{CommandReport, GenerateIntent};
+pub use tokenizer::TokenizerPlan;
 
 const USAGE: &str = "usage: blok {doctor|report|inspect --manifest <path>|generate --model <path> --prompt <text> --tokens <count> [--agents <count>] [--context <tokens>]}\n";
 
@@ -72,17 +75,16 @@ where
             let graph = Graph::first_token(&manifest);
             let arena = ArenaPlan::first_token(&graph)?;
             let transfers = TransferPlan::first_token(&manifest, &graph)?;
+            let tokenizer = TokenizerPlan::load(&intent.model, &intent.prompt)?;
             validate_schedule(&intent, &graph)?;
             DirectIoProbe::first_window(&transfers).run()?;
             write_report(
                 out,
                 CommandReport::generate_descriptors(
-                    intent, config, &manifest, &graph, &arena, &transfers,
+                    intent, config, &manifest, &graph, &arena, &transfers, &tokenizer,
                 ),
             )?;
-            Err(Error::Capability(
-                "generate_requires_direct_io_cuda_tokenizer",
-            ))
+            Err(Error::Capability("generate_requires_cuda_token_emission"))
         }
     }
 }
@@ -260,6 +262,16 @@ mod tests {
             ),
         )
         .expect("write manifest");
+        fs::write(
+            root.join("tokenizer.json"),
+            r#"{"model":{"type":"BPE","vocab":{"H":0,"i":1},"merges":[]}}"#,
+        )
+        .expect("write tokenizer");
+        fs::write(
+            root.join("tokenizer_config.json"),
+            r#"{"bos_token_id":0,"eos_token_id":1}"#,
+        )
+        .expect("write tokenizer config");
 
         let mut out = Vec::new();
         let result = run(
@@ -282,9 +294,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(Error::Capability(
-                "generate_requires_direct_io_cuda_tokenizer"
-            ))
+            Err(Error::Capability("generate_requires_cuda_token_emission"))
         ));
         let report = String::from_utf8(out).expect("utf8 report");
         assert!(report.contains(
@@ -293,6 +303,9 @@ mod tests {
         assert!(report.contains("\"scheduled_bytes\""));
         assert!(report.contains("\"arena\""));
         assert!(report.contains("\"io\""));
+        assert!(report.contains("\"tokenizer\""));
+        assert!(report.contains("\"model_type\":\"BPE\""));
+        assert!(report.contains("\"prompt_roundtrip\":\"metadata_only_tokenizer_execution_pending\""));
         assert!(report.contains("\"top_k\":4"));
         assert!(report.contains("\"agents\":8"));
         assert!(report.contains("\"context_tokens\":1000000"));

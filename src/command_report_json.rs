@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use crate::{ArenaPlan, Graph, HardwareReport, Manifest, RuntimeConfig, TransferPlan};
+use crate::{
+    ArenaPlan, Graph, HardwareReport, Manifest, RuntimeConfig, TokenizerPlan, TransferPlan,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerateIntent {
@@ -22,6 +24,7 @@ pub struct CommandReport {
     graph: Option<String>,
     arena: Option<String>,
     io: Option<String>,
+    tokenizer: Option<String>,
     schedule: Option<String>,
     config: RuntimeConfig,
 }
@@ -38,6 +41,7 @@ impl CommandReport {
             graph: None,
             arena: None,
             io: None,
+            tokenizer: None,
             schedule: None,
             config,
         }
@@ -67,6 +71,7 @@ impl CommandReport {
             graph: Some(graph_json(graph)),
             arena: None,
             io: None,
+            tokenizer: None,
             schedule: None,
             config,
         }
@@ -79,6 +84,7 @@ impl CommandReport {
         graph: &Graph,
         arena: &ArenaPlan,
         transfers: &TransferPlan,
+        tokenizer: &TokenizerPlan,
     ) -> Self {
         let schedule = schedule_json(&generate, graph);
         Self {
@@ -101,6 +107,7 @@ impl CommandReport {
             graph: Some(graph_json(graph)),
             arena: Some(arena_json(arena)),
             io: Some(io_json(transfers)),
+            tokenizer: Some(tokenizer_json(tokenizer)),
             schedule: Some(schedule),
             config,
         }
@@ -133,6 +140,10 @@ impl CommandReport {
             .io
             .as_ref()
             .map_or(String::new(), |m| format!(",\"io\":{m}"));
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .map_or(String::new(), |m| format!(",\"tokenizer\":{m}"));
         let schedule = self
             .schedule
             .as_ref()
@@ -142,7 +153,7 @@ impl CommandReport {
                 "{{\"schema_version\":1,\"crate\":\"blok\",\"version\":{},",
                 "\"command\":{},\"status\":{},\"decision\":{},",
                 "\"config\":{{\"blok_home\":{},\"model_root\":{},\"report_root\":{},",
-                "\"strict_direct_io\":{}}},\"hardware\":{}{}{}{}{}{}{} }}"
+                "\"strict_direct_io\":{}}},\"hardware\":{}{}{}{}{}{}{}{} }}"
             ),
             j(env!("CARGO_PKG_VERSION")),
             j(self.command),
@@ -157,6 +168,7 @@ impl CommandReport {
             graph,
             arena,
             io,
+            tokenizer,
             schedule,
             generate
         )
@@ -235,6 +247,40 @@ fn io_json(transfers: &TransferPlan) -> String {
         transfers.max_alignment,
         first
     )
+}
+
+fn tokenizer_json(tokenizer: &TokenizerPlan) -> String {
+    format!(
+        concat!(
+            "{{\"tokenizer_json\":{},\"tokenizer_config_json\":{},",
+            "\"model_type\":{},\"vocab_size\":{},\"merge_count\":{},",
+            "\"bos_token_id\":{},\"eos_token_id\":{},\"prompt_bytes\":{},",
+            "\"prompt_chars\":{},\"estimated_prompt_tokens\":{},\"prompt_roundtrip\":{}}}"
+        ),
+        j(&tokenizer.tokenizer_json.display().to_string()),
+        tokenizer
+            .tokenizer_config_json
+            .as_ref()
+            .map(|p| j(&p.display().to_string()))
+            .unwrap_or_else(|| "null".to_owned()),
+        tokenizer
+            .model_type
+            .as_ref()
+            .map(|s| j(s))
+            .unwrap_or_else(|| "null".to_owned()),
+        opt_u64(tokenizer.vocab_size),
+        opt_u64(tokenizer.merge_count),
+        opt_u64(tokenizer.bos_token_id),
+        opt_u64(tokenizer.eos_token_id),
+        tokenizer.prompt_bytes,
+        tokenizer.prompt_chars,
+        tokenizer.estimated_prompt_tokens,
+        j(tokenizer.prompt_roundtrip)
+    )
+}
+
+fn opt_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "null".to_owned(), |v| v.to_string())
 }
 
 fn j(value: &str) -> String {
