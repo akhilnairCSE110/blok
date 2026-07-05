@@ -53,7 +53,7 @@ impl TransferPlan {
                 bytes,
                 alignment: tensor.alignment,
                 arena_offset: aligned_arena,
-                backend: "linux_odirect_file",
+                backend: preferred_backend(tensor.file.as_deref()),
             });
             scheduled_bytes = scheduled_bytes
                 .checked_add(bytes)
@@ -68,6 +68,14 @@ impl TransferPlan {
             scheduled_bytes,
             max_alignment,
         })
+    }
+}
+
+fn preferred_backend(file: Option<&str>) -> &'static str {
+    if file.is_some() {
+        "ugds_nvme_to_vram"
+    } else {
+        "descriptor_only_no_payload_file"
     }
 }
 

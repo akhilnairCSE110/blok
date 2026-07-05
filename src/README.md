@@ -2,7 +2,8 @@
 
 `src/` now contains the first executable Rust surface. The current code owns CLI validation,
 configuration, typed errors, deterministic reports, normalized manifest parsing, and first-token
-graph, arena, and direct-I/O transfer descriptors. Subsystem directories still hold structured
+graph, arena, uGDS-first transfer descriptors, and a first `sm_120` PTX byte-probe descriptor.
+Subsystem directories still hold structured
 plans that must be converted into module docs, types, probes, reports, and tests only as
 implementation lands.
 
@@ -32,10 +33,13 @@ implementation lands.
 - `src/tensor_manifest_parser.rs`: normalized sidecar manifest parser and validator.
 - `src/first_token_execution_graph.rs`: first-token declared working-set descriptors.
 - `src/arena.rs`: first-token VRAM arena views derived from the graph.
-- `src/io.rs`: aligned transfer windows and the first Linux direct-I/O probe.
+- `src/io.rs`: uGDS-first aligned transfer windows and the first Linux direct-I/O fallback probe.
+- `src/cuda.rs`: optimized `sm_120` PTX byte-probe descriptor for the first transfer-to-kernel
+  gate.
 
-Do not create CUDA, layout, KV, kernel, or decode files until the descriptor boundary they own is
-real and tested.
+Do not create layout, KV, kernel registry, or decode files until the descriptor boundary they own is
+real and tested. CUDA code is currently limited to the first byte-probe contract; the next CUDA
+change must load and launch that PTX through the driver API or delete it.
 
 ## Gate
 

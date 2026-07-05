@@ -13,8 +13,10 @@ avoid small random I/O unless a sparse report proves it wins end to end.
 ## Delete / Simplify / Optimize / Automate
 
 - Delete blind random reads from the hot path.
-- Simplify first storage to ordinary files with `O_DIRECT` and GDS where available.
-- Optimize with Blok sidecar layout, row-column bundling, and eventually raw uGDS ownership.
+- Simplify first storage to uGDS/GDS for payload movement and ordinary-file `O_DIRECT` only as a
+  fallback/probe path.
+- Optimize with Blok sidecar layout, row-column bundling, and raw uGDS ownership on a dedicated
+  non-root device.
 - Automate refusal of destructive writes on root devices.
 
 ## Ownership Roles
@@ -26,8 +28,9 @@ avoid small random I/O unless a sparse report proves it wins end to end.
 
 ## Gate
 
-H1 reports baseline sequential bandwidth. H2 proves byte-exact NVMe-to-GPU movement through uGDS or
-GDS without compatibility bounce. H3 proves aligned `io_uring` plus `O_DIRECT` fallback.
+H1 reports baseline sequential bandwidth. H2 proves byte-exact NVMe-to-GPU movement through uGDS
+without compatibility bounce; GDS is the compatibility comparison, not the preferred win. H3 proves
+aligned `io_uring` plus `O_DIRECT` fallback.
 
 ## Sources
 

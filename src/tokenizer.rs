@@ -25,8 +25,9 @@ impl TokenizerPlan {
         } else {
             model
         };
-        let tokenizer_json = find_under(root, "tokenizer.json", 5)
-            .ok_or(Error::Capability("tokenizer_json_required_before_prompt_execution"))?;
+        let tokenizer_json = find_under(root, "tokenizer.json", 5).ok_or(Error::Capability(
+            "tokenizer_json_required_before_prompt_execution",
+        ))?;
         let tokenizer_config_json = find_under(root, "tokenizer_config.json", 5);
         let tokenizer_text = fs::read_to_string(&tokenizer_json)?;
         let config_text = tokenizer_config_json
@@ -236,7 +237,10 @@ mod tests {
         assert_eq!(plan.merge_count, Some(1));
         assert_eq!(plan.bos_token_id, Some(0));
         assert_eq!(plan.eos_token_id, Some(1));
-        assert_eq!(plan.prompt_roundtrip, "metadata_only_tokenizer_execution_pending");
+        assert_eq!(
+            plan.prompt_roundtrip,
+            "metadata_only_tokenizer_execution_pending"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

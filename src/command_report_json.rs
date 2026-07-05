@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use crate::{
-    ArenaPlan, Graph, HardwareReport, Manifest, RuntimeConfig, TokenizerPlan, TransferPlan,
+    ArenaPlan, CudaPlan, Graph, HardwareReport, Manifest, RuntimeConfig, TokenizerPlan,
+    TransferPlan,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,9 +25,20 @@ pub struct CommandReport {
     graph: Option<String>,
     arena: Option<String>,
     io: Option<String>,
+    cuda: Option<String>,
     tokenizer: Option<String>,
     schedule: Option<String>,
     config: RuntimeConfig,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GenerateDescriptors<'a> {
+    pub manifest: &'a Manifest,
+    pub graph: &'a Graph,
+    pub arena: &'a ArenaPlan,
+    pub transfers: &'a TransferPlan,
+    pub cuda: &'a CudaPlan,
+    pub tokenizer: &'a TokenizerPlan,
 }
 
 impl CommandReport {
@@ -41,6 +53,7 @@ impl CommandReport {
             graph: None,
             arena: None,
             io: None,
+            cuda: None,
             tokenizer: None,
             schedule: None,
             config,
@@ -71,6 +84,7 @@ impl CommandReport {
             graph: Some(graph_json(graph)),
             arena: None,
             io: None,
+            cuda: None,
             tokenizer: None,
             schedule: None,
             config,
@@ -80,13 +94,9 @@ impl CommandReport {
     pub fn generate_descriptors(
         generate: GenerateIntent,
         config: RuntimeConfig,
-        manifest: &Manifest,
-        graph: &Graph,
-        arena: &ArenaPlan,
-        transfers: &TransferPlan,
-        tokenizer: &TokenizerPlan,
+        descriptors: GenerateDescriptors<'_>,
     ) -> Self {
-        let schedule = schedule_json(&generate, graph);
+        let schedule = schedule_json(&generate, descriptors.graph);
         Self {
             command: "generate",
             status: "blocked",
@@ -98,16 +108,17 @@ impl CommandReport {
                     "{{\"architecture\":{},\"layout\":{},\"tensors\":{},",
                     "\"payload_bytes\":{},\"max_alignment\":{}}}"
                 ),
-                j(manifest.architecture.as_str()),
-                j(manifest.layout.as_str()),
-                manifest.tensors.len(),
-                manifest.payload_bytes(),
-                manifest.max_alignment(),
+                j(descriptors.manifest.architecture.as_str()),
+                j(descriptors.manifest.layout.as_str()),
+                descriptors.manifest.tensors.len(),
+                descriptors.manifest.payload_bytes(),
+                descriptors.manifest.max_alignment(),
             )),
-            graph: Some(graph_json(graph)),
-            arena: Some(arena_json(arena)),
-            io: Some(io_json(transfers)),
-            tokenizer: Some(tokenizer_json(tokenizer)),
+            graph: Some(graph_json(descriptors.graph)),
+            arena: Some(arena_json(descriptors.arena)),
+            io: Some(io_json(descriptors.transfers)),
+            cuda: Some(cuda_json(descriptors.cuda)),
+            tokenizer: Some(tokenizer_json(descriptors.tokenizer)),
             schedule: Some(schedule),
             config,
         }
@@ -140,6 +151,10 @@ impl CommandReport {
             .io
             .as_ref()
             .map_or(String::new(), |m| format!(",\"io\":{m}"));
+        let cuda = self
+            .cuda
+            .as_ref()
+            .map_or(String::new(), |m| format!(",\"cuda\":{m}"));
         let tokenizer = self
             .tokenizer
             .as_ref()
@@ -153,7 +168,7 @@ impl CommandReport {
                 "{{\"schema_version\":1,\"crate\":\"blok\",\"version\":{},",
                 "\"command\":{},\"status\":{},\"decision\":{},",
                 "\"config\":{{\"blok_home\":{},\"model_root\":{},\"report_root\":{},",
-                "\"strict_direct_io\":{}}},\"hardware\":{}{}{}{}{}{}{}{} }}"
+                "\"strict_direct_io\":{}}},\"hardware\":{}{}{}{}{}{}{}{}{} }}"
             ),
             j(env!("CARGO_PKG_VERSION")),
             j(self.command),
@@ -168,6 +183,7 @@ impl CommandReport {
             graph,
             arena,
             io,
+            cuda,
             tokenizer,
             schedule,
             generate
@@ -183,6 +199,7 @@ fn schedule_json(g: &GenerateIntent, graph: &Graph) -> String {
         concat!(
             "{{\"agents\":{},\"decode_steps\":{},\"context_tokens\":{},",
             "\"kv_page_tokens\":{},\"kv_pages\":{},\"bytes_per_decode_step\":{},",
+            "\"dense_neurons\":{},\"top_k_experts_per_layer\":{},",
             "\"tokenizer_required\":true,\"executor\":\"cuda_direct_io_required\"}}"
         ),
         g.agents,
@@ -190,7 +207,9 @@ fn schedule_json(g: &GenerateIntent, graph: &Graph) -> String {
         g.context,
         KV_PAGE,
         kv_pages,
-        graph.scheduled_bytes() * u64::from(g.agents)
+        graph.scheduled_bytes() * u64::from(g.agents),
+        graph.dense_neurons,
+        graph.top_k
     )
 }
 
@@ -199,6 +218,7 @@ fn graph_json(graph: &Graph) -> String {
         concat!(
             "{{\"ops\":{},\"payload_bytes\":{},\"scheduled_bytes\":{},",
             "\"resident_bytes\":{},\"dense_bytes\":{},\"expert_bytes\":{},",
+            "\"skipped_expert_bytes\":{},\"dense_neurons\":{},\"expert_tensors\":{},",
             "\"top_k\":{},\"expert_layers\":{}}}"
         ),
         graph.ops.len(),
@@ -207,6 +227,9 @@ fn graph_json(graph: &Graph) -> String {
         graph.resident_bytes,
         graph.dense_bytes,
         graph.expert_bytes,
+        graph.skipped_expert_bytes(),
+        graph.dense_neurons,
+        graph.expert_tensors,
         graph.top_k,
         graph.expert_layers
     )
@@ -240,12 +263,38 @@ fn io_json(transfers: &TransferPlan) -> String {
     format!(
         concat!(
             "{{\"windows\":{},\"scheduled_bytes\":{},\"max_alignment\":{},",
-            "\"first_window\":{},\"probe\":\"dd_iflag_direct_first_aligned_block\"}}"
+            "\"first_window\":{},\"preferred_backend\":\"ugds_nvme_to_vram\",",
+            "\"fallback_backend\":\"linux_odirect_file\",\"probe\":\"dd_iflag_direct_first_aligned_block\"}}"
         ),
         transfers.windows.len(),
         transfers.scheduled_bytes,
         transfers.max_alignment,
         first
+    )
+}
+
+fn cuda_json(cuda: &CudaPlan) -> String {
+    format!(
+        concat!(
+            "{{\"target_sm\":{},\"entry\":{},\"source\":{},\"inline_ptx\":[{}],",
+            "\"input_bytes\":{},\"vector_bytes\":{},\"block_threads\":{},",
+            "\"grid_blocks\":{},\"source_backend\":{},",
+            "\"requires_direct_storage_to_vram\":{}}}"
+        ),
+        j(cuda.target_sm),
+        j(cuda.entry),
+        j(cuda.source),
+        cuda.inline_ptx
+            .iter()
+            .map(|s| j(s))
+            .collect::<Vec<_>>()
+            .join(","),
+        cuda.input_bytes,
+        cuda.vector_bytes,
+        cuda.block_threads,
+        cuda.grid_blocks,
+        j(cuda.source_backend),
+        cuda.requires_direct_storage_to_vram
     )
 }
 

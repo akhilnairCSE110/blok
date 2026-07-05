@@ -2,6 +2,8 @@
 pub mod arena;
 #[path = "runtime_environment_config.rs"]
 pub mod config;
+#[path = "cuda.rs"]
+pub mod cuda;
 #[path = "blok_runtime_error.rs"]
 pub mod error;
 #[path = "first_token_execution_graph.rs"]
@@ -24,12 +26,13 @@ use std::path::{Path, PathBuf};
 
 pub use arena::ArenaPlan;
 pub use config::RuntimeConfig;
+pub use cuda::CudaPlan;
 pub use error::{Error, Result};
 pub use graph::Graph;
 pub use hardware::HardwareReport;
 pub use io::{DirectIoProbe, TransferPlan};
 pub use manifest::Manifest;
-pub use observe::{CommandReport, GenerateIntent};
+pub use observe::{CommandReport, GenerateDescriptors, GenerateIntent};
 pub use tokenizer::TokenizerPlan;
 
 const USAGE: &str = "usage: blok {doctor|report|inspect --manifest <path>|generate --model <path> --prompt <text> --tokens <count> [--agents <count>] [--context <tokens>]}\n";
@@ -75,13 +78,23 @@ where
             let graph = Graph::first_token(&manifest);
             let arena = ArenaPlan::first_token(&graph)?;
             let transfers = TransferPlan::first_token(&manifest, &graph)?;
+            let cuda = CudaPlan::byte_probe(&transfers)?;
             let tokenizer = TokenizerPlan::load(&intent.model, &intent.prompt)?;
             validate_schedule(&intent, &graph)?;
             DirectIoProbe::first_window(&transfers).run()?;
             write_report(
                 out,
                 CommandReport::generate_descriptors(
-                    intent, config, &manifest, &graph, &arena, &transfers, &tokenizer,
+                    intent,
+                    config,
+                    GenerateDescriptors {
+                        manifest: &manifest,
+                        graph: &graph,
+                        arena: &arena,
+                        transfers: &transfers,
+                        cuda: &cuda,
+                        tokenizer: &tokenizer,
+                    },
                 ),
             )?;
             Err(Error::Capability("generate_requires_cuda_token_emission"))
@@ -303,10 +316,20 @@ mod tests {
         assert!(report.contains("\"scheduled_bytes\""));
         assert!(report.contains("\"arena\""));
         assert!(report.contains("\"io\""));
+        assert!(report.contains("\"preferred_backend\":\"ugds_nvme_to_vram\""));
+        assert!(report.contains("\"cuda\""));
+        assert!(report.contains("\"target_sm\":\"sm_120\""));
+        assert!(report.contains("\"entry\":\"blok_byte_probe_kernel\""));
+        assert!(report.contains("\"ld.global.v4.u32\""));
+        assert!(report.contains("\"fma.rn.f32\""));
         assert!(report.contains("\"tokenizer\""));
         assert!(report.contains("\"model_type\":\"BPE\""));
-        assert!(report.contains("\"prompt_roundtrip\":\"metadata_only_tokenizer_execution_pending\""));
+        assert!(
+            report.contains("\"prompt_roundtrip\":\"metadata_only_tokenizer_execution_pending\"")
+        );
         assert!(report.contains("\"top_k\":4"));
+        assert!(report.contains("\"dense_neurons\":1"));
+        assert!(report.contains("\"skipped_expert_bytes\":0"));
         assert!(report.contains("\"agents\":8"));
         assert!(report.contains("\"context_tokens\":1000000"));
 
