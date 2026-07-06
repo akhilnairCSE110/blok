@@ -29,6 +29,8 @@ pub struct CommandReport {
     tokenizer: Option<String>,
     primitives: Option<String>,
     schedule: Option<String>,
+    text: Option<String>,
+    tokens: Option<u64>,
     config: RuntimeConfig,
 }
 
@@ -58,6 +60,8 @@ impl CommandReport {
             tokenizer: None,
             primitives: None,
             schedule: None,
+            text: None,
+            tokens: None,
             config,
         }
     }
@@ -90,6 +94,8 @@ impl CommandReport {
             tokenizer: None,
             primitives: None,
             schedule: None,
+            text: None,
+            tokens: None,
             config,
         }
     }
@@ -124,6 +130,37 @@ impl CommandReport {
             tokenizer: Some(tokenizer_json(descriptors.tokenizer)),
             primitives: Some(primitives_json()),
             schedule: Some(schedule),
+            text: None,
+            tokens: None,
+            config,
+        }
+    }
+
+    pub fn generated(
+        generate: GenerateIntent,
+        config: RuntimeConfig,
+        text: String,
+        tokens: u64,
+    ) -> Self {
+        Self {
+            command: "generate",
+            status: "ok",
+            decision: "native_kimi_text_emitted",
+            generate: Some(generate),
+            hardware: HardwareReport::probe(),
+            manifest: None,
+            graph: None,
+            arena: None,
+            io: None,
+            cuda: None,
+            tokenizer: None,
+            primitives: Some(format!(
+                "{{\"runtime\":\"fixed_kimi_k26_text_primitives\",\"tokens\":{}}}",
+                tokens
+            )),
+            schedule: None,
+            text: Some(text),
+            tokens: Some(tokens),
             config,
         }
     }
@@ -171,12 +208,19 @@ impl CommandReport {
             .schedule
             .as_ref()
             .map_or(String::new(), |m| format!(",\"schedule\":{m}"));
+        let text = self
+            .text
+            .as_ref()
+            .map_or(String::new(), |text| format!(",\"text\":{}", j(text)));
+        let tokens = self
+            .tokens
+            .map_or(String::new(), |tokens| format!(",\"tokens\":{tokens}"));
         format!(
             concat!(
                 "{{\"schema_version\":1,\"crate\":\"blok\",\"version\":{},",
                 "\"command\":{},\"status\":{},\"decision\":{},",
                 "\"config\":{{\"blok_home\":{},\"model_root\":{},\"report_root\":{},",
-                "\"strict_direct_io\":{}}},\"hardware\":{}{}{}{}{}{}{}{}{}{} }}"
+                "\"strict_direct_io\":{}}},\"hardware\":{}{}{}{}{}{}{}{}{}{}{}{} }}"
             ),
             j(env!("CARGO_PKG_VERSION")),
             j(self.command),
@@ -195,7 +239,9 @@ impl CommandReport {
             tokenizer,
             primitives,
             schedule,
-            generate
+            generate,
+            text,
+            tokens
         )
     }
 }

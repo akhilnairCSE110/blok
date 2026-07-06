@@ -12,6 +12,8 @@ pub mod graph;
 pub mod hardware;
 #[path = "io.rs"]
 pub mod io;
+#[path = "kimi_runtime.rs"]
+pub mod kimi_runtime;
 #[path = "tensor_manifest_parser.rs"]
 pub mod manifest;
 #[path = "command_report_json.rs"]
@@ -33,6 +35,7 @@ pub use error::{Error, Result};
 pub use graph::Graph;
 pub use hardware::HardwareReport;
 pub use io::{DirectIoProbe, KernelProbe, TransferPlan};
+pub use kimi_runtime::{generate_native, KimiExecutionPlan, KimiNativeRequest, KimiNativeResponse};
 pub use manifest::Manifest;
 pub use observe::{CommandReport, GenerateDescriptors, GenerateIntent};
 pub use primitives::{KimiK26TextSpec, KIMI_K26_DECODE, KIMI_K26_TEXT};
@@ -87,22 +90,35 @@ where
             if let Some(probe) = KernelProbe::first_window(&transfers) {
                 probe.run()?;
             }
-            write_report(
-                out,
-                CommandReport::generate_descriptors(
-                    intent,
-                    config,
-                    GenerateDescriptors {
-                        manifest: &manifest,
-                        graph: &graph,
-                        arena: &arena,
-                        transfers: &transfers,
-                        cuda: &cuda,
-                        tokenizer: &tokenizer,
-                    },
+            let native_result = generate_native(KimiNativeRequest {
+                manifest: &manifest,
+                prompt: &intent.prompt,
+                max_tokens: intent.tokens,
+            });
+            match native_result {
+                Ok(response) => write_report(
+                    out,
+                    CommandReport::generated(intent, config, response.text, response.tokens),
                 ),
-            )?;
-            Err(Error::Capability("generate_requires_cuda_token_emission"))
+                Err(error) => {
+                    write_report(
+                        out,
+                        CommandReport::generate_descriptors(
+                            intent,
+                            config,
+                            GenerateDescriptors {
+                                manifest: &manifest,
+                                graph: &graph,
+                                arena: &arena,
+                                transfers: &transfers,
+                                cuda: &cuda,
+                                tokenizer: &tokenizer,
+                            },
+                        ),
+                    )?;
+                    Err(error)
+                }
+            }
         }
     }
 }
@@ -312,7 +328,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(Error::Capability("generate_requires_cuda_token_emission"))
+            Err(Error::Capability("native_kimi_executor_incomplete"))
         ));
         let report = String::from_utf8(out).expect("utf8 report");
         assert!(report.contains(

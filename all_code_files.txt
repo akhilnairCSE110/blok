@@ -1,0 +1,3103 @@
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/download.py
+============================================================
+#!/usr/bin/env python3
+import json, os, shutil, subprocess, sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+HOME = Path(os.getenv("BLOK_HOME", "/home/akhil-nair/Desktop/home/.blok"))
+HF = os.getenv("BLOK_HF_BIN", "/home/akhil-nair/Desktop/home/venvs/blok-hf/bin/hf")
+FETCH = ROOT / "scripts/model_fetch.py"
+MODEL = "kimi-k2.6"
+BUFFER = 50 * 1024**3
+
+def run(*cmd, capture=False, env=None):
+    p = subprocess.run(cmd, text=True, stdout=subprocess.PIPE if capture else None, check=False, env=env)
+    if p.returncode: raise SystemExit(p.returncode)
+    return p.stdout if capture else ""
+
+def status(env):
+    return json.loads(run(sys.executable, str(FETCH), MODEL, "status", capture=True, env=env))
+
+def main():
+    if Path.cwd().resolve() != ROOT: raise SystemExit(f"run from {ROOT}")
+    if not Path(HF).is_file(): raise SystemExit(f"missing hf cli: {HF}")
+    env = os.environ | {"BLOK_HOME": str(HOME), "BLOK_HF_BIN": HF}
+    run(sys.executable, "-m", "py_compile", str(FETCH), env=env)
+    s = status(env)
+    free = shutil.disk_usage(HOME).free
+    need = max(0, s["expected_bytes"] - s["downloaded_bytes"]) + BUFFER
+    print(f"{s['repo']} {s['safetensors']}/{s['expected_safetensors']} shards {s['downloaded_bytes']}/{s['expected_bytes']} bytes free={free}")
+    if s["complete"]: return
+    if free < need: raise SystemExit(f"not enough disk: need {need}, free {free}")
+    os.execve(sys.executable, [sys.executable, str(FETCH), MODEL, "fetch"], env)
+
+if __name__ == "__main__": main()
+
+
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/end_goal_prompt.py
+============================================================
+#!/usr/bin/env python3
+import blok.runtime as blk
+
+
+PROMPT = (
+    "Answer this question in one word. Do not use capitals or punctuation. "
+    "What is the capital of France? Enclose your response in these braces: <>"
+)
+
+
+def main() -> None:
+    kimi_k2_thread = blk.new_threadi(
+        model_dir="<kimi k2 model directory>",
+        max_tokens=10,
+        max_time=60,
+        prompt=PROMPT,
+        planning=blk.high,
+    )
+    response = kimi_k2_thread.run()
+    assert response.text.asstr() == "paris", response.text.asstr()
+    assert response.ttft < 5.0, response.ttft
+    assert response.min_tps > 5.0, response.min_tps
+    assert response.max_tps > 5.0, response.max_tps
+    assert response.power.low()
+    assert response.plan.predicted()
+
+
+if __name__ == "__main__":
+    main()
+
+
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/scripts/model_fetch.py
+============================================================
+#!/usr/bin/env python3
+import json, os, re, shutil, struct, subprocess, sys
+from pathlib import Path
+
+MODELS = {"kimi-k2.6": ("moonshotai/Kimi-K2.6", "7eb5002f6aadc958aed6a9177b7ed26bb94011bb", 595421860056, 64)}
+ATTN = ("q_proj", "k_proj", "v_proj", "o_proj", "q_a_proj", "q_b_proj", "kv_a_proj", "kv_b_proj")
+UP, DOWN = ("up_proj", "gate_proj", "w1", "w3"), ("down_proj", "w2")
+DTYPE = {"BF16": "bf16", "F16": "f16", "F32": "f32", "I8": "i8", "U8": "u8"}
+
+def die(msg=None):
+    if msg: print(msg, file=sys.stderr)
+    print(f"usage: {Path(sys.argv[0]).name} kimi-k2.6 {{status|fetch|detach|layout|materialize}}", file=sys.stderr)
+    raise SystemExit(64 if msg is None else 1)
+
+def js(x): return json.dumps(x, separators=(",", ":"))
+def align(n, a): return ((n + a - 1) // a) * a
+def align_down(n, a): return n // a * a
+
+def ctx(model):
+    if model not in MODELS: die(f"unknown model: {model}")
+    repo, rev, size, shards = MODELS[model]
+    home = Path(os.getenv("BLOK_HOME", Path(__file__).resolve().parents[3] / ".blok"))
+    root = Path(os.getenv("BLOK_MODEL_ROOT", home / "models")) / repo
+    return {"model": model, "repo": repo, "revision": rev, "expected_bytes": size, "expected_safetensors": shards,
+            "local_dir": root / "source/hf" / rev, "meta_dir": root / "blok", "cache_dir": home / "hf-cache",
+            "hf": os.getenv("BLOK_HF_BIN", "hf")}
+
+def files(c):
+    root = c["local_dir"]
+    if not root.is_dir(): return []
+    return [p for p in root.rglob("*") if p.is_file() and ".cache" not in p.relative_to(root).parts]
+
+def status(c):
+    fs = files(c)
+    got = sum(p.stat().st_size for p in fs)
+    shards = sum(p.name.endswith(".safetensors") for p in fs)
+    return {k: str(v) if k.endswith("_dir") else v for k, v in c.items() if k not in ("hf", "meta_dir")} | {
+        "downloaded_bytes": got, "safetensors": shards,
+        "complete": got >= c["expected_bytes"] and shards >= c["expected_safetensors"],
+    }
+
+def hf_env(c):
+    env = os.environ.copy()
+    token = env.pop("BLOK_HF_TOKEN", "")
+    env.pop("HF_TOKEN", None); env.pop("HUGGING_FACE_HUB_TOKEN", None)
+    env.update(HF_HOME=str(c["cache_dir"]), HF_HUB_CACHE=str(c["cache_dir"] / "hub"), HF_XET_CACHE=str(c["cache_dir"] / "xet"),
+               HF_XET_HIGH_PERFORMANCE="1", HF_HUB_DOWNLOAD_TIMEOUT=env.get("HF_HUB_DOWNLOAD_TIMEOUT", "60"))
+    return env, token.strip()
+
+def fetch(c):
+    c["local_dir"].mkdir(parents=True, exist_ok=True); c["cache_dir"].mkdir(parents=True, exist_ok=True)
+    env, token = hf_env(c)
+    cmd = [c["hf"], "download", c["repo"], "--revision", c["revision"], "--local-dir", str(c["local_dir"]),
+           "--max-workers", os.getenv("BLOK_HF_WORKERS", "8")]
+    if token: cmd += ["--token", token]
+    rc = subprocess.run(cmd, env=env).returncode
+    if rc: raise SystemExit(rc)
+    c["meta_dir"].mkdir(parents=True, exist_ok=True)
+    (c["meta_dir"] / "fetch-status.json").write_text(js(status(c)) + "\n")
+
+def role(name):
+    if name.endswith(".mlp.gate.weight") or name.endswith(".mlp.gate.e_score_correction_bias"):
+        return "router"
+    if "shared_experts" in name: return "shared_expert_resident"
+    if re.search(r"\.experts?\.\d+\.", name): return "routed_expert"
+    if any(x in name for x in ATTN): return "attention_resident"
+    if any(x in name for x in UP + DOWN): return "dense_ffn_rowcol"
+    return "resident"
+
+def tensors(c):
+    out = []
+    for path in sorted(c["local_dir"].glob("*.safetensors")):
+        with path.open("rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]; header = json.loads(f.read(n)); base = 8 + n
+        for name, meta in header.items():
+            if name == "__metadata__": continue
+            if meta["dtype"] not in DTYPE: continue
+            start, end = meta["data_offsets"]
+            out.append((name, role(name), DTYPE[meta["dtype"]], "x".join(map(str, meta["shape"])), str(path), base + start, end - start))
+    return out
+
+def layout(c):
+    ts = tensors(c)
+    by_role = {}
+    for _, r, _, _, _, _, n in ts: by_role[r] = by_role.get(r, 0) + n
+    return {"model": c["model"], "source": str(c["local_dir"]), "layout": "sidecar", "tensors": len(ts), "bytes_by_role": by_role}
+
+def materialize(c):
+    s = status(c)
+    if not s["complete"]: raise SystemExit(f"incomplete download: {s['safetensors']}/{s['expected_safetensors']} shards")
+    c["meta_dir"].mkdir(parents=True, exist_ok=True)
+    lines = ["blok-manifest-v1", "architecture=hybrid", "layout=sidecar"]
+    index, alignment = [], 4096
+    for name, r, dtype, shape, file, start, size in tensors(c):
+        off, end = align_down(start, alignment), align(start + size, alignment)
+        lines.append(f"tensor {name} {r} {dtype} {shape} {off} {end - off} {alignment} {file}")
+        index.append({"name": name, "role": r, "dtype": dtype, "shape": shape, "file": file, "offset": off, "bytes": end - off})
+    (c["meta_dir"] / "manifest.blok").write_text("\n".join(lines) + "\n")
+    (c["meta_dir"] / "layout-index.json").write_text(js({"schema": "blok.layout.v1", "layout": "sidecar", "tensors": index}) + "\n")
+    return {"model": c["model"], "layout": "sidecar", "tensors": len(index), "manifest": str(c["meta_dir"] / "manifest.blok")}
+
+def detach(c):
+    c["meta_dir"].mkdir(parents=True, exist_ok=True)
+    log = open(c["meta_dir"] / "fetch.log", "ab")
+    p = subprocess.Popen([sys.executable, __file__, c["model"], "fetch"], stdout=log, stderr=log, start_new_session=True)
+    (c["meta_dir"] / "fetch.pid").write_text(f"{p.pid}\n")
+    return {"model": c["model"], "pid": p.pid, "log": str(c["meta_dir"] / "fetch.log")}
+
+def main():
+    if len(sys.argv) != 3: die()
+    c, mode = ctx(sys.argv[1]), sys.argv[2]
+    if mode in ("status", "plan"): print(js(status(c)))
+    elif mode == "fetch": fetch(c); print(js(status(c)))
+    elif mode == "detach": print(js(detach(c)))
+    elif mode == "layout": print(js(layout(c)))
+    elif mode == "materialize": print(js(materialize(c)))
+    else: die(f"unknown mode: {mode}")
+
+if __name__ == "__main__": main()
+
+
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/src/arena.rs
+============================================================
+use crate::{Error, Graph, Result};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArenaTier {
+    Vram,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArenaView {
+    pub name: String,
+    pub tier: ArenaTier,
+    pub offset: u64,
+    pub bytes: u64,
+    pub alignment: u64,
+    pub lifetime: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArenaPlan {
+    pub views: Vec<ArenaView>,
+    pub reserved_bytes: u64,
+    pub max_alignment: u64,
+}
+
+impl ArenaPlan {
+    pub fn first_token(graph: &Graph) -> Result<Self> {
+        let mut views = Vec::with_capacity(graph.ops.len());
+        let mut offset = 0_u64;
+        let mut max_alignment = 1_u64;
+
+        for op in &graph.ops {
+            max_alignment = max_alignment.max(op.alignment);
+            let aligned = align(offset, op.alignment)?;
+            let end = aligned
+                .checked_add(op.bytes)
+                .ok_or(Error::Capability("arena_descriptor_overflow"))?;
+            views.push(ArenaView {
+                name: op.arena.to_owned(),
+                tier: ArenaTier::Vram,
+                offset: aligned,
+                bytes: op.bytes,
+                alignment: op.alignment,
+                lifetime: op.dependency,
+            });
+            offset = end;
+        }
+
+        Ok(Self {
+            views,
+            reserved_bytes: offset,
+            max_alignment,
+        })
+    }
+}
+
+fn align(value: u64, alignment: u64) -> Result<u64> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return Err(Error::Capability("arena_alignment_invalid"));
+    }
+    let mask = alignment - 1;
+    value
+        .checked_add(mask)
+        .map(|v| v & !mask)
+        .ok_or(Error::Capability("arena_alignment_overflow"))
+}
+
+
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/src/blok_command_line_entrypoint.rs
+============================================================
+use std::env;
+use std::io::stdout;
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    let mut out = stdout().lock();
+
+    match blok::run(env::args_os(), &mut out) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(error.exit_code() as u8)
+        }
+    }
+}
+
+
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/src/blok_runtime_error.rs
+============================================================
+use std::fmt::{self, Display, Formatter};
+use std::io;
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug)]
+pub enum Error {
+    Capability(&'static str),
+    Cli(String),
+    Config(String),
+    Manifest(String),
+    Io(io::Error),
+}
+
+impl Error {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Cli(_) => 64,
+            Self::Config(_) => 78,
+            Self::Capability(_) => 78,
+            Self::Manifest(_) => 65,
+            Self::Io(_) => 74,
+        }
+    }
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Capability(code) => write!(f, "capability error: {code}"),
+            Self::Cli(message) => write!(f, "cli error: {message}"),
+            Self::Config(message) => write!(f, "config error: {message}"),
+            Self::Manifest(message) => write!(f, "manifest error: {message}"),
+            Self::Io(error) => write!(f, "io error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<io::Error> for Error {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/src/blok_runtime_library.rs
+============================================================
+#[path = "arena.rs"]
+pub mod arena;
+#[path = "runtime_environment_config.rs"]
+pub mod config;
+#[path = "cuda.rs"]
+pub mod cuda;
+#[path = "blok_runtime_error.rs"]
+pub mod error;
+#[path = "first_token_execution_graph.rs"]
+pub mod graph;
+#[path = "linux_hardware_probe_report.rs"]
+pub mod hardware;
+#[path = "io.rs"]
+pub mod io;
+#[path = "kimi_runtime.rs"]
+pub mod kimi_runtime;
+#[path = "tensor_manifest_parser.rs"]
+pub mod manifest;
+#[path = "command_report_json.rs"]
+pub mod observe;
+#[path = "primitives.rs"]
+pub mod primitives;
+#[path = "tokenizer.rs"]
+pub mod tokenizer;
+
+use std::ffi::OsString;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+pub use arena::ArenaPlan;
+pub use config::RuntimeConfig;
+pub use cuda::CudaPlan;
+pub use error::{Error, Result};
+pub use graph::Graph;
+pub use hardware::HardwareReport;
+pub use io::{DirectIoProbe, KernelProbe, TransferPlan};
+pub use kimi_runtime::{generate_native, KimiExecutionPlan, KimiNativeRequest, KimiNativeResponse};
+pub use manifest::Manifest;
+pub use observe::{CommandReport, GenerateDescriptors, GenerateIntent};
+pub use primitives::{KimiK26TextSpec, KIMI_K26_DECODE, KIMI_K26_TEXT};
+pub use tokenizer::TokenizerPlan;
+
+const USAGE: &str = "usage: blok {doctor|report|inspect --manifest <path>|generate --model <path> --prompt <text> --tokens <count> [--agents <count>] [--context <tokens>]}\n";
+
+#[derive(Debug, Eq, PartialEq)]
+enum Command {
+    Doctor,
+    Report,
+    Inspect(PathBuf),
+    Generate(GenerateIntent),
+    Help,
+    Version,
+}
+
+pub fn run<I, W>(args: I, out: &mut W) -> Result<()>
+where
+    I: IntoIterator<Item = OsString>,
+    W: Write,
+{
+    match parse(args)? {
+        Command::Help => out.write_all(USAGE.as_bytes()).map_err(Error::from),
+        Command::Version => {
+            writeln!(out, "blok {}", env!("CARGO_PKG_VERSION")).map_err(Error::from)
+        }
+        Command::Doctor => {
+            write_report(out, CommandReport::ok("doctor", RuntimeConfig::from_env()?))
+        }
+        Command::Report => {
+            write_report(out, CommandReport::ok("report", RuntimeConfig::from_env()?))
+        }
+        Command::Inspect(path) => {
+            let manifest = Manifest::parse(&fs::read_to_string(path)?)?;
+            let graph = Graph::first_token(&manifest);
+            write_report(
+                out,
+                CommandReport::inspect(RuntimeConfig::from_env()?, &manifest, &graph),
+            )
+        }
+        Command::Generate(intent) => {
+            let config = RuntimeConfig::from_env()?;
+            let manifest_path = find_manifest(&intent.model)?;
+            let manifest = Manifest::parse(&fs::read_to_string(manifest_path)?)?;
+            let graph = Graph::first_token(&manifest);
+            let arena = ArenaPlan::first_token(&graph)?;
+            let transfers = TransferPlan::first_token(&manifest, &graph)?;
+            let cuda = CudaPlan::byte_probe(&transfers)?;
+            let tokenizer = TokenizerPlan::load(&intent.model, &intent.prompt)?;
+            validate_schedule(&intent, &graph)?;
+            if let Some(probe) = KernelProbe::first_window(&transfers) {
+                probe.run()?;
+            }
+            let native_result = generate_native(KimiNativeRequest {
+                manifest: &manifest,
+                prompt: &intent.prompt,
+                max_tokens: intent.tokens,
+            });
+            match native_result {
+                Ok(response) => write_report(
+                    out,
+                    CommandReport::generated(intent, config, response.text, response.tokens),
+                ),
+                Err(error) => {
+                    write_report(
+                        out,
+                        CommandReport::generate_descriptors(
+                            intent,
+                            config,
+                            GenerateDescriptors {
+                                manifest: &manifest,
+                                graph: &graph,
+                                arena: &arena,
+                                transfers: &transfers,
+                                cuda: &cuda,
+                                tokenizer: &tokenizer,
+                            },
+                        ),
+                    )?;
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+
+fn write_report(out: &mut impl Write, report: CommandReport) -> Result<()> {
+    writeln!(out, "{}", report.to_json())?;
+    Ok(())
+}
+
+fn parse<I>(args: I) -> Result<Command>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    let _program = args.next();
+    let Some(command) = args.next() else {
+        return Ok(Command::Help);
+    };
+
+    match command.to_string_lossy().as_ref() {
+        "-h" | "--help" | "help" => Ok(Command::Help),
+        "-V" | "--version" | "version" => Ok(Command::Version),
+        "doctor" => no_trailing(args, Command::Doctor),
+        "report" => no_trailing(args, Command::Report),
+        "inspect" => parse_inspect(args),
+        "generate" => parse_generate(args),
+        other => Err(Error::Cli(format!("unknown command: {other}"))),
+    }
+}
+
+fn no_trailing<I>(mut args: I, command: Command) -> Result<Command>
+where
+    I: Iterator<Item = OsString>,
+{
+    if let Some(extra) = args.next() {
+        return Err(Error::Cli(format!(
+            "unexpected argument: {}",
+            extra.to_string_lossy()
+        )));
+    }
+    Ok(command)
+}
+
+fn parse_inspect<I>(args: I) -> Result<Command>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    match (args.next(), args.next(), args.next()) {
+        (Some(flag), Some(path), None) if flag == "--manifest" => Ok(Command::Inspect(path.into())),
+        _ => Err(Error::Cli("inspect requires --manifest <path>".to_owned())),
+    }
+}
+
+fn parse_generate<I>(args: I) -> Result<Command>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut model = None;
+    let mut prompt = None;
+    let mut tokens = None;
+    let mut agents = 1;
+    let mut context = None;
+    let mut args = args.into_iter();
+
+    while let Some(flag) = args.next() {
+        let flag = flag.to_string_lossy();
+        let value = args
+            .next()
+            .ok_or_else(|| Error::Cli(format!("{flag} requires a value")))?;
+        match flag.as_ref() {
+            "--model" => model = Some(PathBuf::from(value)),
+            "--prompt" => prompt = Some(value.to_string_lossy().into_owned()),
+            "--tokens" => tokens = Some(parse_token_count(&value.to_string_lossy())?),
+            "--agents" => agents = parse_agent_count(&value.to_string_lossy())?,
+            "--context" => context = Some(parse_token_count(&value.to_string_lossy())?),
+            other => return Err(Error::Cli(format!("unknown generate flag: {other}"))),
+        }
+    }
+
+    let tokens = tokens.ok_or(Error::Cli("--tokens is required".to_owned()))?;
+    Ok(Command::Generate(GenerateIntent {
+        model: model.ok_or(Error::Cli("--model is required".to_owned()))?,
+        prompt: prompt.ok_or(Error::Cli("--prompt is required".to_owned()))?,
+        tokens,
+        agents,
+        context: context.unwrap_or(tokens),
+    }))
+}
+
+fn validate_schedule(intent: &GenerateIntent, graph: &Graph) -> Result<()> {
+    intent
+        .context
+        .checked_mul(u64::from(intent.agents))
+        .and_then(|_| {
+            graph
+                .scheduled_bytes()
+                .checked_mul(u64::from(intent.agents))
+        })
+        .ok_or(Error::Capability("schedule_counter_overflow"))?;
+    Ok(())
+}
+
+fn parse_token_count(value: &str) -> Result<u64> {
+    let tokens = value
+        .parse::<u64>()
+        .map_err(|_| Error::Cli(format!("invalid token count: {value}")))?;
+    if tokens == 0 {
+        Err(Error::Cli(
+            "token counts must be greater than zero".to_owned(),
+        ))
+    } else {
+        Ok(tokens)
+    }
+}
+
+fn parse_agent_count(value: &str) -> Result<u32> {
+    let agents = value
+        .parse::<u32>()
+        .map_err(|_| Error::Cli(format!("invalid agent count: {value}")))?;
+    if agents == 0 {
+        Err(Error::Cli("--agents must be greater than zero".to_owned()))
+    } else {
+        Ok(agents)
+    }
+}
+
+fn find_manifest(model: &Path) -> Result<PathBuf> {
+    if model.is_file() {
+        return Ok(model.to_path_buf());
+    }
+    if !model.exists() {
+        return Err(Error::Manifest(format!(
+            "model path does not exist: {}",
+            model.display()
+        )));
+    }
+
+    [
+        model.join("manifest.blok"),
+        model.join("blok").join("manifest.blok"),
+        model.join("blok").join("repacked").join("manifest.blok"),
+        model.join("meta").join("manifest.blok"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .ok_or_else(|| {
+        Error::Manifest(format!(
+            "no manifest.blok found under {}; run scripts/model_fetch.py kimi-k2.6 materialize first",
+            model.display()
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn generate_compiles_descriptors_before_capability_error() {
+        let root = env::temp_dir().join(format!("blok-generate-test-{}", std::process::id()));
+        let manifest_dir = root.join("blok");
+        fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        fs::write(
+            manifest_dir.join("manifest.blok"),
+            concat!(
+                "blok-manifest-v1\n",
+                "architecture=hybrid\n",
+                "layout=repacked\n",
+                "tensor model.embed_tokens.weight resident bf16 1x2048 0 4096 4096\n",
+                "tensor layer.0.dense_ffn.neuron.0 dense_ffn_rowcol bf16 1x2048 4096 4096 4096\n",
+                "tensor model.layers.0.mlp.experts.0.w1.weight routed_expert bf16 1x2048 8192 4096 4096\n",
+                "tensor model.layers.0.mlp.experts.1.w1.weight routed_expert bf16 1x2048 12288 4096 4096\n"
+            ),
+        )
+        .expect("write manifest");
+        fs::write(
+            root.join("tokenizer.json"),
+            r#"{"model":{"type":"BPE","vocab":{"H":0,"i":1},"merges":[]}}"#,
+        )
+        .expect("write tokenizer");
+        fs::write(
+            root.join("tokenizer_config.json"),
+            r#"{"bos_token_id":0,"eos_token_id":1}"#,
+        )
+        .expect("write tokenizer config");
+
+        let mut out = Vec::new();
+        let result = run(
+            [
+                OsString::from("blok"),
+                OsString::from("generate"),
+                OsString::from("--model"),
+                root.as_os_str().to_owned(),
+                OsString::from("--prompt"),
+                OsString::from("Hi"),
+                OsString::from("--tokens"),
+                OsString::from("1000000"),
+                OsString::from("--agents"),
+                OsString::from("8"),
+                OsString::from("--context"),
+                OsString::from("1000000"),
+            ],
+            &mut out,
+        );
+
+        assert!(matches!(
+            result,
+            Err(Error::Capability("native_kimi_executor_incomplete"))
+        ));
+        let report = String::from_utf8(out).expect("utf8 report");
+        assert!(report.contains(
+            "\"decision\":\"direct_io_cuda_and_tokenizer_required_before_payload_reads\""
+        ));
+        assert!(report.contains("\"scheduled_bytes\""));
+        assert!(report.contains("\"arena\""));
+        assert!(report.contains("\"io\""));
+        assert!(report.contains("\"preferred_backend\":\"ugds_nvme_to_vram\""));
+        assert!(report.contains("\"cuda\""));
+        assert!(report.contains("\"target_sm\":\"sm_120\""));
+        assert!(report.contains("\"entry\":\"blok_byte_probe_kernel\""));
+        assert!(report.contains("\"ld.global.v4.u32\""));
+        assert!(report.contains("\"fma.rn.f32\""));
+        assert!(report.contains("\"tokenizer\""));
+        assert!(report.contains("\"model_type\":\"BPE\""));
+        assert!(
+            report.contains("\"prompt_roundtrip\":\"metadata_only_tokenizer_execution_pending\"")
+        );
+        assert!(report.contains("\"top_k\":8"));
+        assert!(report.contains("\"runtime\":\"fixed_kimi_k26_text_primitives\""));
+        assert!(report.contains("\"rmsnorm_int4_matvec\""));
+        assert!(report.contains("\"moe_silu_weighted_sum\""));
+        assert!(report.contains("\"dense_neurons\":1"));
+        assert!(report.contains("\"skipped_expert_bytes\":0"));
+        assert!(report.contains("\"agents\":8"));
+        assert!(report.contains("\"context_tokens\":1000000"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/src/command_report_json.rs
+============================================================
+use std::path::PathBuf;
+
+use crate::{
+    ArenaPlan, CudaPlan, Graph, HardwareReport, Manifest, RuntimeConfig, TokenizerPlan,
+    TransferPlan, KIMI_K26_DECODE, KIMI_K26_TEXT,
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenerateIntent {
+    pub model: PathBuf,
+    pub prompt: String,
+    pub tokens: u64,
+    pub agents: u32,
+    pub context: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandReport {
+    command: &'static str,
+    status: &'static str,
+    decision: &'static str,
+    generate: Option<GenerateIntent>,
+    hardware: HardwareReport,
+    manifest: Option<String>,
+    graph: Option<String>,
+    arena: Option<String>,
+    io: Option<String>,
+    cuda: Option<String>,
+    tokenizer: Option<String>,
+    primitives: Option<String>,
+    schedule: Option<String>,
+    config: RuntimeConfig,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GenerateDescriptors<'a> {
+    pub manifest: &'a Manifest,
+    pub graph: &'a Graph,
+    pub arena: &'a ArenaPlan,
+    pub transfers: &'a TransferPlan,
+    pub cuda: &'a CudaPlan,
+    pub tokenizer: &'a TokenizerPlan,
+}
+
+impl CommandReport {
+    pub fn ok(command: &'static str, config: RuntimeConfig) -> Self {
+        Self {
+            command,
+            status: "ok",
+            decision: "diagnostic_only_no_payload_bytes_touched",
+            generate: None,
+            hardware: HardwareReport::probe(),
+            manifest: None,
+            graph: None,
+            arena: None,
+            io: None,
+            cuda: None,
+            tokenizer: None,
+            primitives: None,
+            schedule: None,
+            config,
+        }
+    }
+
+    pub fn inspect(config: RuntimeConfig, manifest: &Manifest, graph: &Graph) -> Self {
+        Self {
+            command: "inspect",
+            status: "ok",
+            decision: "metadata_only_payload_bytes_not_touched",
+            generate: None,
+            hardware: HardwareReport::probe(),
+            manifest: Some(format!(
+                concat!(
+                    "{{\"architecture\":{},\"layout\":{},\"tensors\":{},",
+                    "\"payload_bytes\":{},\"max_alignment\":{},",
+                    "\"graph_ops\":{},\"graph_payload_bytes\":{}}}"
+                ),
+                j(manifest.architecture.as_str()),
+                j(manifest.layout.as_str()),
+                manifest.tensors.len(),
+                manifest.payload_bytes(),
+                manifest.max_alignment(),
+                graph.ops.len(),
+                graph.payload_bytes()
+            )),
+            graph: Some(graph_json(graph)),
+            arena: None,
+            io: None,
+            cuda: None,
+            tokenizer: None,
+            primitives: None,
+            schedule: None,
+            config,
+        }
+    }
+
+    pub fn generate_descriptors(
+        generate: GenerateIntent,
+        config: RuntimeConfig,
+        descriptors: GenerateDescriptors<'_>,
+    ) -> Self {
+        let schedule = schedule_json(&generate, descriptors.graph);
+        Self {
+            command: "generate",
+            status: "blocked",
+            decision: "direct_io_cuda_and_tokenizer_required_before_payload_reads",
+            generate: Some(generate),
+            hardware: HardwareReport::probe(),
+            manifest: Some(format!(
+                concat!(
+                    "{{\"architecture\":{},\"layout\":{},\"tensors\":{},",
+                    "\"payload_bytes\":{},\"max_alignment\":{}}}"
+                ),
+                j(descriptors.manifest.architecture.as_str()),
+                j(descriptors.manifest.layout.as_str()),
+                descriptors.manifest.tensors.len(),
+                descriptors.manifest.payload_bytes(),
+                descriptors.manifest.max_alignment(),
+            )),
+            graph: Some(graph_json(descriptors.graph)),
+            arena: Some(arena_json(descriptors.arena)),
+            io: Some(io_json(descriptors.transfers)),
+            cuda: Some(cuda_json(descriptors.cuda)),
+            tokenizer: Some(tokenizer_json(descriptors.tokenizer)),
+            primitives: Some(primitives_json()),
+            schedule: Some(schedule),
+            config,
+        }
+    }
+
+    pub fn generated(
+        generate: GenerateIntent,
+        config: RuntimeConfig,
+        text: String,
+        tokens: u64,
+    ) -> Self {
+        Self {
+            command: "generate",
+            status: "ok",
+            decision: "native_kimi_text_emitted",
+            generate: Some(generate),
+            hardware: HardwareReport::probe(),
+            manifest: None,
+            graph: None,
+            arena: None,
+            io: None,
+            cuda: None,
+            tokenizer: None,
+            primitives: Some(format!(
+                "{{\"runtime\":\"fixed_kimi_k26_text_primitives\",\"tokens\":{},\"text\":{}}}",
+                tokens,
+                j(&text)
+            )),
+            schedule: None,
+            config,
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        let generate = self.generate.as_ref().map_or(String::new(), |g| {
+            format!(
+                ",\"generate\":{{\"model\":{},\"prompt\":{},\"tokens\":{},\"agents\":{},\"context\":{}}}",
+                j(&g.model.display().to_string()),
+                j(&g.prompt),
+                g.tokens,
+                g.agents,
+                g.context
+            )
+        });
+        let manifest = self
+            .manifest
+            .as_ref()
+            .map_or(String::new(), |m| format!(",\"manifest\":{m}"));
+        let graph = self
+            .graph
+            .as_ref()
+            .map_or(String::new(), |m| format!(",\"graph\":{m}"));
+        let arena = self
+            .arena
+            .as_ref()
+            .map_or(String::new(), |m| format!(",\"arena\":{m}"));
+        let io = self
+            .io
+            .as_ref()
+            .map_or(String::new(), |m| format!(",\"io\":{m}"));
+        let cuda = self
+            .cuda
+            .as_ref()
+            .map_or(String::new(), |m| format!(",\"cuda\":{m}"));
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .map_or(String::new(), |m| format!(",\"tokenizer\":{m}"));
+        let primitives = self
+            .primitives
+            .as_ref()
+            .map_or(String::new(), |m| format!(",\"primitives\":{m}"));
+        let schedule = self
+            .schedule
+            .as_ref()
+            .map_or(String::new(), |m| format!(",\"schedule\":{m}"));
+        let generated_text = if self.status == "ok" && self.command == "generate" {
+            self.primitives
+                .as_ref()
+                .and_then(|p| p.split("\"text\":").nth(1))
+                .map_or(String::new(), |text| {
+                    format!(
+                        ",\"text\":{},\"tokens\":{}",
+                        text.trim_end_matches('}'),
+                        generated_tokens(self.primitives.as_deref().unwrap_or(""))
+                    )
+                })
+        } else {
+            String::new()
+        };
+        format!(
+            concat!(
+                "{{\"schema_version\":1,\"crate\":\"blok\",\"version\":{},",
+                "\"command\":{},\"status\":{},\"decision\":{},",
+                "\"config\":{{\"blok_home\":{},\"model_root\":{},\"report_root\":{},",
+                "\"strict_direct_io\":{}}},\"hardware\":{}{}{}{}{}{}{}{}{}{}{} }}"
+            ),
+            j(env!("CARGO_PKG_VERSION")),
+            j(self.command),
+            j(self.status),
+            j(self.decision),
+            j(&self.config.blok_home.display().to_string()),
+            j(&self.config.model_root.display().to_string()),
+            j(&self.config.report_root.display().to_string()),
+            self.config.strict_direct_io,
+            self.hardware.json,
+            manifest,
+            graph,
+            arena,
+            io,
+            cuda,
+            tokenizer,
+            primitives,
+            schedule,
+            generate,
+            generated_text
+        )
+    }
+}
+
+fn generated_tokens(primitives: &str) -> u64 {
+    primitives
+        .split("\"tokens\":")
+        .nth(1)
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+fn primitives_json() -> String {
+    format!(
+        concat!(
+            "{{\"runtime\":\"fixed_kimi_k26_text_primitives\",",
+            "\"layers\":{},\"hidden\":{},\"heads\":{},\"routed_experts\":{},",
+            "\"experts_per_token\":{},\"max_context\":{},\"ops\":[{}]}}"
+        ),
+        KIMI_K26_TEXT.layers,
+        KIMI_K26_TEXT.hidden,
+        KIMI_K26_TEXT.heads,
+        KIMI_K26_TEXT.routed_experts,
+        KIMI_K26_TEXT.experts_per_token,
+        KIMI_K26_TEXT.max_context,
+        KIMI_K26_DECODE
+            .iter()
+            .map(|op| j(op))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn schedule_json(g: &GenerateIntent, graph: &Graph) -> String {
+    const KV_PAGE: u64 = 128;
+    let live_tokens = g.context.saturating_mul(u64::from(g.agents));
+    let kv_pages = live_tokens.div_ceil(KV_PAGE);
+    format!(
+        concat!(
+            "{{\"agents\":{},\"decode_steps\":{},\"context_tokens\":{},",
+            "\"kv_page_tokens\":{},\"kv_pages\":{},\"bytes_per_decode_step\":{},",
+            "\"dense_neurons\":{},\"top_k_experts_per_layer\":{},",
+            "\"tokenizer_required\":true,\"executor\":\"cuda_direct_io_required\"}}"
+        ),
+        g.agents,
+        g.tokens,
+        g.context,
+        KV_PAGE,
+        kv_pages,
+        graph.scheduled_bytes() * u64::from(g.agents),
+        graph.dense_neurons,
+        graph.top_k
+    )
+}
+
+fn graph_json(graph: &Graph) -> String {
+    format!(
+        concat!(
+            "{{\"ops\":{},\"payload_bytes\":{},\"scheduled_bytes\":{},",
+            "\"resident_bytes\":{},\"dense_bytes\":{},\"expert_bytes\":{},",
+            "\"scheduled_expert_bytes\":{},\"skipped_expert_bytes\":{},",
+            "\"dense_neurons\":{},\"expert_tensors\":{},\"top_k\":{},",
+            "\"expert_layers\":{}}}"
+        ),
+        graph.ops.len(),
+        graph.payload_bytes(),
+        graph.scheduled_bytes(),
+        graph.resident_bytes,
+        graph.dense_bytes,
+        graph.expert_bytes,
+        graph.scheduled_expert_bytes,
+        graph.skipped_expert_bytes(),
+        graph.dense_neurons,
+        graph.expert_tensors,
+        graph.top_k,
+        graph.expert_layers
+    )
+}
+
+fn arena_json(arena: &ArenaPlan) -> String {
+    format!(
+        "{{\"views\":{},\"reserved_bytes\":{},\"max_alignment\":{},\"tier\":\"vram\"}}",
+        arena.views.len(),
+        arena.reserved_bytes,
+        arena.max_alignment
+    )
+}
+
+fn io_json(transfers: &TransferPlan) -> String {
+    let first = transfers.windows.first().map_or(String::from("null"), |w| {
+        format!(
+            concat!(
+                "{{\"tensor\":{},\"file_present\":{},\"offset\":{},\"bytes\":{},",
+                "\"alignment\":{},\"arena_offset\":{},\"backend\":{}}}"
+            ),
+            j(&w.tensor),
+            w.file.is_some(),
+            w.offset,
+            w.bytes,
+            w.alignment,
+            w.arena_offset,
+            j(w.backend)
+        )
+    });
+    format!(
+        concat!(
+            "{{\"windows\":{},\"scheduled_bytes\":{},\"max_alignment\":{},",
+            "\"first_window\":{},\"preferred_backend\":\"ugds_nvme_to_vram\",",
+            "\"fallback_backend\":\"linux_odirect_file\",\"probe\":\"dd_iflag_direct_first_aligned_block\"}}"
+        ),
+        transfers.windows.len(),
+        transfers.scheduled_bytes,
+        transfers.max_alignment,
+        first
+    )
+}
+
+fn cuda_json(cuda: &CudaPlan) -> String {
+    format!(
+        concat!(
+            "{{\"target_sm\":{},\"entry\":{},\"source\":{},\"inline_ptx\":[{}],",
+            "\"input_bytes\":{},\"vector_bytes\":{},\"block_threads\":{},",
+            "\"grid_blocks\":{},\"source_backend\":{},",
+            "\"requires_direct_storage_to_vram\":{}}}"
+        ),
+        j(cuda.target_sm),
+        j(cuda.entry),
+        j(cuda.source),
+        cuda.inline_ptx
+            .iter()
+            .map(|s| j(s))
+            .collect::<Vec<_>>()
+            .join(","),
+        cuda.input_bytes,
+        cuda.vector_bytes,
+        cuda.block_threads,
+        cuda.grid_blocks,
+        j(cuda.source_backend),
+        cuda.requires_direct_storage_to_vram
+    )
+}
+
+fn tokenizer_json(tokenizer: &TokenizerPlan) -> String {
+    format!(
+        concat!(
+            "{{\"tokenizer_json\":{},\"tokenizer_config_json\":{},",
+            "\"model_type\":{},\"vocab_size\":{},\"merge_count\":{},",
+            "\"bos_token_id\":{},\"eos_token_id\":{},\"prompt_bytes\":{},",
+            "\"prompt_chars\":{},\"estimated_prompt_tokens\":{},\"prompt_roundtrip\":{}}}"
+        ),
+        j(&tokenizer.tokenizer_json.display().to_string()),
+        tokenizer
+            .tokenizer_config_json
+            .as_ref()
+            .map(|p| j(&p.display().to_string()))
+            .unwrap_or_else(|| "null".to_owned()),
+        tokenizer
+            .model_type
+            .as_ref()
+            .map(|s| j(s))
+            .unwrap_or_else(|| "null".to_owned()),
+        opt_u64(tokenizer.vocab_size),
+        opt_u64(tokenizer.merge_count),
+        opt_u64(tokenizer.bos_token_id),
+        opt_u64(tokenizer.eos_token_id),
+        tokenizer.prompt_bytes,
+        tokenizer.prompt_chars,
+        tokenizer.estimated_prompt_tokens,
+        j(tokenizer.prompt_roundtrip)
+    )
+}
+
+fn opt_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "null".to_owned(), |v| v.to_string())
+}
+
+fn j(value: &str) -> String {
+    let mut out = String::from("\"");
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/src/cuda.rs
+============================================================
+use crate::{Error, Result, TransferPlan};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CudaPlan {
+    pub target_sm: &'static str,
+    pub entry: &'static str,
+    pub source: &'static str,
+    pub inline_ptx: &'static [&'static str],
+    pub input_bytes: u64,
+    pub vector_bytes: u64,
+    pub block_threads: u32,
+    pub grid_blocks: u64,
+    pub source_backend: &'static str,
+    pub requires_direct_storage_to_vram: bool,
+}
+
+impl CudaPlan {
+    pub fn byte_probe(transfers: &TransferPlan) -> Result<Self> {
+        let window = transfers
+            .windows
+            .iter()
+            .find(|w| w.bytes > 0)
+            .ok_or(Error::Capability("cuda_probe_requires_transfer_window"))?;
+        if window.bytes % 16 != 0 || window.alignment < 16 {
+            return Err(Error::Capability(
+                "cuda_probe_requires_16_byte_aligned_window",
+            ));
+        }
+        let block_threads = 256;
+        let lanes = window.bytes / 16;
+        Ok(Self {
+            target_sm: "sm_120",
+            entry: "blok_byte_probe_kernel",
+            source: "src/cuda_byte_probe.cu",
+            inline_ptx: &[
+                "ld.global.v4.u32",
+                "ld.global.f32",
+                "fma.rn.f32",
+                "blok_router_topk_kernel",
+                "blok_rmsnorm_int4_matvec_kernel",
+                "blok_moe_silu_weighted_sum_kernel",
+            ],
+            input_bytes: window.bytes,
+            vector_bytes: 16,
+            block_threads,
+            grid_blocks: lanes.div_ceil(u64::from(block_threads)),
+            source_backend: window.backend,
+            requires_direct_storage_to_vram: true,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::{TransferPlan, TransferWindow};
+
+    #[test]
+    fn byte_probe_describes_sm120_vectorized_ptx() {
+        let plan = CudaPlan::byte_probe(&TransferPlan {
+            windows: vec![TransferWindow {
+                tensor: "tensor".to_owned(),
+                file: Some("model.safetensors".to_owned()),
+                offset: 0,
+                bytes: 4096,
+                alignment: 4096,
+                arena_offset: 0,
+                backend: "ugds_nvme_to_vram",
+            }],
+            scheduled_bytes: 4096,
+            max_alignment: 4096,
+        })
+        .expect("cuda plan");
+
+        assert_eq!(plan.target_sm, "sm_120");
+        assert_eq!(plan.entry, "blok_byte_probe_kernel");
+        assert_eq!(plan.vector_bytes, 16);
+        assert_eq!(plan.grid_blocks, 1);
+        assert!(plan.inline_ptx.contains(&"ld.global.v4.u32"));
+        assert!(plan.inline_ptx.contains(&"fma.rn.f32"));
+    }
+}
+
+
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/src/cuda_byte_probe.cu
+============================================================
+#include <cuda_runtime.h>
+
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <string>
+
+#ifdef BLOK_HAVE_UGDS
+#include <ugds.h>
+#endif
+
+namespace {
+
+struct Args {
+  std::string backend = "ugds";
+  std::string file;
+  std::string device = "/dev/ugds_drv0";
+  std::uint64_t offset = 0;
+  std::uint64_t bytes = 0;
+  std::uint64_t alignment = 4096;
+};
+
+__global__ __launch_bounds__(256, 2) void blok_byte_probe_kernel(const uint4 *__restrict__ input,
+                                                                 std::uint32_t *out,
+                                                                 std::uint64_t lanes) {
+  const std::uint64_t i = (blockIdx.x * blockDim.x) + threadIdx.x;
+  if (i >= lanes) {
+    return;
+  }
+  std::uint32_t a;
+  std::uint32_t b;
+  std::uint32_t c;
+  std::uint32_t d;
+  asm volatile("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(a), "=r"(b), "=r"(c), "=r"(d)
+               : "l"(input + i));
+  atomicXor(out, a ^ b ^ c ^ d);
+}
+
+__global__ __launch_bounds__(256, 2) void blok_neuron_dot_kernel(const float *__restrict__ x,
+                                                                 const float *__restrict__ rows,
+                                                                 float *__restrict__ y,
+                                                                 std::uint32_t hidden) {
+  extern __shared__ float partial[];
+  const std::uint32_t neuron = blockIdx.x;
+  const std::uint32_t tid = threadIdx.x;
+  float acc = 0.0F;
+  for (std::uint32_t i = tid; i < hidden; i += blockDim.x) {
+    float a;
+    float b;
+    asm volatile("ld.global.f32 %0, [%1];" : "=f"(a) : "l"(x + i));
+    asm volatile("ld.global.f32 %0, [%1];" : "=f"(b) : "l"(rows + (neuron * hidden) + i));
+    asm volatile("fma.rn.f32 %0, %1, %2, %0;" : "+f"(acc) : "f"(a), "f"(b));
+  }
+  partial[tid] = acc;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      partial[tid] += partial[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    y[neuron] = partial[0];
+  }
+}
+
+__global__ __launch_bounds__(256, 2) void blok_rmsnorm_kernel(const float *__restrict__ x,
+                                                              const float *__restrict__ w,
+                                                              float *__restrict__ y,
+                                                              std::uint32_t hidden, float eps) {
+  extern __shared__ float s[];
+  const std::uint32_t tid = threadIdx.x;
+  float sum = 0.0F;
+  for (std::uint32_t i = tid; i < hidden; i += blockDim.x) {
+    const float v = x[i];
+    sum += v * v;
+  }
+  s[tid] = sum;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x / 2; stride; stride >>= 1) {
+    if (tid < stride) {
+      s[tid] += s[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float inv = rsqrtf((s[0] / static_cast<float>(hidden)) + eps);
+  for (std::uint32_t i = tid; i < hidden; i += blockDim.x) {
+    y[i] = x[i] * inv * w[i];
+  }
+}
+
+__global__ __launch_bounds__(256, 2) void blok_silu_gate_kernel(const float *__restrict__ gate,
+                                                                const float *__restrict__ up,
+                                                                float *__restrict__ y,
+                                                                std::uint32_t n) {
+  const std::uint32_t i = (blockIdx.x * blockDim.x) + threadIdx.x;
+  if (i < n) {
+    const float g = gate[i];
+    y[i] = (g / (1.0F + expf(-g))) * up[i];
+  }
+}
+
+__global__ __launch_bounds__(384, 1) void blok_router_topk_kernel(const float *__restrict__ logits,
+                                                                  std::uint16_t *__restrict__ expert,
+                                                                  float *__restrict__ weight,
+                                                                  std::uint32_t experts,
+                                                                  std::uint32_t k,
+                                                                  float scale) {
+  extern __shared__ float scores[];
+  const std::uint32_t tid = threadIdx.x;
+  if (tid < experts) {
+    const float x = logits[tid];
+    scores[tid] = 1.0F / (1.0F + expf(-x));
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float total = 0.0F;
+    for (std::uint32_t slot = 0; slot < k; ++slot) {
+      float best = -1.0F;
+      std::uint32_t id = 0;
+      for (std::uint32_t i = 0; i < experts; ++i) {
+        const float v = scores[i];
+        if (v > best) {
+          best = v;
+          id = i;
+        }
+      }
+      expert[slot] = static_cast<std::uint16_t>(id);
+      weight[slot] = best;
+      total += best;
+      scores[id] = -1.0F;
+    }
+    if (total > 0.0F) {
+      for (std::uint32_t slot = 0; slot < k; ++slot) {
+        weight[slot] = (weight[slot] / total) * scale;
+      }
+    }
+  }
+}
+
+__global__ __launch_bounds__(256, 2) void blok_int4_group_matvec_kernel(
+    const float *__restrict__ x, const std::uint8_t *__restrict__ packed,
+    const float *__restrict__ scale, float *__restrict__ y, std::uint32_t rows,
+    std::uint32_t cols) {
+  extern __shared__ float partial[];
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t tid = threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  float acc = 0.0F;
+  const std::uint32_t packed_row = row * ((cols + 1) >> 1);
+  for (std::uint32_t c = tid; c < cols; c += blockDim.x) {
+    const std::uint8_t byte = packed[packed_row + (c >> 1)];
+    const std::int8_t q = static_cast<std::int8_t>((c & 1) ? (byte >> 4) : (byte & 15)) - 8;
+    acc += x[c] * static_cast<float>(q) * scale[(row * ((cols + 31) >> 5)) + (c >> 5)];
+  }
+  partial[tid] = acc;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x / 2; stride; stride >>= 1) {
+    if (tid < stride) {
+      partial[tid] += partial[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    y[row] = partial[0];
+  }
+}
+
+__global__ __launch_bounds__(256, 2) void blok_rmsnorm_int4_matvec_kernel(
+    const float *__restrict__ x, const float *__restrict__ norm_w,
+    const std::uint8_t *__restrict__ packed, const float *__restrict__ scale,
+    float *__restrict__ y, std::uint32_t rows, std::uint32_t cols, float eps) {
+  extern __shared__ float s[];
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t tid = threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  float ss = 0.0F;
+  for (std::uint32_t c = tid; c < cols; c += blockDim.x) {
+    const float v = x[c];
+    ss += v * v;
+  }
+  s[tid] = ss;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x / 2; stride; stride >>= 1) {
+    if (tid < stride) {
+      s[tid] += s[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float inv = rsqrtf((s[0] / static_cast<float>(cols)) + eps);
+  float acc = 0.0F;
+  const std::uint32_t packed_row = row * ((cols + 1) >> 1);
+  for (std::uint32_t c = tid; c < cols; c += blockDim.x) {
+    const std::uint8_t byte = packed[packed_row + (c >> 1)];
+    const std::int8_t q = static_cast<std::int8_t>((c & 1) ? (byte >> 4) : (byte & 15)) - 8;
+    const float a = x[c] * inv * norm_w[c];
+    acc += a * static_cast<float>(q) * scale[(row * ((cols + 31) >> 5)) + (c >> 5)];
+  }
+  s[tid] = acc;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x / 2; stride; stride >>= 1) {
+    if (tid < stride) {
+      s[tid] += s[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    y[row] = s[0];
+  }
+}
+
+__global__ __launch_bounds__(256, 2) void blok_moe_silu_weighted_sum_kernel(
+    const float *__restrict__ gate, const float *__restrict__ up, const float *__restrict__ down,
+    const float *__restrict__ weight, float *__restrict__ y, std::uint32_t k,
+    std::uint32_t hidden) {
+  const std::uint32_t i = (blockIdx.x * blockDim.x) + threadIdx.x;
+  if (i >= hidden) {
+    return;
+  }
+  float acc = 0.0F;
+  for (std::uint32_t e = 0; e < k; ++e) {
+    const float g = gate[(e * hidden) + i];
+    const float u = up[(e * hidden) + i];
+    acc += weight[e] * (g / (1.0F + expf(-g))) * u * down[(e * hidden) + i];
+  }
+  y[i] += acc;
+}
+
+[[noreturn]] void die(const std::string &message) {
+  std::cerr << "blok-byte-probe: " << message << "\n";
+  std::exit(1);
+}
+
+void cuda_ok(cudaError_t status, const char *what) {
+  if (status != cudaSuccess) {
+    die(std::string(what) + ": " + cudaGetErrorString(status));
+  }
+}
+
+std::uint64_t parse_u64(const char *text, const char *name) {
+  char *end = nullptr;
+  errno = 0;
+  const auto value = std::strtoull(text, &end, 10);
+  if (errno != 0 || end == text || *end != '\0') {
+    die(std::string("invalid ") + name);
+  }
+  return value;
+}
+
+Args parse(int argc, char **argv) {
+  Args args;
+  for (int i = 1; i < argc; i += 2) {
+    if (i + 1 >= argc) {
+      die("usage: blok-byte-probe --file <path> --offset <bytes> --bytes <bytes> [--alignment <bytes>]");
+    }
+    const std::string flag = argv[i];
+    if (flag == "--file") {
+      args.file = argv[i + 1];
+    } else if (flag == "--backend") {
+      args.backend = argv[i + 1];
+    } else if (flag == "--device") {
+      args.device = argv[i + 1];
+    } else if (flag == "--offset") {
+      args.offset = parse_u64(argv[i + 1], "offset");
+    } else if (flag == "--bytes") {
+      args.bytes = parse_u64(argv[i + 1], "bytes");
+    } else if (flag == "--alignment") {
+      args.alignment = parse_u64(argv[i + 1], "alignment");
+    } else {
+      die("unknown flag: " + flag);
+    }
+  }
+  if (args.bytes == 0 || (args.backend == "odirect" && args.file.empty())) {
+    die("nonzero --bytes is required; --file is required for --backend odirect");
+  }
+  if (args.backend != "ugds" && args.backend != "odirect") {
+    die("--backend must be ugds or odirect");
+  }
+  if ((args.alignment & (args.alignment - 1)) != 0 || args.alignment < 4096) {
+    die("--alignment must be a power of two and at least 4096");
+  }
+  if ((args.offset % args.alignment) != 0 || (args.bytes % args.alignment) != 0 ||
+      (args.bytes % sizeof(uint4)) != 0) {
+    die("offset and bytes must satisfy O_DIRECT and uint4 alignment");
+  }
+  return args;
+}
+
+std::uint32_t checksum_cpu(const void *data, std::uint64_t bytes) {
+  const auto *p = static_cast<const std::uint32_t *>(data);
+  std::uint32_t x = 0;
+  for (std::uint64_t i = 0; i < bytes / sizeof(std::uint32_t); ++i) {
+    x ^= p[i];
+  }
+  return x;
+}
+
+void read_direct(const Args &args, void *dst) {
+  const int fd = open(args.file.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+  if (fd < 0) {
+    die(std::string("open O_DIRECT failed: ") + std::strerror(errno));
+  }
+  auto *p = static_cast<std::uint8_t *>(dst);
+  std::uint64_t done = 0;
+  while (done < args.bytes) {
+    const ssize_t n = pread(fd, p + done, args.bytes - done, args.offset + done);
+    if (n < 0) {
+      const int saved = errno;
+      close(fd);
+      die(std::string("pread O_DIRECT failed: ") + std::strerror(saved));
+    }
+    if (n == 0) {
+      close(fd);
+      die("short direct read");
+    }
+    done += static_cast<std::uint64_t>(n);
+  }
+  close(fd);
+}
+
+void read_ugds(const Args &args, void *device_ptr) {
+#ifdef BLOK_HAVE_UGDS
+  const int fd = open(args.device.c_str(), O_RDWR | O_CLOEXEC);
+  if (fd < 0) {
+    die(std::string("open uGDS device failed: ") + std::strerror(errno));
+  }
+  cuda_ok(cudaDeviceSynchronize(), "cudaDeviceSynchronize before uGDS");
+  if (uGDSDriverOpen() != 0) {
+    close(fd);
+    die("uGDSDriverOpen failed");
+  }
+  uGDSDescr_t desc = {};
+  desc.type = UGDS_HANDLE_TYPE_OPAQUE_FD;
+  desc.handle.fd = fd;
+  uGDSHandle_t handle = {};
+  if (uGDSHandleRegister(&handle, &desc) != 0) {
+    uGDSDriverClose();
+    close(fd);
+    die("uGDSHandleRegister failed");
+  }
+  if (uGDSBufRegister(device_ptr, args.bytes, 0) != 0) {
+    uGDSHandleDeregister(handle);
+    uGDSDriverClose();
+    close(fd);
+    die("uGDSBufRegister failed");
+  }
+  if (uGDSRead(handle, device_ptr, args.bytes, args.offset, 0) != static_cast<ssize_t>(args.bytes)) {
+    uGDSBufDeregister(device_ptr);
+    uGDSHandleDeregister(handle);
+    uGDSDriverClose();
+    close(fd);
+    die("uGDSRead failed");
+  }
+  uGDSBufDeregister(device_ptr);
+  uGDSHandleDeregister(handle);
+  uGDSDriverClose();
+  close(fd);
+#else
+  (void)args;
+  (void)device_ptr;
+  die("uGDS backend requested but ugds.h/libugds were not found at build time");
+#endif
+}
+
+std::string json_escape(const std::string &s) {
+  std::string out = "\"";
+  for (const char c : s) {
+    if (c == '"' || c == '\\') {
+      out += '\\';
+    }
+    out += c;
+  }
+  out += '"';
+  return out;
+}
+
+}  // namespace
+
+int main(int argc, char **argv) {
+  const Args args = parse(argc, argv);
+
+  void *device = nullptr;
+  std::uint32_t *device_out = nullptr;
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+  cuda_ok(cudaMalloc(&device, args.bytes), "cudaMalloc input");
+  cuda_ok(cudaMalloc(&device_out, sizeof(std::uint32_t)), "cudaMalloc output");
+  cuda_ok(cudaMemset(device_out, 0, sizeof(std::uint32_t)), "cudaMemset output");
+  cuda_ok(cudaEventCreate(&start), "cudaEventCreate start");
+  cuda_ok(cudaEventCreate(&stop), "cudaEventCreate stop");
+  if (args.backend == "ugds") {
+    read_ugds(args, device);
+  } else {
+    void *host = nullptr;
+    if (posix_memalign(&host, args.alignment, args.bytes) != 0) {
+      die("posix_memalign failed");
+    }
+    read_direct(args, host);
+    cuda_ok(cudaMemcpy(device, host, args.bytes, cudaMemcpyHostToDevice), "cudaMemcpy H2D");
+    std::free(host);
+  }
+
+  constexpr int threads = 256;
+  const std::uint64_t lanes = args.bytes / sizeof(uint4);
+  const auto blocks = static_cast<unsigned>((lanes + threads - 1) / threads);
+  cuda_ok(cudaEventRecord(start), "cudaEventRecord start");
+  blok_byte_probe_kernel<<<blocks, threads>>>(static_cast<const uint4 *>(device), device_out, lanes);
+  cuda_ok(cudaGetLastError(), "blok_byte_probe_kernel launch");
+  cuda_ok(cudaEventRecord(stop), "cudaEventRecord stop");
+  cuda_ok(cudaEventSynchronize(stop), "cudaEventSynchronize stop");
+
+  float kernel_ms = 0.0F;
+  std::uint32_t gpu = 0;
+  void *verify = nullptr;
+  if (posix_memalign(&verify, args.alignment, args.bytes) != 0) {
+    die("verify posix_memalign failed");
+  }
+  cuda_ok(cudaEventElapsedTime(&kernel_ms, start, stop), "cudaEventElapsedTime");
+  cuda_ok(cudaMemcpy(&gpu, device_out, sizeof(gpu), cudaMemcpyDeviceToHost), "cudaMemcpy D2H");
+  cuda_ok(cudaMemcpy(verify, device, args.bytes, cudaMemcpyDeviceToHost), "cudaMemcpy verify");
+  const std::uint32_t cpu = checksum_cpu(verify, args.bytes);
+
+  std::cout << "{\"schema\":\"blok.byte_probe.v0\",\"backend\":" << json_escape(args.backend) << ","
+            << "\"file\":" << json_escape(args.file) << ",\"offset\":" << args.offset
+            << ",\"bytes\":" << args.bytes << ",\"alignment\":" << args.alignment
+            << ",\"target_sm\":\"sm_120\",\"kernel\":\"blok_byte_probe_kernel\","
+            << "\"threads\":" << threads << ",\"blocks\":" << blocks
+            << ",\"cpu_checksum\":" << cpu << ",\"gpu_checksum\":" << gpu
+            << ",\"verified\":" << (cpu == gpu ? "true" : "false")
+            << ",\"kernel_ms\":" << kernel_ms << "}\n";
+
+  cudaEventDestroy(stop);
+  cudaEventDestroy(start);
+  cudaFree(device_out);
+  cudaFree(device);
+  std::free(verify);
+  return cpu == gpu ? 0 : 2;
+}
+
+
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/src/first_token_execution_graph.rs
+============================================================
+use std::collections::BTreeSet;
+
+use crate::{manifest::Manifest, KIMI_K26_TEXT};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Op {
+    pub tensor: String,
+    pub layer: Option<u32>,
+    pub neuron: Option<u32>,
+    pub expert: Option<u32>,
+    pub offset: u64,
+    pub bytes: u64,
+    pub alignment: u64,
+    pub arena: &'static str,
+    pub consumer: &'static str,
+    pub dependency: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Graph {
+    pub ops: Vec<Op>,
+    pub resident_bytes: u64,
+    pub dense_bytes: u64,
+    pub expert_bytes: u64,
+    pub scheduled_expert_bytes: u64,
+    pub dense_neurons: u32,
+    pub expert_tensors: u32,
+    pub top_k: u32,
+    pub expert_layers: u32,
+}
+
+impl Graph {
+    pub fn first_token(manifest: &Manifest) -> Self {
+        let top_k = KIMI_K26_TEXT.experts_per_token;
+        let mut graph = Self {
+            ops: Vec::with_capacity(manifest.tensors.len()),
+            resident_bytes: 0,
+            dense_bytes: 0,
+            expert_bytes: 0,
+            scheduled_expert_bytes: 0,
+            dense_neurons: 0,
+            expert_tensors: 0,
+            top_k,
+            expert_layers: 0,
+        };
+        let mut expert_layers = BTreeSet::new();
+        for tensor in &manifest.tensors {
+            let (arena, consumer, dependency) = route(&tensor.role);
+            let bytes = tensor.source.end - tensor.source.start;
+            match tensor.role.as_str() {
+                "routed_expert" => {
+                    graph.expert_bytes += bytes;
+                    graph.expert_tensors += 1;
+                    if let Some(layer) = layer(&tensor.name) {
+                        expert_layers.insert(layer);
+                    }
+                    if !scheduled_expert(expert(&tensor.name), top_k) {
+                        continue;
+                    }
+                    graph.scheduled_expert_bytes += bytes;
+                }
+                "dense_ffn_rowcol" => {
+                    graph.dense_bytes += bytes;
+                    graph.dense_neurons += 1;
+                }
+                _ => graph.resident_bytes += bytes,
+            }
+            graph.ops.push(Op {
+                tensor: tensor.name.clone(),
+                layer: layer(&tensor.name),
+                neuron: neuron(&tensor.name),
+                expert: expert(&tensor.name),
+                offset: tensor.source.start,
+                bytes,
+                alignment: tensor.alignment,
+                arena,
+                consumer,
+                dependency,
+            });
+        }
+        graph.expert_layers = expert_layers.len() as u32;
+        graph
+    }
+
+    pub fn payload_bytes(&self) -> u64 {
+        self.resident_bytes + self.dense_bytes + self.expert_bytes
+    }
+
+    pub fn scheduled_bytes(&self) -> u64 {
+        self.resident_bytes + self.dense_bytes + self.scheduled_expert_bytes
+    }
+
+    pub fn skipped_expert_bytes(&self) -> u64 {
+        self.expert_bytes
+            .saturating_sub(self.scheduled_expert_bytes)
+    }
+}
+
+fn scheduled_expert(expert: Option<u32>, top_k: u32) -> bool {
+    match expert {
+        Some(expert) => expert < top_k,
+        None => true,
+    }
+}
+
+fn route(role: &str) -> (&'static str, &'static str, &'static str) {
+    match role {
+        "routed_expert" => (
+            "vram.expert_slot",
+            "moe.grouped_gemm",
+            "router_top_k_before_fetch",
+        ),
+        "dense_ffn_rowcol" => ("vram.ffn_slot", "ffn.row_column_bundle", "layer_prefetch"),
+        _ => ("vram.resident", "resident_weight", "model_open"),
+    }
+}
+
+fn layer(name: &str) -> Option<u32> {
+    for marker in ["model.layers.", "layers.", "layer."] {
+        if let Some(i) = name.find(marker) {
+            let s = &name[i + marker.len()..];
+            let n: String = s.chars().take_while(char::is_ascii_digit).collect();
+            return n.parse().ok();
+        }
+    }
+    None
+}
+
+fn neuron(name: &str) -> Option<u32> {
+    number_after(name, ".neuron.")
+}
+
+fn expert(name: &str) -> Option<u32> {
+    number_after(name, ".experts.").or_else(|| number_after(name, ".expert."))
+}
+
+fn number_after(name: &str, marker: &str) -> Option<u32> {
+    let i = name.find(marker)?;
+    let s = &name[i + marker.len()..];
+    let n: String = s.chars().take_while(char::is_ascii_digit).collect();
+    n.parse().ok()
+}
+
+
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/src/io.rs
+============================================================
+use std::path::PathBuf;
+use std::process::{Command as ProcessCommand, Stdio};
+
+use crate::{Error, Graph, Manifest, Result};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferWindow {
+    pub tensor: String,
+    pub file: Option<String>,
+    pub offset: u64,
+    pub bytes: u64,
+    pub alignment: u64,
+    pub arena_offset: u64,
+    pub backend: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferPlan {
+    pub windows: Vec<TransferWindow>,
+    pub scheduled_bytes: u64,
+    pub max_alignment: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectIoProbe {
+    pub file: Option<String>,
+    pub offset: u64,
+    pub bytes: u64,
+    pub block: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelProbe {
+    pub bin: PathBuf,
+    pub backend: String,
+    pub file: String,
+    pub offset: u64,
+    pub bytes: u64,
+    pub alignment: u64,
+}
+
+impl TransferPlan {
+    pub fn first_token(manifest: &Manifest, graph: &Graph) -> Result<Self> {
+        let mut windows = Vec::with_capacity(graph.ops.len());
+        let mut arena_offset = 0_u64;
+        let mut scheduled_bytes = 0_u64;
+        let mut max_alignment = 1_u64;
+
+        for op in &graph.ops {
+            let tensor = manifest
+                .tensors
+                .iter()
+                .find(|tensor| tensor.name == op.tensor)
+                .ok_or(Error::Capability("manifest_graph_descriptor_mismatch"))?;
+            max_alignment = max_alignment.max(tensor.alignment);
+            let aligned_arena = align(arena_offset, tensor.alignment)?;
+            let bytes = tensor.source.end - tensor.source.start;
+            windows.push(TransferWindow {
+                tensor: tensor.name.clone(),
+                file: tensor.file.clone(),
+                offset: tensor.source.start,
+                bytes,
+                alignment: tensor.alignment,
+                arena_offset: aligned_arena,
+                backend: preferred_backend(tensor.file.as_deref()),
+            });
+            scheduled_bytes = scheduled_bytes
+                .checked_add(bytes)
+                .ok_or(Error::Capability("transfer_descriptor_overflow"))?;
+            arena_offset = aligned_arena
+                .checked_add(bytes)
+                .ok_or(Error::Capability("transfer_arena_offset_overflow"))?;
+        }
+
+        Ok(Self {
+            windows,
+            scheduled_bytes,
+            max_alignment,
+        })
+    }
+}
+
+impl KernelProbe {
+    pub fn first_window(plan: &TransferPlan) -> Option<Self> {
+        let window = plan.windows.iter().find(|w| w.file.is_some())?;
+        Some(Self {
+            bin: std::env::var_os("BLOK_BYTE_PROBE_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("build/blok-byte-probe")),
+            backend: std::env::var("BLOK_IO_BACKEND").unwrap_or_else(|_| "odirect".to_owned()),
+            file: window.file.clone()?,
+            offset: window.offset,
+            bytes: window.bytes,
+            alignment: window.alignment,
+        })
+    }
+
+    pub fn run(&self) -> Result<()> {
+        if !self.bin.is_file() {
+            return Err(Error::Capability("blok_byte_probe_binary_required"));
+        }
+        let status = ProcessCommand::new(&self.bin)
+            .args([
+                "--backend",
+                &self.backend,
+                "--file",
+                &self.file,
+                "--offset",
+                &self.offset.to_string(),
+                "--bytes",
+                &self.bytes.to_string(),
+                "--alignment",
+                &self.alignment.to_string(),
+            ])
+            .stderr(Stdio::inherit())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(Error::Capability("blok_byte_probe_failed"))
+        }
+    }
+}
+
+fn preferred_backend(file: Option<&str>) -> &'static str {
+    if file.is_some() {
+        "ugds_nvme_to_vram"
+    } else {
+        "descriptor_only_no_payload_file"
+    }
+}
+
+impl DirectIoProbe {
+    pub fn first_window(plan: &TransferPlan) -> Self {
+        let Some(window) = plan.windows.iter().find(|w| w.file.is_some()) else {
+            return Self {
+                file: None,
+                offset: 0,
+                bytes: 0,
+                block: 4096,
+            };
+        };
+        let block = window.alignment.max(4096);
+        Self {
+            file: window.file.clone(),
+            offset: window.offset,
+            bytes: window.bytes.min(block),
+            block,
+        }
+    }
+
+    pub fn run(&self) -> Result<()> {
+        let Some(file) = &self.file else {
+            return Ok(());
+        };
+        if self.bytes == 0
+            || !self.offset.is_multiple_of(self.block)
+            || !self.bytes.is_multiple_of(self.block)
+        {
+            return Err(Error::Capability("direct_io_probe_window_unaligned"));
+        }
+        let status = ProcessCommand::new("dd")
+            .args([
+                &format!("if={file}"),
+                "of=/dev/null",
+                "iflag=direct",
+                &format!("bs={}", self.block),
+                &format!("skip={}", self.offset / self.block),
+                &format!("count={}", self.bytes / self.block),
+                "status=none",
+            ])
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(Error::Capability("direct_io_probe_failed"))
+        }
+    }
+}
+
+fn align(value: u64, alignment: u64) -> Result<u64> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return Err(Error::Capability("transfer_alignment_invalid"));
+    }
+    let mask = alignment - 1;
+    value
+        .checked_add(mask)
+        .map(|v| v & !mask)
+        .ok_or(Error::Capability("transfer_alignment_overflow"))
+}
+
+
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/src/linux_hardware_probe_report.rs
+============================================================
+use std::collections::HashSet;
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HardwareReport {
+    pub json: String,
+}
+
+impl HardwareReport {
+    pub fn probe() -> Self {
+        let cpuinfo = read("/proc/cpuinfo");
+        let modules = read("/proc/modules");
+        let gpu = pci("0x10de", "0x03").into_iter().next();
+        let smi = nvidia_smi();
+        let nvme = nvme(&mounts());
+        let sandbox = Path::new("/sys/bus/pci/devices").exists()
+            && gpu.is_some()
+            && !Path::new("/dev/nvidia0").exists();
+        Self {
+            json: format!(
+                "{{\"schema\":\"blok.hardware.v0\",\"host\":{},\"cpu\":{},\"gpu\":{},\"nvme\":[{}],\"capabilities\":{},\"failures\":[{}]}}",
+                host(sandbox), cpu(&cpuinfo), gpu_json(gpu.as_deref(), smi.as_ref()),
+                nvme.join(","), caps(&modules), failures(gpu.as_deref(), smi.as_ref(), sandbox, &nvme).join(",")
+            ),
+        }
+    }
+}
+
+fn host(sandbox: bool) -> String {
+    format!(
+        "{{\"hostname\":{},\"os\":{},\"kernel\":{},\"sandboxed\":{},\"probe_utc\":{}}}",
+        q(&read_trim("/proc/sys/kernel/hostname")),
+        q(&os()),
+        q(&read_trim("/proc/sys/kernel/osrelease")),
+        sandbox,
+        q(&format!(
+            "unix:{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs())
+        ))
+    )
+}
+
+fn cpu(s: &str) -> String {
+    let logical = s.lines().filter(|l| l.starts_with("processor")).count() as u32;
+    let vendor = cpu_field(s, "vendor_id");
+    let physical = core_count(s).unwrap_or(logical);
+    format!(
+        concat!(
+            "{{\"model\":{},\"vendor\":{},\"sockets\":{},\"physical_cores\":{},",
+            "\"logical_cpus\":{},\"numa_nodes\":{},\"frequency_governor\":{},",
+            "\"scaling_driver\":{},\"isolated_cpus\":{},\"ccd_plan\":{}}}"
+        ),
+        q(&cpu_field(s, "model name")),
+        q(&vendor),
+        socket_count(s),
+        physical,
+        logical,
+        dirs("/sys/devices/system/node", "node").max(1),
+        q(&read_trim(
+            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+        )),
+        q(&read_trim(
+            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_driver"
+        )),
+        oq(read_trim("/sys/devices/system/cpu/isolated")),
+        q(if vendor == "AuthenticAMD" && physical >= 16 {
+            "ccd0_cuda_submission_ccd1_io_polling"
+        } else {
+            "unknown"
+        })
+    )
+}
+
+fn gpu_json(gpu: Option<&Path>, smi: Option<&SmiGpu>) -> String {
+    let bdf = gpu.and_then(name).unwrap_or("");
+    let status = match (
+        gpu.is_some(),
+        Path::new("/dev/nvidiactl").exists(),
+        smi.is_some(),
+    ) {
+        (false, _, _) => "absent",
+        (true, false, _) => "permission_blocked",
+        (true, true, false) => "driver_unreachable",
+        _ => "ready",
+    };
+    let gpu_name = smi
+        .map(|s| s.name.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| lspci(bdf));
+    format!(
+        concat!(
+            "{{\"pci_bdf\":{},\"name\":{},\"vendor_id\":{},\"device_id\":{},",
+            "\"subsystem_vendor_id\":{},\"subsystem_device_id\":{},\"numa_node\":{},",
+            "\"local_cpulist\":{},\"kernel_driver\":{},\"nvidia_module_version\":{},",
+            "\"nvidia_smi_ok\":{},\"compute_capability\":{},\"vram_bytes\":{},",
+            "\"pcie_link_gen\":{},\"pcie_link_width\":{},\"pcie_max_link_gen\":{},",
+            "\"pcie_max_link_width\":{},\"status\":{}}}"
+        ),
+        q(bdf),
+        q(&gpu_name),
+        sysq(gpu, "vendor"),
+        sysq(gpu, "device"),
+        sysq(gpu, "subsystem_vendor"),
+        sysq(gpu, "subsystem_device"),
+        sysn(gpu, "numa_node"),
+        syso(gpu, "local_cpulist"),
+        q(&gpu.map(driver).unwrap_or_default()),
+        q(&module_version()),
+        smi.is_some(),
+        smi.map_or("null".to_owned(), |s| q(&s.compute)),
+        smi.map_or("null".to_owned(), |s| (s.vram_mib * 1024 * 1024)
+            .to_string()),
+        syso(gpu, "current_link_speed"),
+        syso(gpu, "current_link_width"),
+        syso(gpu, "max_link_speed"),
+        syso(gpu, "max_link_width"),
+        q(status)
+    )
+}
+
+fn nvme(mounts: &[(String, String)]) -> Vec<String> {
+    blocks("nvme")
+        .into_iter()
+        .map(|block| {
+            let dev = Path::new("/sys/block").join(&block);
+            let pci = fs::canonicalize(dev.join("device")).ok().and_then(|p| {
+                p.ancestors()
+                    .find(|a| a.join("vendor").exists())
+                    .map(Path::to_path_buf)
+            });
+            let mps: Vec<_> = mounts
+                .iter()
+                .filter(|(src, _)| src.contains(&block))
+                .map(|(_, dst)| q(dst))
+                .collect();
+            let role = if mps.iter().any(|m| m == "\"/\"") {
+                "root"
+            } else if mps.is_empty() {
+                "unknown"
+            } else {
+                "model"
+            };
+            format!(
+                concat!(
+                    "{{\"pci_bdf\":{},\"block\":{},\"model\":{},\"controller\":{},",
+                    "\"vendor_id\":{},\"device_id\":{},\"numa_node\":{},\"local_cpulist\":{},",
+                    "\"kernel_driver\":{},\"mountpoints\":[{}],\"logical_block_bytes\":{},",
+                    "\"physical_block_bytes\":{},\"read_ahead_kb\":{},\"nr_requests\":{},",
+                    "\"scheduler\":{},\"write_cache\":{},\"pcie_link_gen\":{},\"pcie_link_width\":{},",
+                    "\"pcie_max_link_gen\":{},\"pcie_max_link_width\":{},\"role\":{},",
+                    "\"ugds_rebind_allowed\":{}}}"
+                ),
+                q(pci.as_deref().and_then(name).unwrap_or("")),
+                q(&block),
+                q(&read_path(&dev.join("device/model"))),
+                q(&pci.as_deref().and_then(name).map(lspci).unwrap_or_default()),
+                sysq(pci.as_deref(), "vendor"),
+                sysq(pci.as_deref(), "device"),
+                sysn(pci.as_deref(), "numa_node"),
+                syso(pci.as_deref(), "local_cpulist"),
+                q(&pci.as_deref().map(driver).unwrap_or_default()),
+                mps.join(","),
+                num(&dev.join("queue/logical_block_size")),
+                num(&dev.join("queue/physical_block_size")),
+                num(&dev.join("queue/read_ahead_kb")),
+                num(&dev.join("queue/nr_requests")),
+                q(&read_path(&dev.join("queue/scheduler"))),
+                q(&read_path(&dev.join("queue/write_cache"))),
+                syso(pci.as_deref(), "current_link_speed"),
+                syso(pci.as_deref(), "current_link_width"),
+                syso(pci.as_deref(), "max_link_speed"),
+                syso(pci.as_deref(), "max_link_width"),
+                q(role),
+                role != "root"
+            )
+        })
+        .collect()
+}
+
+fn caps(mods: &str) -> String {
+    let cuda = if Path::new("/dev/nvidiactl").exists() {
+        "present"
+    } else if module(mods, "nvidia") == "loaded" {
+        "permission_blocked"
+    } else {
+        "missing"
+    };
+    format!(
+        "{{\"cuda_runtime\":{},\"nvcc\":{},\"fio\":{},\"nvidia_fs\":{},\"ugds_drv\":{}}}",
+        q(cuda),
+        q(cmd("nvcc")),
+        q(cmd("fio")),
+        q(module(mods, "nvidia_fs")),
+        q(module(mods, "ugds_drv"))
+    )
+}
+
+fn failures(
+    gpu: Option<&Path>,
+    smi: Option<&SmiGpu>,
+    sandbox: bool,
+    nvme: &[String],
+) -> Vec<String> {
+    let mut v = Vec::new();
+    if gpu.is_none() {
+        v.push(fail(
+            "gpu",
+            "no NVIDIA PCI display device observed",
+            "check PCI visibility",
+        ));
+    } else if sandbox {
+        v.push(fail(
+            "gpu.device_nodes",
+            "NVIDIA PCI device is visible but /dev/nvidia* is hidden",
+            "run outside the sandbox or grant device access",
+        ));
+    } else if smi.is_none() {
+        v.push(fail(
+            "gpu.nvidia_smi",
+            "nvidia-smi failed",
+            "load driver and check permissions",
+        ));
+    }
+    if nvme.is_empty() {
+        v.push(fail(
+            "nvme",
+            "no NVMe block device observed",
+            "check /sys/block visibility",
+        ));
+    }
+    v
+}
+
+fn fail(field: &str, reason: &str, fix: &str) -> String {
+    format!(
+        "{{\"field\":{},\"reason\":{},\"fix\":{}}}",
+        q(field),
+        q(reason),
+        q(fix)
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SmiGpu {
+    name: String,
+    compute: String,
+    vram_mib: u64,
+}
+
+fn nvidia_smi() -> Option<SmiGpu> {
+    let o = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=name,compute_cap,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    o.status
+        .success()
+        .then(|| String::from_utf8(o.stdout).ok())
+        .flatten()
+        .and_then(|s| parse_smi(s.lines().next()?))
+}
+
+fn parse_smi(line: &str) -> Option<SmiGpu> {
+    let mut p = line.split(',').map(str::trim);
+    Some(SmiGpu {
+        name: p.next()?.to_owned(),
+        compute: p.next()?.to_owned(),
+        vram_mib: p.next()?.parse().ok()?,
+    })
+}
+
+fn lspci(bdf: &str) -> String {
+    let short = bdf.strip_prefix("0000:").unwrap_or(bdf);
+    Command::new("lspci")
+        .args(["-s", short])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().split_once(": ").map(|(_, v)| v.to_owned()))
+        .unwrap_or_default()
+}
+
+fn pci(vendor: &str, class: &str) -> Vec<PathBuf> {
+    fs::read_dir("/sys/bus/pci/devices")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            read_path(&p.join("vendor")) == vendor && read_path(&p.join("class")).starts_with(class)
+        })
+        .collect()
+}
+
+fn mounts() -> Vec<(String, String)> {
+    read("/proc/self/mountinfo")
+        .lines()
+        .filter_map(parse_mount)
+        .collect()
+}
+
+fn parse_mount(line: &str) -> Option<(String, String)> {
+    let (left, right) = line.split_once(" - ")?;
+    Some((
+        right.split_whitespace().nth(1)?.to_owned(),
+        left.split_whitespace().nth(4)?.replace("\\040", " "),
+    ))
+}
+
+fn core_count(cpuinfo: &str) -> Option<u32> {
+    let mut cores = HashSet::new();
+    let (mut socket, mut core) = (None, None);
+    for line in cpuinfo.lines().chain([""]) {
+        if line.is_empty() {
+            if let (Some(s), Some(c)) = (socket.take(), core.take()) {
+                cores.insert((s, c));
+            }
+        } else if let Some(v) = field(line, "physical id") {
+            socket = Some(v.to_owned());
+        } else if let Some(v) = field(line, "core id") {
+            core = Some(v.to_owned());
+        }
+    }
+    (!cores.is_empty()).then_some(cores.len() as u32)
+}
+
+fn socket_count(cpuinfo: &str) -> u32 {
+    cpuinfo
+        .lines()
+        .filter_map(|l| field(l, "physical id"))
+        .collect::<HashSet<_>>()
+        .len()
+        .max(1) as u32
+}
+
+fn cpu_field(cpuinfo: &str, key: &str) -> String {
+    cpuinfo
+        .lines()
+        .find_map(|l| field(l, key))
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    line.strip_prefix(key)?.split(':').nth(1).map(str::trim)
+}
+
+fn blocks(prefix: &str) -> Vec<String> {
+    fs::read_dir("/sys/block")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with(prefix))
+        .collect()
+}
+
+fn module(mods: &str, name: &str) -> &'static str {
+    if mods.lines().any(|l| l.starts_with(name)) {
+        "loaded"
+    } else {
+        "missing"
+    }
+}
+
+fn module_version() -> String {
+    read_trim("/proc/driver/nvidia/version")
+        .split_whitespace()
+        .find(|s| s.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn cmd(name: &str) -> &'static str {
+    env::var_os("PATH")
+        .and_then(|p| env::split_paths(&p).find(|d| d.join(name).is_file()))
+        .map_or("missing", |_| "present")
+}
+
+fn dirs(path: &str, prefix: &str) -> u32 {
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+        .count() as u32
+}
+
+fn driver(p: &Path) -> String {
+    fs::read_link(p.join("driver"))
+        .ok()
+        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_default()
+}
+
+fn name(p: &Path) -> Option<&str> {
+    p.file_name().and_then(|s| s.to_str())
+}
+
+fn sysq(p: Option<&Path>, f: &str) -> String {
+    q(&p.map(|p| read_path(&p.join(f))).unwrap_or_default())
+}
+
+fn syso(p: Option<&Path>, f: &str) -> String {
+    oq(p.map(|p| read_path(&p.join(f))).unwrap_or_default())
+}
+
+fn sysn(p: Option<&Path>, f: &str) -> String {
+    p.map(|p| read_path(&p.join(f)))
+        .filter(|s| !s.is_empty())
+        .unwrap_or("null".to_owned())
+}
+
+fn num(p: &Path) -> String {
+    read_path(p)
+        .parse::<u64>()
+        .map_or("null".to_owned(), |n| n.to_string())
+}
+
+fn read(path: &str) -> String {
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+fn read_trim(path: &str) -> String {
+    read(path).trim().to_owned()
+}
+
+fn read_path(path: &Path) -> String {
+    fs::read_to_string(path)
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default()
+}
+
+fn os() -> String {
+    read("/etc/os-release")
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("PRETTY_NAME=")
+                .map(|v| v.trim_matches('"').to_owned())
+        })
+        .unwrap_or_default()
+}
+
+fn oq(s: String) -> String {
+    if s.is_empty() {
+        "null".to_owned()
+    } else {
+        q(&s)
+    }
+}
+
+fn q(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/src/primitives.rs
+============================================================
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KimiK26TextSpec {
+    pub layers: u32,
+    pub hidden: u32,
+    pub heads: u32,
+    pub q_lora_rank: u32,
+    pub kv_lora_rank: u32,
+    pub qk_nope: u32,
+    pub qk_rope: u32,
+    pub v_head: u32,
+    pub routed_experts: u32,
+    pub experts_per_token: u32,
+    pub moe_hidden: u32,
+    pub vocab: u32,
+    pub max_context: u32,
+}
+
+pub const KIMI_K26_TEXT: KimiK26TextSpec = KimiK26TextSpec {
+    layers: 61,
+    hidden: 7168,
+    heads: 64,
+    q_lora_rank: 1536,
+    kv_lora_rank: 512,
+    qk_nope: 128,
+    qk_rope: 64,
+    v_head: 128,
+    routed_experts: 384,
+    experts_per_token: 8,
+    moe_hidden: 2048,
+    vocab: 163840,
+    max_context: 262144,
+};
+
+pub const KIMI_K26_DECODE: &[&str] = &[
+    "direct_read",
+    "rmsnorm_int4_matvec",
+    "mla_qkv",
+    "yarn_rope",
+    "flash_attention",
+    "router_topk",
+    "moe_silu_weighted_sum",
+    "bf16_matmul",
+    "residual",
+    "sample_argmax",
+];
+
+
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/src/runtime_environment_config.rs
+============================================================
+use std::env;
+use std::path::PathBuf;
+
+use crate::error::{Error, Result};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeConfig {
+    pub blok_home: PathBuf,
+    pub model_root: PathBuf,
+    pub report_root: PathBuf,
+    pub strict_direct_io: bool,
+}
+
+impl RuntimeConfig {
+    pub fn from_env() -> Result<Self> {
+        let blok_home = env_path("BLOK_HOME")?.unwrap_or(default_home()?);
+        let model_root = env_path("BLOK_MODEL_ROOT")?.unwrap_or_else(|| blok_home.join("models"));
+        let report_root =
+            env_path("BLOK_REPORT_ROOT")?.unwrap_or_else(|| blok_home.join("reports"));
+        let strict_direct_io = env_bool("BLOK_STRICT_DIRECT_IO")?.unwrap_or(true);
+
+        Ok(Self {
+            blok_home,
+            model_root,
+            report_root,
+            strict_direct_io,
+        })
+    }
+}
+
+fn env_path(name: &str) -> Result<Option<PathBuf>> {
+    match env::var_os(name) {
+        Some(value) if value.is_empty() => Err(Error::Config(format!("{name} cannot be empty"))),
+        Some(value) => Ok(Some(PathBuf::from(value))),
+        None => Ok(None),
+    }
+}
+
+fn env_bool(name: &str) -> Result<Option<bool>> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| Error::Config(format!("{name} must be valid unicode")))?;
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        _ => Err(Error::Config(format!("{name} must be boolean"))),
+    }
+}
+
+fn default_home() -> Result<PathBuf> {
+    let Some(home) = env::var_os("HOME") else {
+        return Err(Error::Config(
+            "BLOK_HOME is required when HOME is unset".to_owned(),
+        ));
+    };
+    if home.is_empty() {
+        return Err(Error::Config("HOME cannot be empty".to_owned()));
+    }
+    Ok(PathBuf::from(home).join(".blok"))
+}
+
+
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/src/tensor_manifest_parser.rs
+============================================================
+use std::collections::BTreeSet;
+use std::ops::Range;
+
+use crate::{Error, Result};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Architecture {
+    Dense,
+    Gqa,
+    Moe,
+    Mla,
+    Hybrid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Layout {
+    Source,
+    Sidecar,
+    Repacked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DType {
+    Bf16,
+    F16,
+    F32,
+    I8,
+    U8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Tensor {
+    pub name: String,
+    pub role: String,
+    pub dtype: DType,
+    pub shape: Vec<u64>,
+    pub source: Range<u64>,
+    pub alignment: u64,
+    pub file: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Manifest {
+    pub architecture: Architecture,
+    pub layout: Layout,
+    pub tensors: Vec<Tensor>,
+}
+
+impl Manifest {
+    pub fn parse(text: &str) -> Result<Self> {
+        let mut architecture = None;
+        let mut layout = None;
+        let mut tensors = Vec::new();
+
+        for (line_no, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') || line == "blok-manifest-v1" {
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("architecture=") {
+                architecture = Some(parse_arch(value)?);
+            } else if let Some(value) = line.strip_prefix("layout=") {
+                layout = Some(parse_layout(value)?);
+            } else if let Some(rest) = line.strip_prefix("tensor ") {
+                tensors.push(parse_tensor(rest, line_no + 1)?);
+            } else {
+                return Err(Error::Manifest(format!("line {} is unknown", line_no + 1)));
+            }
+        }
+
+        let manifest = Self {
+            architecture: architecture
+                .ok_or_else(|| Error::Manifest("architecture is required".to_owned()))?,
+            layout: layout.ok_or_else(|| Error::Manifest("layout is required".to_owned()))?,
+            tensors,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn payload_bytes(&self) -> u64 {
+        self.tensors
+            .iter()
+            .map(|t| t.source.end - t.source.start)
+            .sum()
+    }
+
+    pub fn max_alignment(&self) -> u64 {
+        self.tensors.iter().map(|t| t.alignment).max().unwrap_or(1)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.tensors.is_empty() {
+            return Err(Error::Manifest(
+                "at least one tensor is required".to_owned(),
+            ));
+        }
+        let mut names = BTreeSet::new();
+        for tensor in &self.tensors {
+            if !names.insert(tensor.name.as_str()) {
+                return Err(Error::Manifest(format!(
+                    "{} is declared more than once",
+                    tensor.name
+                )));
+            }
+            if tensor.source.start >= tensor.source.end {
+                return Err(Error::Manifest(format!(
+                    "{} has an empty range",
+                    tensor.name
+                )));
+            }
+            if tensor.alignment == 0 || !tensor.alignment.is_power_of_two() {
+                return Err(Error::Manifest(format!(
+                    "{} alignment must be a power of two",
+                    tensor.name
+                )));
+            }
+            if tensor.source.start % tensor.alignment != 0 {
+                return Err(Error::Manifest(format!(
+                    "{} offset is unaligned",
+                    tensor.name
+                )));
+            }
+            if (tensor.source.end - tensor.source.start) % tensor.alignment != 0 {
+                return Err(Error::Manifest(format!(
+                    "{} size is unaligned",
+                    tensor.name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Architecture {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dense => "dense",
+            Self::Gqa => "gqa",
+            Self::Moe => "moe",
+            Self::Mla => "mla",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
+impl Layout {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Sidecar => "sidecar",
+            Self::Repacked => "repacked",
+        }
+    }
+}
+
+fn parse_tensor(rest: &str, line_no: usize) -> Result<Tensor> {
+    let parts: Vec<_> = rest.split_whitespace().collect();
+    if !(7..=8).contains(&parts.len()) {
+        return Err(Error::Manifest(format!(
+            "line {line_no} tensor requires 7 or 8 fields"
+        )));
+    }
+    let offset = u64_field(parts[4], "offset")?;
+    let size = u64_field(parts[5], "size")?;
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| Error::Manifest(format!("line {line_no} tensor range overflows")))?;
+    Ok(Tensor {
+        name: parts[0].to_owned(),
+        role: parts[1].to_owned(),
+        dtype: parse_dtype(parts[2])?,
+        shape: parts[3]
+            .split('x')
+            .map(|v| u64_field(v, "shape"))
+            .collect::<Result<_>>()?,
+        source: offset..end,
+        alignment: u64_field(parts[6], "alignment")?,
+        file: parts.get(7).map(|s| (*s).to_owned()),
+    })
+}
+
+fn u64_field(value: &str, name: &str) -> Result<u64> {
+    value
+        .parse()
+        .map_err(|_| Error::Manifest(format!("{name} must be an integer")))
+}
+
+fn parse_arch(value: &str) -> Result<Architecture> {
+    match value {
+        "dense" => Ok(Architecture::Dense),
+        "gqa" => Ok(Architecture::Gqa),
+        "moe" => Ok(Architecture::Moe),
+        "mla" => Ok(Architecture::Mla),
+        "hybrid" => Ok(Architecture::Hybrid),
+        _ => Err(Error::Manifest(format!("unknown architecture: {value}"))),
+    }
+}
+
+fn parse_layout(value: &str) -> Result<Layout> {
+    match value {
+        "source" => Ok(Layout::Source),
+        "sidecar" => Ok(Layout::Sidecar),
+        "repacked" => Ok(Layout::Repacked),
+        _ => Err(Error::Manifest(format!("unknown layout: {value}"))),
+    }
+}
+
+fn parse_dtype(value: &str) -> Result<DType> {
+    match value {
+        "bf16" => Ok(DType::Bf16),
+        "f16" => Ok(DType::F16),
+        "f32" => Ok(DType::F32),
+        "i8" => Ok(DType::I8),
+        "u8" => Ok(DType::U8),
+        _ => Err(Error::Manifest(format!("unknown dtype: {value}"))),
+    }
+}
+
+
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/src/tokenizer.rs
+============================================================
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::{Error, Result};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenizerPlan {
+    pub tokenizer_json: PathBuf,
+    pub tokenizer_config_json: Option<PathBuf>,
+    pub model_type: Option<String>,
+    pub vocab_size: Option<u64>,
+    pub merge_count: Option<u64>,
+    pub bos_token_id: Option<u64>,
+    pub eos_token_id: Option<u64>,
+    pub prompt_bytes: u64,
+    pub prompt_chars: u64,
+    pub estimated_prompt_tokens: u64,
+    pub prompt_roundtrip: &'static str,
+}
+
+impl TokenizerPlan {
+    pub fn load(model: &Path, prompt: &str) -> Result<Self> {
+        let root = if model.is_file() {
+            model.parent().unwrap_or(model)
+        } else {
+            model
+        };
+        let tokenizer_json = find_under(root, "tokenizer.json", 5).ok_or(Error::Capability(
+            "tokenizer_json_required_before_prompt_execution",
+        ))?;
+        let tokenizer_config_json = find_under(root, "tokenizer_config.json", 5);
+        let tokenizer_text = fs::read_to_string(&tokenizer_json)?;
+        let config_text = tokenizer_config_json
+            .as_ref()
+            .and_then(|p| fs::read_to_string(p).ok());
+        let prompt_bytes = prompt.len() as u64;
+        let prompt_chars = prompt.chars().count() as u64;
+        Ok(Self {
+            tokenizer_json,
+            tokenizer_config_json,
+            model_type: json_string(&tokenizer_text, "type"),
+            vocab_size: json_number(&tokenizer_text, "vocab_size")
+                .or_else(|| count_vocab_entries(&tokenizer_text)),
+            merge_count: count_array_entries(&tokenizer_text, "merges"),
+            bos_token_id: config_text
+                .as_deref()
+                .and_then(|text| json_number(text, "bos_token_id")),
+            eos_token_id: config_text
+                .as_deref()
+                .and_then(|text| json_number(text, "eos_token_id")),
+            prompt_bytes,
+            prompt_chars,
+            estimated_prompt_tokens: estimate_tokens(prompt),
+            prompt_roundtrip: "metadata_only_tokenizer_execution_pending",
+        })
+    }
+}
+
+fn find_under(root: &Path, name: &str, depth: u8) -> Option<PathBuf> {
+    let direct = root.join(name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    if depth == 0 {
+        return None;
+    }
+    let mut dirs: Vec<_> = fs::read_dir(root)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    dirs.into_iter()
+        .find_map(|path| find_under(&path, name, depth - 1))
+}
+
+fn json_number(text: &str, key: &str) -> Option<u64> {
+    let marker = format!("\"{key}\"");
+    let i = text.find(&marker)?;
+    let after_key = &text[i + marker.len()..];
+    let colon = after_key.find(':')?;
+    let value = after_key[colon + 1..].trim_start();
+    let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+fn json_string(text: &str, key: &str) -> Option<String> {
+    let marker = format!("\"{key}\"");
+    let i = text.find(&marker)?;
+    let after_key = &text[i + marker.len()..];
+    let colon = after_key.find(':')?;
+    let value = after_key[colon + 1..].trim_start();
+    let value = value.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut escaped = false;
+    for c in value.chars() {
+        if escaped {
+            out.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            return Some(out);
+        } else {
+            out.push(c);
+        }
+    }
+    None
+}
+
+fn count_vocab_entries(text: &str) -> Option<u64> {
+    let marker = "\"vocab\"";
+    let i = text.find(marker)?;
+    let rest = &text[i + marker.len()..];
+    let open = rest.find('{')?;
+    let mut depth = 0_u32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut count = 0_u64;
+    let mut could_be_key = false;
+    for c in rest[open..].chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' && in_string {
+            escaped = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            if in_string && depth == 1 {
+                could_be_key = true;
+            }
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(count);
+                }
+            }
+            ':' if depth == 1 && could_be_key => {
+                count += 1;
+                could_be_key = false;
+            }
+            ',' if depth == 1 => could_be_key = false,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn count_array_entries(text: &str, key: &str) -> Option<u64> {
+    let marker = format!("\"{key}\"");
+    let i = text.find(&marker)?;
+    let rest = &text[i + marker.len()..];
+    let open = rest.find('[')?;
+    let mut depth = 0_u32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut count = 0_u64;
+    let mut has_value = false;
+    for c in rest[open..].chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' && in_string {
+            escaped = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            if in_string && depth == 1 {
+                has_value = true;
+            }
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        match c {
+            '[' => depth += 1,
+            ']' => {
+                if depth == 1 {
+                    return Some(count + u64::from(has_value));
+                }
+                depth = depth.saturating_sub(1);
+            }
+            ',' if depth == 1 && has_value => {
+                count += 1;
+                has_value = false;
+            }
+            c if depth == 1 && !c.is_whitespace() => has_value = true,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn estimate_tokens(prompt: &str) -> u64 {
+    let words = prompt.split_whitespace().count() as u64;
+    let byte_estimate = (prompt.len() as u64).div_ceil(4);
+    words.max(byte_estimate).max(u64::from(!prompt.is_empty()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn tokenizer_plan_reports_metadata_without_claiming_roundtrip() {
+        let root = env::temp_dir().join(format!("blok-tokenizer-test-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("create tokenizer dir");
+        fs::write(
+            root.join("tokenizer.json"),
+            r#"{"model":{"type":"BPE","vocab":{"H":0,"i":1,"Hi":2},"merges":["H i"]}}"#,
+        )
+        .expect("write tokenizer");
+        fs::write(
+            root.join("tokenizer_config.json"),
+            r#"{"bos_token_id":0,"eos_token_id":1}"#,
+        )
+        .expect("write tokenizer config");
+
+        let plan = TokenizerPlan::load(&root, "Hi").expect("load tokenizer plan");
+
+        assert_eq!(plan.model_type.as_deref(), Some("BPE"));
+        assert_eq!(plan.vocab_size, Some(3));
+        assert_eq!(plan.merge_count, Some(1));
+        assert_eq!(plan.bos_token_id, Some(0));
+        assert_eq!(plan.eos_token_id, Some(1));
+        assert_eq!(
+            plan.prompt_roundtrip,
+            "metadata_only_tokenizer_execution_pending"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+
+============================================================
+FILE: /home/akhil-nair/Desktop/home/code/blok/xtask/src/xtask_command_line_entrypoint.rs
+============================================================
+
+

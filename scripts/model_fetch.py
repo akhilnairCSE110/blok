@@ -59,6 +59,8 @@ def fetch(c):
     (c["meta_dir"] / "fetch-status.json").write_text(js(status(c)) + "\n")
 
 def role(name):
+    if name.endswith(".mlp.gate.weight") or name.endswith(".mlp.gate.e_score_correction_bias"):
+        return "router"
     if "shared_experts" in name: return "shared_expert_resident"
     if re.search(r"\.experts?\.\d+\.", name): return "routed_expert"
     if any(x in name for x in ATTN): return "attention_resident"

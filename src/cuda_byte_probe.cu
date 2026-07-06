@@ -119,30 +119,28 @@ __global__ __launch_bounds__(384, 1) void blok_router_topk_kernel(const float *_
     scores[tid] = 1.0F / (1.0F + expf(-x));
   }
   __syncthreads();
-  for (std::uint32_t slot = 0; slot < k; ++slot) {
-    float best = -1.0F;
-    std::uint32_t id = 0;
-    for (std::uint32_t i = tid; i < experts; i += blockDim.x) {
-      const float v = scores[i];
-      if (v > best) {
-        best = v;
-        id = i;
-      }
-    }
-    scores[experts + tid] = best;
-    __syncthreads();
-    if (tid == 0) {
-      for (std::uint32_t i = 1; i < blockDim.x; ++i) {
-        if (scores[experts + i] > best) {
-          best = scores[experts + i];
+  if (tid == 0) {
+    float total = 0.0F;
+    for (std::uint32_t slot = 0; slot < k; ++slot) {
+      float best = -1.0F;
+      std::uint32_t id = 0;
+      for (std::uint32_t i = 0; i < experts; ++i) {
+        const float v = scores[i];
+        if (v > best) {
+          best = v;
           id = i;
         }
       }
       expert[slot] = static_cast<std::uint16_t>(id);
-      weight[slot] = best * scale;
+      weight[slot] = best;
+      total += best;
       scores[id] = -1.0F;
     }
-    __syncthreads();
+    if (total > 0.0F) {
+      for (std::uint32_t slot = 0; slot < k; ++slot) {
+        weight[slot] = (weight[slot] / total) * scale;
+      }
+    }
   }
 }
 
