@@ -30,16 +30,3 @@ pub const KIMI_K26_TEXT: KimiK26TextSpec = KimiK26TextSpec {
     vocab: 163840,
     max_context: 262144,
 };
-
-pub const KIMI_K26_DECODE: &[&str] = &[
-    "direct_read",
-    "rmsnorm_int4_matvec",
-    "mla_qkv",
-    "yarn_rope",
-    "flash_attention",
-    "router_topk",
-    "moe_silu_weighted_sum",
-    "bf16_matmul",
-    "residual",
-    "sample_argmax",
-];

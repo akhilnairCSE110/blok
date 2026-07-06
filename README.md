@@ -1,50 +1,24 @@
 # Blok
 
-Blok is an SSD-resident inference runtime. Model weights, prompts, KV state, auxiliary runtime
-checkpoints, layout indexes, and benchmark artifacts live on NVMe by default. GPU VRAM and system
-RAM are scratchpads for a deterministic execution schedule.
+Kimi K2.6-only native inference runtime.
 
-The central bet is simple: transformer inference is deterministic enough to schedule payload
-movement before compute needs it. Blok should store tensors in flash-friendly layouts, move only the
-bytes required by the current graph, use sparsity where it reduces total wall time, fuse operations
-aggressively, and keep the GPU compute-bound instead of depending on whole-model memory residency.
-
-The first target is:
+Path:
 
 ```sh
-blok generate --model <huge-moe-model> --prompt "Hi" --tokens 1
+python3 end_goal_prompt.py
 ```
 
-That command must emit one token on the Linux target with measured NVMe-to-VRAM bytes, kernel time,
-memory use, and no hidden payload `mmap` or page-cache path.
+That calls:
 
-## Source of Truth
+```text
+blok.runtime -> target/{debug,release}/blok generate -> build/blok-kimi-exec
+```
 
-- [Plan index](docs/plan-index.md): granular subsystem plans and the development method.
-- [Golden implementation plan](docs/06_21_plan.md): target, invariants, research notes, milestone
-  gates, and implementation order.
-- [System requirements](docs/system-requirements.md): Ubuntu, CUDA, uGDS, NVMe, and build-tool
-  prerequisites.
-- [scripts/ci.sh](scripts/ci.sh): local and CI command surface used by `just`.
+The native executor owns the model path: manifest parsing, O_DIRECT/uGDS payload movement, CUDA
+kernels, and token emission. vLLM/Transformers are not part of the product path.
 
-## Development State
+Required external state:
 
-This repository now has the first executable Rust crate named `blok` plus `xtask`, preserving the
-current `just` and `scripts/ci.sh` entry points. The implemented surface is intentionally narrow:
-`doctor` and `report` emit deterministic JSON context; `inspect --manifest <path>` validates
-metadata and compiles first-token graph descriptors without touching payload bytes; `generate`
-validates the user intent, compiles graph/arena/I/O descriptors, runs the first aligned Linux
-direct-I/O probe when the manifest carries a source file, and then blocks until CUDA, tokenizer, and
-token emission are implemented.
-
-Do not add passive placeholder modules. Every new source file must define a real type, command,
-report, parser, probe, or test used by the current milestone.
-
-## Core References
-
-- uGDS: https://github.com/ScaleX-IO/uGDS
-- NVIDIA GDS: https://docs.nvidia.com/gpudirect-storage/overview-guide/index.html
-- FlexGen: https://arxiv.org/abs/2303.06865
-- LLM in a flash: https://arxiv.org/abs/2312.11514
-- FlashAttention: https://arxiv.org/abs/2205.14135
-- PagedAttention: https://arxiv.org/abs/2309.06180
+- complete `moonshotai/Kimi-K2.6` download;
+- `scripts/model_fetch.py kimi-k2.6 materialize`;
+- CUDA/CMake build producing `build/blok-kimi-exec`.

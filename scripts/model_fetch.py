@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, re, shutil, struct, subprocess, sys
+import json, os, re, shutil, struct, subprocess, sys, time
 from pathlib import Path
 
 MODELS = {"kimi-k2.6": ("moonshotai/Kimi-K2.6", "7eb5002f6aadc958aed6a9177b7ed26bb94011bb", 595421860056, 64)}
@@ -9,7 +9,7 @@ DTYPE = {"BF16": "bf16", "F16": "f16", "F32": "f32", "I8": "i8", "U8": "u8"}
 
 def die(msg=None):
     if msg: print(msg, file=sys.stderr)
-    print(f"usage: {Path(sys.argv[0]).name} kimi-k2.6 {{status|fetch|detach|layout|materialize}}", file=sys.stderr)
+    print(f"usage: {Path(sys.argv[0]).name} kimi-k2.6 {{status|state|fetch|detach|layout|materialize}}", file=sys.stderr)
     raise SystemExit(64 if msg is None else 1)
 
 def js(x): return json.dumps(x, separators=(",", ":"))
@@ -38,6 +38,22 @@ def status(c):
         "downloaded_bytes": got, "safetensors": shards,
         "complete": got >= c["expected_bytes"] and shards >= c["expected_safetensors"],
     }
+
+def partial(c):
+    root = c["local_dir"] / ".cache/huggingface/download"
+    ps = list(root.rglob("*.incomplete")) if root.is_dir() else []
+    return {"partial_files": len(ps), "partial_bytes": sum(p.stat().st_size for p in ps)}
+
+def tree_bytes(c):
+    return sum(p.stat().st_size for p in c["local_dir"].rglob("*") if p.is_file()) if c["local_dir"].is_dir() else 0
+
+def state(c):
+    a = status(c) | partial(c) | {"tree_bytes": tree_bytes(c)}
+    time.sleep(int(os.getenv("BLOK_STATE_WAIT", "10")))
+    b = status(c) | partial(c) | {"tree_bytes": tree_bytes(c)}
+    b["tree_byte_delta"] = b["tree_bytes"] - a["tree_bytes"]
+    b["partial_byte_delta"] = b["partial_bytes"] - a["partial_bytes"]
+    return b
 
 def hf_env(c):
     env = os.environ.copy()
@@ -110,6 +126,7 @@ def main():
     if len(sys.argv) != 3: die()
     c, mode = ctx(sys.argv[1]), sys.argv[2]
     if mode in ("status", "plan"): print(js(status(c)))
+    elif mode == "state": print(js(state(c)))
     elif mode == "fetch": fetch(c); print(js(status(c)))
     elif mode == "detach": print(js(detach(c)))
     elif mode == "layout": print(js(layout(c)))

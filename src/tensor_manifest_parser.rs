@@ -78,17 +78,6 @@ impl Manifest {
         Ok(manifest)
     }
 
-    pub fn payload_bytes(&self) -> u64 {
-        self.tensors
-            .iter()
-            .map(|t| t.source.end - t.source.start)
-            .sum()
-    }
-
-    pub fn max_alignment(&self) -> u64 {
-        self.tensors.iter().map(|t| t.alignment).max().unwrap_or(1)
-    }
-
     fn validate(&self) -> Result<()> {
         if self.tensors.is_empty() {
             return Err(Error::Manifest(
@@ -129,28 +118,6 @@ impl Manifest {
             }
         }
         Ok(())
-    }
-}
-
-impl Architecture {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Dense => "dense",
-            Self::Gqa => "gqa",
-            Self::Moe => "moe",
-            Self::Mla => "mla",
-            Self::Hybrid => "hybrid",
-        }
-    }
-}
-
-impl Layout {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Source => "source",
-            Self::Sidecar => "sidecar",
-            Self::Repacked => "repacked",
-        }
     }
 }
 

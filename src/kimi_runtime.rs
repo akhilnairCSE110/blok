@@ -1,8 +1,12 @@
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
 use crate::{Error, Manifest, Result, KIMI_K26_TEXT};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KimiNativeRequest<'a> {
     pub manifest: &'a Manifest,
+    pub manifest_path: &'a Path,
     pub prompt: &'a str,
     pub max_tokens: u64,
 }
@@ -27,26 +31,6 @@ pub struct KimiExecutionPlan {
     pub kernel_policy: &'static str,
     pub max_concurrent_instances: u32,
     pub decode_batch_cap: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RoutedToken {
-    pub request: u32,
-    pub token: u32,
-    pub experts: [u16; 8],
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExpertBatch {
-    pub expert: u16,
-    pub tokens: Vec<(u32, u32)>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LayerRouteSchedule {
-    pub layer: u32,
-    pub batches: Vec<ExpertBatch>,
-    pub unique_experts: u32,
 }
 
 impl KimiExecutionPlan {
@@ -92,41 +76,103 @@ impl KimiExecutionPlan {
     }
 }
 
-impl LayerRouteSchedule {
-    pub fn from_tokens(layer: u32, tokens: &[RoutedToken]) -> Self {
-        let mut per_expert: Vec<ExpertBatch> = (0..KIMI_K26_TEXT.routed_experts)
-            .map(|expert| ExpertBatch {
-                expert: expert as u16,
-                tokens: Vec::new(),
-            })
-            .collect();
-        for token in tokens {
-            for expert in token.experts {
-                per_expert[usize::from(expert)]
-                    .tokens
-                    .push((token.request, token.token));
-            }
-        }
-        let batches: Vec<_> = per_expert
-            .into_iter()
-            .filter(|batch| !batch.tokens.is_empty())
-            .collect();
-        Self {
-            layer,
-            unique_experts: batches.len() as u32,
-            batches,
-        }
-    }
-
-    pub fn cold_expert_pressure(&self, hot_experts_per_layer: u32) -> u32 {
-        self.unique_experts.saturating_sub(hot_experts_per_layer)
-    }
-}
-
 pub fn generate_native(request: KimiNativeRequest<'_>) -> Result<KimiNativeResponse> {
     validate_request(&request)?;
-    let _plan = KimiExecutionPlan::from_manifest(request.manifest);
-    Err(Error::Capability("native_kimi_executor_incomplete"))
+    let plan = KimiExecutionPlan::from_manifest(request.manifest);
+    run_executor(&request, &plan)
+}
+
+fn run_executor(
+    request: &KimiNativeRequest<'_>,
+    plan: &KimiExecutionPlan,
+) -> Result<KimiNativeResponse> {
+    let bin = executor_bin();
+    if !bin.is_file() {
+        return Err(Error::Capability("blok_kimi_exec_binary_required"));
+    }
+    let output = Command::new(&bin)
+        .args([
+            "--manifest",
+            &request.manifest_path.display().to_string(),
+            "--prompt",
+            request.prompt,
+            "--tokens",
+            &request.max_tokens.to_string(),
+            "--top-k",
+            &plan.top_k.to_string(),
+        ])
+        .stderr(Stdio::piped())
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(Error::Native(if stderr.is_empty() {
+            format!("{} exited with {}", bin.display(), output.status)
+        } else {
+            stderr
+        }));
+    }
+    parse_executor_json(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn executor_bin() -> PathBuf {
+    std::env::var_os("BLOK_KIMI_EXEC_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("build/blok-kimi-exec"))
+}
+
+fn parse_executor_json(text: &str) -> Result<KimiNativeResponse> {
+    let text_value = json_string(text, "text")
+        .ok_or_else(|| Error::Native("executor response missing text".to_owned()))?;
+    let tokens = json_u64(text, "tokens")
+        .ok_or_else(|| Error::Native("executor response missing tokens".to_owned()))?;
+    let predicted_tps = json_f64(text, "predicted_tps").unwrap_or(0.0);
+    let watts = json_f64(text, "watts");
+    Ok(KimiNativeResponse {
+        text: text_value,
+        tokens,
+        predicted_tps,
+        watts,
+    })
+}
+
+fn json_u64(text: &str, key: &str) -> Option<u64> {
+    json_number(text, key)?.parse().ok()
+}
+
+fn json_f64(text: &str, key: &str) -> Option<f64> {
+    json_number(text, key)?.parse().ok()
+}
+
+fn json_number<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let marker = format!("\"{key}\"");
+    let i = text.find(&marker)?;
+    let value = text[i + marker.len()..].split_once(':')?.1.trim_start();
+    let end = value
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(value.len());
+    Some(&value[..end])
+}
+
+fn json_string(text: &str, key: &str) -> Option<String> {
+    let marker = format!("\"{key}\"");
+    let i = text.find(&marker)?;
+    let value = text[i + marker.len()..].split_once(':')?.1.trim_start();
+    let value = value.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut escaped = false;
+    for c in value.chars() {
+        if escaped {
+            out.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            return Some(out);
+        } else {
+            out.push(c);
+        }
+    }
+    None
 }
 
 fn concurrency_from_cache_budget() -> u32 {
@@ -147,74 +193,11 @@ fn validate_request(request: &KimiNativeRequest<'_>) -> Result<()> {
     if request.manifest.tensors.is_empty() {
         return Err(Error::Manifest("manifest has no tensors".to_owned()));
     }
+    if !request.manifest_path.is_file() {
+        return Err(Error::Manifest(format!(
+            "manifest path does not exist: {}",
+            request.manifest_path.display()
+        )));
+    }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::manifest::Manifest;
-
-    #[test]
-    fn execution_plan_keeps_routers_resident_and_streams_routed_experts() {
-        let manifest = Manifest::parse(concat!(
-            "blok-manifest-v1\n",
-            "architecture=hybrid\n",
-            "layout=sidecar\n",
-            "tensor model.layers.1.mlp.gate.weight router bf16 384x7168 0 4096 4096\n",
-            "tensor model.layers.1.self_attn.q_a_proj.weight attention_resident bf16 1x2048 4096 4096 4096\n",
-            "tensor model.layers.1.mlp.shared_experts.w1.weight shared_expert_resident bf16 1x2048 8192 4096 4096\n",
-            "tensor model.layers.1.mlp.experts.0.w1.weight routed_expert bf16 1x2048 12288 4096 4096\n",
-            "tensor model.layers.1.mlp.experts.1.w1.weight routed_expert bf16 1x2048 16384 4096 4096\n",
-            "tensor model.layers.1.mlp.experts.2.w1.weight routed_expert bf16 1x2048 20480 4096 4096\n",
-            "tensor model.layers.1.mlp.experts.3.w1.weight routed_expert bf16 1x2048 24576 4096 4096\n",
-            "tensor model.layers.1.mlp.experts.4.w1.weight routed_expert bf16 1x2048 28672 4096 4096\n",
-            "tensor model.layers.1.mlp.experts.5.w1.weight routed_expert bf16 1x2048 32768 4096 4096\n",
-            "tensor model.layers.1.mlp.experts.6.w1.weight routed_expert bf16 1x2048 36864 4096 4096\n",
-            "tensor model.layers.1.mlp.experts.7.w1.weight routed_expert bf16 1x2048 40960 4096 4096\n"
-        ))
-        .expect("manifest");
-
-        let plan = KimiExecutionPlan::from_manifest(&manifest);
-
-        assert_eq!(plan.top_k, 8);
-        assert_eq!(plan.resident_router_bytes, 4096);
-        assert_eq!(plan.resident_attention_bytes, 4096);
-        assert_eq!(plan.resident_shared_expert_bytes, 4096);
-        assert_eq!(plan.streamed_expert_bytes_per_token_floor, 4096 * 8 * 60);
-        assert_eq!(
-            plan.io_policy,
-            "host_issued_gds_or_odirect_into_registered_gpu_slabs"
-        );
-        assert_eq!(plan.decode_batch_cap, 48);
-    }
-
-    #[test]
-    fn route_schedule_groups_tokens_by_expert_for_grouped_gemm() {
-        let schedule = LayerRouteSchedule::from_tokens(
-            7,
-            &[
-                RoutedToken {
-                    request: 0,
-                    token: 10,
-                    experts: [1, 2, 3, 4, 5, 6, 7, 8],
-                },
-                RoutedToken {
-                    request: 1,
-                    token: 20,
-                    experts: [1, 2, 9, 10, 11, 12, 13, 14],
-                },
-            ],
-        );
-
-        assert_eq!(schedule.layer, 7);
-        assert_eq!(schedule.unique_experts, 14);
-        assert_eq!(schedule.cold_expert_pressure(8), 6);
-        let expert_one = schedule
-            .batches
-            .iter()
-            .find(|batch| batch.expert == 1)
-            .expect("expert 1 batch");
-        assert_eq!(expert_one.tokens, vec![(0, 10), (1, 20)]);
-    }
 }

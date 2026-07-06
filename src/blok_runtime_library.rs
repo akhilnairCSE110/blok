@@ -1,362 +1,133 @@
-#[path = "arena.rs"]
-pub mod arena;
-#[path = "runtime_environment_config.rs"]
-pub mod config;
-#[path = "cuda.rs"]
-pub mod cuda;
 #[path = "blok_runtime_error.rs"]
-pub mod error;
-#[path = "first_token_execution_graph.rs"]
-pub mod graph;
-#[path = "linux_hardware_probe_report.rs"]
-pub mod hardware;
-#[path = "io.rs"]
-pub mod io;
+mod error;
 #[path = "kimi_runtime.rs"]
-pub mod kimi_runtime;
+mod kimi_runtime;
 #[path = "tensor_manifest_parser.rs"]
-pub mod manifest;
-#[path = "command_report_json.rs"]
-pub mod observe;
+mod manifest;
 #[path = "primitives.rs"]
-pub mod primitives;
-#[path = "tokenizer.rs"]
-pub mod tokenizer;
+mod primitives;
 
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub use arena::ArenaPlan;
-pub use config::RuntimeConfig;
-pub use cuda::CudaPlan;
 pub use error::{Error, Result};
-pub use graph::Graph;
-pub use hardware::HardwareReport;
-pub use io::{DirectIoProbe, KernelProbe, TransferPlan};
-pub use kimi_runtime::{generate_native, KimiExecutionPlan, KimiNativeRequest, KimiNativeResponse};
-pub use manifest::Manifest;
-pub use observe::{CommandReport, GenerateDescriptors, GenerateIntent};
-pub use primitives::{KimiK26TextSpec, KIMI_K26_DECODE, KIMI_K26_TEXT};
-pub use tokenizer::TokenizerPlan;
+use kimi_runtime::{generate_native, KimiNativeRequest};
+use manifest::Manifest;
+pub use primitives::KIMI_K26_TEXT;
 
-const USAGE: &str = "usage: blok {doctor|report|inspect --manifest <path>|generate --model <path> --prompt <text> --tokens <count> [--agents <count>] [--context <tokens>]}\n";
-
-#[derive(Debug, Eq, PartialEq)]
-enum Command {
-    Doctor,
-    Report,
-    Inspect(PathBuf),
-    Generate(GenerateIntent),
-    Help,
-    Version,
-}
+const USAGE: &str = "usage: blok generate --model <manifest-or-dir> --prompt <text> --tokens <n>\n";
 
 pub fn run<I, W>(args: I, out: &mut W) -> Result<()>
 where
     I: IntoIterator<Item = OsString>,
     W: Write,
 {
-    match parse(args)? {
-        Command::Help => out.write_all(USAGE.as_bytes()).map_err(Error::from),
-        Command::Version => {
-            writeln!(out, "blok {}", env!("CARGO_PKG_VERSION")).map_err(Error::from)
-        }
-        Command::Doctor => {
-            write_report(out, CommandReport::ok("doctor", RuntimeConfig::from_env()?))
-        }
-        Command::Report => {
-            write_report(out, CommandReport::ok("report", RuntimeConfig::from_env()?))
-        }
-        Command::Inspect(path) => {
-            let manifest = Manifest::parse(&fs::read_to_string(path)?)?;
-            let graph = Graph::first_token(&manifest);
-            write_report(
-                out,
-                CommandReport::inspect(RuntimeConfig::from_env()?, &manifest, &graph),
-            )
-        }
-        Command::Generate(intent) => {
-            let config = RuntimeConfig::from_env()?;
-            let manifest_path = find_manifest(&intent.model)?;
-            let manifest = Manifest::parse(&fs::read_to_string(manifest_path)?)?;
-            let graph = Graph::first_token(&manifest);
-            let arena = ArenaPlan::first_token(&graph)?;
-            let transfers = TransferPlan::first_token(&manifest, &graph)?;
-            let cuda = CudaPlan::byte_probe(&transfers)?;
-            let tokenizer = TokenizerPlan::load(&intent.model, &intent.prompt)?;
-            validate_schedule(&intent, &graph)?;
-            if let Some(probe) = KernelProbe::first_window(&transfers) {
-                probe.run()?;
-            }
-            let native_result = generate_native(KimiNativeRequest {
-                manifest: &manifest,
-                prompt: &intent.prompt,
-                max_tokens: intent.tokens,
-            });
-            match native_result {
-                Ok(response) => write_report(
-                    out,
-                    CommandReport::generated(intent, config, response.text, response.tokens),
-                ),
-                Err(error) => {
-                    write_report(
-                        out,
-                        CommandReport::generate_descriptors(
-                            intent,
-                            config,
-                            GenerateDescriptors {
-                                manifest: &manifest,
-                                graph: &graph,
-                                arena: &arena,
-                                transfers: &transfers,
-                                cuda: &cuda,
-                                tokenizer: &tokenizer,
-                            },
-                        ),
-                    )?;
-                    Err(error)
-                }
-            }
-        }
-    }
-}
-
-fn write_report(out: &mut impl Write, report: CommandReport) -> Result<()> {
-    writeln!(out, "{}", report.to_json())?;
-    Ok(())
-}
-
-fn parse<I>(args: I) -> Result<Command>
-where
-    I: IntoIterator<Item = OsString>,
-{
     let mut args = args.into_iter();
     let _program = args.next();
-    let Some(command) = args.next() else {
-        return Ok(Command::Help);
-    };
-
-    match command.to_string_lossy().as_ref() {
-        "-h" | "--help" | "help" => Ok(Command::Help),
-        "-V" | "--version" | "version" => Ok(Command::Version),
-        "doctor" => no_trailing(args, Command::Doctor),
-        "report" => no_trailing(args, Command::Report),
-        "inspect" => parse_inspect(args),
-        "generate" => parse_generate(args),
-        other => Err(Error::Cli(format!("unknown command: {other}"))),
+    match args.next().and_then(|s| s.into_string().ok()).as_deref() {
+        Some("generate") => generate(parse_generate(args)?, out),
+        Some("-h" | "--help" | "help") | None => {
+            out.write_all(USAGE.as_bytes()).map_err(Error::from)
+        }
+        Some(other) => Err(Error::Cli(format!("unknown command: {other}"))),
     }
 }
 
-fn no_trailing<I>(mut args: I, command: Command) -> Result<Command>
-where
-    I: Iterator<Item = OsString>,
-{
-    if let Some(extra) = args.next() {
-        return Err(Error::Cli(format!(
-            "unexpected argument: {}",
-            extra.to_string_lossy()
-        )));
-    }
-    Ok(command)
+struct Generate {
+    model: PathBuf,
+    prompt: String,
+    tokens: u64,
 }
 
-fn parse_inspect<I>(args: I) -> Result<Command>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut args = args.into_iter();
-    match (args.next(), args.next(), args.next()) {
-        (Some(flag), Some(path), None) if flag == "--manifest" => Ok(Command::Inspect(path.into())),
-        _ => Err(Error::Cli("inspect requires --manifest <path>".to_owned())),
-    }
-}
-
-fn parse_generate<I>(args: I) -> Result<Command>
+fn parse_generate<I>(args: I) -> Result<Generate>
 where
     I: IntoIterator<Item = OsString>,
 {
     let mut model = None;
     let mut prompt = None;
     let mut tokens = None;
-    let mut agents = 1;
-    let mut context = None;
     let mut args = args.into_iter();
-
-    while let Some(flag) = args.next() {
-        let flag = flag.to_string_lossy();
+    while let Some(flag) = args.next().and_then(|s| s.into_string().ok()) {
         let value = args
             .next()
             .ok_or_else(|| Error::Cli(format!("{flag} requires a value")))?;
-        match flag.as_ref() {
+        match flag.as_str() {
             "--model" => model = Some(PathBuf::from(value)),
             "--prompt" => prompt = Some(value.to_string_lossy().into_owned()),
-            "--tokens" => tokens = Some(parse_token_count(&value.to_string_lossy())?),
-            "--agents" => agents = parse_agent_count(&value.to_string_lossy())?,
-            "--context" => context = Some(parse_token_count(&value.to_string_lossy())?),
+            "--tokens" => tokens = Some(parse_u64(&value.to_string_lossy(), "--tokens")?),
             other => return Err(Error::Cli(format!("unknown generate flag: {other}"))),
         }
     }
-
-    let tokens = tokens.ok_or(Error::Cli("--tokens is required".to_owned()))?;
-    Ok(Command::Generate(GenerateIntent {
-        model: model.ok_or(Error::Cli("--model is required".to_owned()))?,
-        prompt: prompt.ok_or(Error::Cli("--prompt is required".to_owned()))?,
-        tokens,
-        agents,
-        context: context.unwrap_or(tokens),
-    }))
+    Ok(Generate {
+        model: model.ok_or_else(|| Error::Cli("--model is required".to_owned()))?,
+        prompt: prompt.ok_or_else(|| Error::Cli("--prompt is required".to_owned()))?,
+        tokens: tokens.ok_or_else(|| Error::Cli("--tokens is required".to_owned()))?,
+    })
 }
 
-fn validate_schedule(intent: &GenerateIntent, graph: &Graph) -> Result<()> {
-    intent
-        .context
-        .checked_mul(u64::from(intent.agents))
-        .and_then(|_| {
-            graph
-                .scheduled_bytes()
-                .checked_mul(u64::from(intent.agents))
-        })
-        .ok_or(Error::Capability("schedule_counter_overflow"))?;
+fn parse_u64(value: &str, name: &str) -> Result<u64> {
+    let n = value
+        .parse()
+        .map_err(|_| Error::Cli(format!("{name} must be an integer")))?;
+    if n == 0 {
+        Err(Error::Cli(format!("{name} must be greater than zero")))
+    } else {
+        Ok(n)
+    }
+}
+
+fn generate<W: Write>(g: Generate, out: &mut W) -> Result<()> {
+    let manifest_path = find_manifest(&g.model)?;
+    let manifest = Manifest::parse(&fs::read_to_string(&manifest_path)?)?;
+    let response = generate_native(KimiNativeRequest {
+        manifest: &manifest,
+        manifest_path: &manifest_path,
+        prompt: &g.prompt,
+        max_tokens: g.tokens,
+    })?;
+    writeln!(
+        out,
+        "{{\"status\":\"ok\",\"text\":{},\"tokens\":{},\"predicted_tps\":{},\"watts\":{}}}",
+        json(&response.text),
+        response.tokens,
+        response.predicted_tps,
+        response
+            .watts
+            .map_or_else(|| "null".to_owned(), |watts| watts.to_string())
+    )?;
     Ok(())
-}
-
-fn parse_token_count(value: &str) -> Result<u64> {
-    let tokens = value
-        .parse::<u64>()
-        .map_err(|_| Error::Cli(format!("invalid token count: {value}")))?;
-    if tokens == 0 {
-        Err(Error::Cli(
-            "token counts must be greater than zero".to_owned(),
-        ))
-    } else {
-        Ok(tokens)
-    }
-}
-
-fn parse_agent_count(value: &str) -> Result<u32> {
-    let agents = value
-        .parse::<u32>()
-        .map_err(|_| Error::Cli(format!("invalid agent count: {value}")))?;
-    if agents == 0 {
-        Err(Error::Cli("--agents must be greater than zero".to_owned()))
-    } else {
-        Ok(agents)
-    }
 }
 
 fn find_manifest(model: &Path) -> Result<PathBuf> {
     if model.is_file() {
         return Ok(model.to_path_buf());
     }
-    if !model.exists() {
-        return Err(Error::Manifest(format!(
-            "model path does not exist: {}",
-            model.display()
-        )));
-    }
-
     [
         model.join("manifest.blok"),
         model.join("blok").join("manifest.blok"),
-        model.join("blok").join("repacked").join("manifest.blok"),
         model.join("meta").join("manifest.blok"),
     ]
     .into_iter()
-    .find(|path| path.is_file())
-    .ok_or_else(|| {
-        Error::Manifest(format!(
-            "no manifest.blok found under {}; run scripts/model_fetch.py kimi-k2.6 materialize first",
-            model.display()
-        ))
-    })
+    .find(|p| p.is_file())
+    .ok_or_else(|| Error::Manifest(format!("no manifest.blok found under {}", model.display())))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::env;
-
-    #[test]
-    fn generate_compiles_descriptors_before_capability_error() {
-        let root = env::temp_dir().join(format!("blok-generate-test-{}", std::process::id()));
-        let manifest_dir = root.join("blok");
-        fs::create_dir_all(&manifest_dir).expect("create manifest dir");
-        fs::write(
-            manifest_dir.join("manifest.blok"),
-            concat!(
-                "blok-manifest-v1\n",
-                "architecture=hybrid\n",
-                "layout=repacked\n",
-                "tensor model.embed_tokens.weight resident bf16 1x2048 0 4096 4096\n",
-                "tensor layer.0.dense_ffn.neuron.0 dense_ffn_rowcol bf16 1x2048 4096 4096 4096\n",
-                "tensor model.layers.0.mlp.experts.0.w1.weight routed_expert bf16 1x2048 8192 4096 4096\n",
-                "tensor model.layers.0.mlp.experts.1.w1.weight routed_expert bf16 1x2048 12288 4096 4096\n"
-            ),
-        )
-        .expect("write manifest");
-        fs::write(
-            root.join("tokenizer.json"),
-            r#"{"model":{"type":"BPE","vocab":{"H":0,"i":1},"merges":[]}}"#,
-        )
-        .expect("write tokenizer");
-        fs::write(
-            root.join("tokenizer_config.json"),
-            r#"{"bos_token_id":0,"eos_token_id":1}"#,
-        )
-        .expect("write tokenizer config");
-
-        let mut out = Vec::new();
-        let result = run(
-            [
-                OsString::from("blok"),
-                OsString::from("generate"),
-                OsString::from("--model"),
-                root.as_os_str().to_owned(),
-                OsString::from("--prompt"),
-                OsString::from("Hi"),
-                OsString::from("--tokens"),
-                OsString::from("1000000"),
-                OsString::from("--agents"),
-                OsString::from("8"),
-                OsString::from("--context"),
-                OsString::from("1000000"),
-            ],
-            &mut out,
-        );
-
-        assert!(matches!(
-            result,
-            Err(Error::Capability("native_kimi_executor_incomplete"))
-        ));
-        let report = String::from_utf8(out).expect("utf8 report");
-        assert!(report.contains(
-            "\"decision\":\"direct_io_cuda_and_tokenizer_required_before_payload_reads\""
-        ));
-        assert!(report.contains("\"scheduled_bytes\""));
-        assert!(report.contains("\"arena\""));
-        assert!(report.contains("\"io\""));
-        assert!(report.contains("\"preferred_backend\":\"ugds_nvme_to_vram\""));
-        assert!(report.contains("\"cuda\""));
-        assert!(report.contains("\"target_sm\":\"sm_120\""));
-        assert!(report.contains("\"entry\":\"blok_byte_probe_kernel\""));
-        assert!(report.contains("\"ld.global.v4.u32\""));
-        assert!(report.contains("\"fma.rn.f32\""));
-        assert!(report.contains("\"tokenizer\""));
-        assert!(report.contains("\"model_type\":\"BPE\""));
-        assert!(
-            report.contains("\"prompt_roundtrip\":\"metadata_only_tokenizer_execution_pending\"")
-        );
-        assert!(report.contains("\"top_k\":8"));
-        assert!(report.contains("\"runtime\":\"fixed_kimi_k26_text_primitives\""));
-        assert!(report.contains("\"rmsnorm_int4_matvec\""));
-        assert!(report.contains("\"moe_silu_weighted_sum\""));
-        assert!(report.contains("\"dense_neurons\":1"));
-        assert!(report.contains("\"skipped_expert_bytes\":0"));
-        assert!(report.contains("\"agents\":8"));
-        assert!(report.contains("\"context_tokens\":1000000"));
-
-        let _ = fs::remove_dir_all(root);
+fn json(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
     }
+    out.push('"');
+    out
 }
