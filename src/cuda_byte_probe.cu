@@ -70,6 +70,174 @@ __global__ __launch_bounds__(256, 2) void blok_neuron_dot_kernel(const float *__
   }
 }
 
+__global__ __launch_bounds__(256, 2) void blok_rmsnorm_kernel(const float *__restrict__ x,
+                                                              const float *__restrict__ w,
+                                                              float *__restrict__ y,
+                                                              std::uint32_t hidden, float eps) {
+  extern __shared__ float s[];
+  const std::uint32_t tid = threadIdx.x;
+  float sum = 0.0F;
+  for (std::uint32_t i = tid; i < hidden; i += blockDim.x) {
+    const float v = x[i];
+    sum += v * v;
+  }
+  s[tid] = sum;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x / 2; stride; stride >>= 1) {
+    if (tid < stride) {
+      s[tid] += s[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float inv = rsqrtf((s[0] / static_cast<float>(hidden)) + eps);
+  for (std::uint32_t i = tid; i < hidden; i += blockDim.x) {
+    y[i] = x[i] * inv * w[i];
+  }
+}
+
+__global__ __launch_bounds__(256, 2) void blok_silu_gate_kernel(const float *__restrict__ gate,
+                                                                const float *__restrict__ up,
+                                                                float *__restrict__ y,
+                                                                std::uint32_t n) {
+  const std::uint32_t i = (blockIdx.x * blockDim.x) + threadIdx.x;
+  if (i < n) {
+    const float g = gate[i];
+    y[i] = (g / (1.0F + expf(-g))) * up[i];
+  }
+}
+
+__global__ __launch_bounds__(384, 1) void blok_router_topk_kernel(const float *__restrict__ logits,
+                                                                  std::uint16_t *__restrict__ expert,
+                                                                  float *__restrict__ weight,
+                                                                  std::uint32_t experts,
+                                                                  std::uint32_t k,
+                                                                  float scale) {
+  extern __shared__ float scores[];
+  const std::uint32_t tid = threadIdx.x;
+  if (tid < experts) {
+    const float x = logits[tid];
+    scores[tid] = 1.0F / (1.0F + expf(-x));
+  }
+  __syncthreads();
+  for (std::uint32_t slot = 0; slot < k; ++slot) {
+    float best = -1.0F;
+    std::uint32_t id = 0;
+    for (std::uint32_t i = tid; i < experts; i += blockDim.x) {
+      const float v = scores[i];
+      if (v > best) {
+        best = v;
+        id = i;
+      }
+    }
+    scores[experts + tid] = best;
+    __syncthreads();
+    if (tid == 0) {
+      for (std::uint32_t i = 1; i < blockDim.x; ++i) {
+        if (scores[experts + i] > best) {
+          best = scores[experts + i];
+          id = i;
+        }
+      }
+      expert[slot] = static_cast<std::uint16_t>(id);
+      weight[slot] = best * scale;
+      scores[id] = -1.0F;
+    }
+    __syncthreads();
+  }
+}
+
+__global__ __launch_bounds__(256, 2) void blok_int4_group_matvec_kernel(
+    const float *__restrict__ x, const std::uint8_t *__restrict__ packed,
+    const float *__restrict__ scale, float *__restrict__ y, std::uint32_t rows,
+    std::uint32_t cols) {
+  extern __shared__ float partial[];
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t tid = threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  float acc = 0.0F;
+  const std::uint32_t packed_row = row * ((cols + 1) >> 1);
+  for (std::uint32_t c = tid; c < cols; c += blockDim.x) {
+    const std::uint8_t byte = packed[packed_row + (c >> 1)];
+    const std::int8_t q = static_cast<std::int8_t>((c & 1) ? (byte >> 4) : (byte & 15)) - 8;
+    acc += x[c] * static_cast<float>(q) * scale[(row * ((cols + 31) >> 5)) + (c >> 5)];
+  }
+  partial[tid] = acc;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x / 2; stride; stride >>= 1) {
+    if (tid < stride) {
+      partial[tid] += partial[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    y[row] = partial[0];
+  }
+}
+
+__global__ __launch_bounds__(256, 2) void blok_rmsnorm_int4_matvec_kernel(
+    const float *__restrict__ x, const float *__restrict__ norm_w,
+    const std::uint8_t *__restrict__ packed, const float *__restrict__ scale,
+    float *__restrict__ y, std::uint32_t rows, std::uint32_t cols, float eps) {
+  extern __shared__ float s[];
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t tid = threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  float ss = 0.0F;
+  for (std::uint32_t c = tid; c < cols; c += blockDim.x) {
+    const float v = x[c];
+    ss += v * v;
+  }
+  s[tid] = ss;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x / 2; stride; stride >>= 1) {
+    if (tid < stride) {
+      s[tid] += s[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float inv = rsqrtf((s[0] / static_cast<float>(cols)) + eps);
+  float acc = 0.0F;
+  const std::uint32_t packed_row = row * ((cols + 1) >> 1);
+  for (std::uint32_t c = tid; c < cols; c += blockDim.x) {
+    const std::uint8_t byte = packed[packed_row + (c >> 1)];
+    const std::int8_t q = static_cast<std::int8_t>((c & 1) ? (byte >> 4) : (byte & 15)) - 8;
+    const float a = x[c] * inv * norm_w[c];
+    acc += a * static_cast<float>(q) * scale[(row * ((cols + 31) >> 5)) + (c >> 5)];
+  }
+  s[tid] = acc;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x / 2; stride; stride >>= 1) {
+    if (tid < stride) {
+      s[tid] += s[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    y[row] = s[0];
+  }
+}
+
+__global__ __launch_bounds__(256, 2) void blok_moe_silu_weighted_sum_kernel(
+    const float *__restrict__ gate, const float *__restrict__ up, const float *__restrict__ down,
+    const float *__restrict__ weight, float *__restrict__ y, std::uint32_t k,
+    std::uint32_t hidden) {
+  const std::uint32_t i = (blockIdx.x * blockDim.x) + threadIdx.x;
+  if (i >= hidden) {
+    return;
+  }
+  float acc = 0.0F;
+  for (std::uint32_t e = 0; e < k; ++e) {
+    const float g = gate[(e * hidden) + i];
+    const float u = up[(e * hidden) + i];
+    acc += weight[e] * (g / (1.0F + expf(-g))) * u * down[(e * hidden) + i];
+  }
+  y[i] += acc;
+}
+
 [[noreturn]] void die(const std::string &message) {
   std::cerr << "blok-byte-probe: " << message << "\n";
   std::exit(1);

@@ -51,9 +51,10 @@ def fetch(c):
     c["local_dir"].mkdir(parents=True, exist_ok=True); c["cache_dir"].mkdir(parents=True, exist_ok=True)
     env, token = hf_env(c)
     cmd = [c["hf"], "download", c["repo"], "--revision", c["revision"], "--local-dir", str(c["local_dir"]),
-           "--cache-dir", str(c["cache_dir"]), "--max-workers", os.getenv("BLOK_HF_WORKERS", "8")]
+           "--max-workers", os.getenv("BLOK_HF_WORKERS", "8")]
     if token: cmd += ["--token", token]
-    subprocess.run(cmd, check=True, env=env)
+    rc = subprocess.run(cmd, env=env).returncode
+    if rc: raise SystemExit(rc)
     c["meta_dir"].mkdir(parents=True, exist_ok=True)
     (c["meta_dir"] / "fetch-status.json").write_text(js(status(c)) + "\n")
 

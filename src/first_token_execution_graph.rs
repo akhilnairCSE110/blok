@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::manifest::{Architecture, Manifest};
+use crate::{manifest::Manifest, KIMI_K26_TEXT};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Op {
@@ -22,6 +22,7 @@ pub struct Graph {
     pub resident_bytes: u64,
     pub dense_bytes: u64,
     pub expert_bytes: u64,
+    pub scheduled_expert_bytes: u64,
     pub dense_neurons: u32,
     pub expert_tensors: u32,
     pub top_k: u32,
@@ -30,15 +31,13 @@ pub struct Graph {
 
 impl Graph {
     pub fn first_token(manifest: &Manifest) -> Self {
-        let top_k = u32::from(matches!(
-            manifest.architecture,
-            Architecture::Moe | Architecture::Hybrid
-        )) * 4;
+        let top_k = KIMI_K26_TEXT.experts_per_token;
         let mut graph = Self {
             ops: Vec::with_capacity(manifest.tensors.len()),
             resident_bytes: 0,
             dense_bytes: 0,
             expert_bytes: 0,
+            scheduled_expert_bytes: 0,
             dense_neurons: 0,
             expert_tensors: 0,
             top_k,
@@ -55,6 +54,10 @@ impl Graph {
                     if let Some(layer) = layer(&tensor.name) {
                         expert_layers.insert(layer);
                     }
+                    if !scheduled_expert(expert(&tensor.name), top_k) {
+                        continue;
+                    }
+                    graph.scheduled_expert_bytes += bytes;
                 }
                 "dense_ffn_rowcol" => {
                     graph.dense_bytes += bytes;
@@ -84,20 +87,19 @@ impl Graph {
     }
 
     pub fn scheduled_bytes(&self) -> u64 {
-        self.resident_bytes + self.dense_bytes + self.expert_bytes.min(self.expert_bytes_per_k())
+        self.resident_bytes + self.dense_bytes + self.scheduled_expert_bytes
     }
 
     pub fn skipped_expert_bytes(&self) -> u64 {
-        self.expert_bytes.saturating_sub(self.expert_bytes_per_k())
+        self.expert_bytes
+            .saturating_sub(self.scheduled_expert_bytes)
     }
+}
 
-    fn expert_bytes_per_k(&self) -> u64 {
-        if self.top_k == 0 || self.expert_layers == 0 {
-            0
-        } else {
-            (self.expert_bytes / u64::from(self.expert_layers))
-                .saturating_mul(u64::from(self.top_k))
-        }
+fn scheduled_expert(expert: Option<u32>, top_k: u32) -> bool {
+    match expert {
+        Some(expert) => expert < top_k,
+        None => true,
     }
 }
 

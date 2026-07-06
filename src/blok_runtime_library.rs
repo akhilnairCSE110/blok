@@ -16,6 +16,8 @@ pub mod io;
 pub mod manifest;
 #[path = "command_report_json.rs"]
 pub mod observe;
+#[path = "primitives.rs"]
+pub mod primitives;
 #[path = "tokenizer.rs"]
 pub mod tokenizer;
 
@@ -30,9 +32,10 @@ pub use cuda::CudaPlan;
 pub use error::{Error, Result};
 pub use graph::Graph;
 pub use hardware::HardwareReport;
-pub use io::{DirectIoProbe, TransferPlan};
+pub use io::{DirectIoProbe, KernelProbe, TransferPlan};
 pub use manifest::Manifest;
 pub use observe::{CommandReport, GenerateDescriptors, GenerateIntent};
+pub use primitives::{KimiK26TextSpec, KIMI_K26_DECODE, KIMI_K26_TEXT};
 pub use tokenizer::TokenizerPlan;
 
 const USAGE: &str = "usage: blok {doctor|report|inspect --manifest <path>|generate --model <path> --prompt <text> --tokens <count> [--agents <count>] [--context <tokens>]}\n";
@@ -81,7 +84,9 @@ where
             let cuda = CudaPlan::byte_probe(&transfers)?;
             let tokenizer = TokenizerPlan::load(&intent.model, &intent.prompt)?;
             validate_schedule(&intent, &graph)?;
-            DirectIoProbe::first_window(&transfers).run()?;
+            if let Some(probe) = KernelProbe::first_window(&transfers) {
+                probe.run()?;
+            }
             write_report(
                 out,
                 CommandReport::generate_descriptors(
@@ -327,7 +332,10 @@ mod tests {
         assert!(
             report.contains("\"prompt_roundtrip\":\"metadata_only_tokenizer_execution_pending\"")
         );
-        assert!(report.contains("\"top_k\":4"));
+        assert!(report.contains("\"top_k\":8"));
+        assert!(report.contains("\"runtime\":\"fixed_kimi_k26_text_primitives\""));
+        assert!(report.contains("\"rmsnorm_int4_matvec\""));
+        assert!(report.contains("\"moe_silu_weighted_sum\""));
         assert!(report.contains("\"dense_neurons\":1"));
         assert!(report.contains("\"skipped_expert_bytes\":0"));
         assert!(report.contains("\"agents\":8"));

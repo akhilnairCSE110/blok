@@ -28,6 +28,6 @@ def main():
     print(f"{s['repo']} {s['safetensors']}/{s['expected_safetensors']} shards {s['downloaded_bytes']}/{s['expected_bytes']} bytes free={free}")
     if s["complete"]: return
     if free < need: raise SystemExit(f"not enough disk: need {need}, free {free}")
-    subprocess.run([sys.executable, str(FETCH), MODEL, "fetch"], check=True, env=env)
+    os.execve(sys.executable, [sys.executable, str(FETCH), MODEL, "fetch"], env)
 
 if __name__ == "__main__": main()

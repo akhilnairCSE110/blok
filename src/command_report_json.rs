@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::{
     ArenaPlan, CudaPlan, Graph, HardwareReport, Manifest, RuntimeConfig, TokenizerPlan,
-    TransferPlan,
+    TransferPlan, KIMI_K26_DECODE, KIMI_K26_TEXT,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,6 +27,7 @@ pub struct CommandReport {
     io: Option<String>,
     cuda: Option<String>,
     tokenizer: Option<String>,
+    primitives: Option<String>,
     schedule: Option<String>,
     config: RuntimeConfig,
 }
@@ -55,6 +56,7 @@ impl CommandReport {
             io: None,
             cuda: None,
             tokenizer: None,
+            primitives: None,
             schedule: None,
             config,
         }
@@ -86,6 +88,7 @@ impl CommandReport {
             io: None,
             cuda: None,
             tokenizer: None,
+            primitives: None,
             schedule: None,
             config,
         }
@@ -119,6 +122,7 @@ impl CommandReport {
             io: Some(io_json(descriptors.transfers)),
             cuda: Some(cuda_json(descriptors.cuda)),
             tokenizer: Some(tokenizer_json(descriptors.tokenizer)),
+            primitives: Some(primitives_json()),
             schedule: Some(schedule),
             config,
         }
@@ -159,6 +163,10 @@ impl CommandReport {
             .tokenizer
             .as_ref()
             .map_or(String::new(), |m| format!(",\"tokenizer\":{m}"));
+        let primitives = self
+            .primitives
+            .as_ref()
+            .map_or(String::new(), |m| format!(",\"primitives\":{m}"));
         let schedule = self
             .schedule
             .as_ref()
@@ -168,7 +176,7 @@ impl CommandReport {
                 "{{\"schema_version\":1,\"crate\":\"blok\",\"version\":{},",
                 "\"command\":{},\"status\":{},\"decision\":{},",
                 "\"config\":{{\"blok_home\":{},\"model_root\":{},\"report_root\":{},",
-                "\"strict_direct_io\":{}}},\"hardware\":{}{}{}{}{}{}{}{}{} }}"
+                "\"strict_direct_io\":{}}},\"hardware\":{}{}{}{}{}{}{}{}{}{} }}"
             ),
             j(env!("CARGO_PKG_VERSION")),
             j(self.command),
@@ -185,10 +193,32 @@ impl CommandReport {
             io,
             cuda,
             tokenizer,
+            primitives,
             schedule,
             generate
         )
     }
+}
+
+fn primitives_json() -> String {
+    format!(
+        concat!(
+            "{{\"runtime\":\"fixed_kimi_k26_text_primitives\",",
+            "\"layers\":{},\"hidden\":{},\"heads\":{},\"routed_experts\":{},",
+            "\"experts_per_token\":{},\"max_context\":{},\"ops\":[{}]}}"
+        ),
+        KIMI_K26_TEXT.layers,
+        KIMI_K26_TEXT.hidden,
+        KIMI_K26_TEXT.heads,
+        KIMI_K26_TEXT.routed_experts,
+        KIMI_K26_TEXT.experts_per_token,
+        KIMI_K26_TEXT.max_context,
+        KIMI_K26_DECODE
+            .iter()
+            .map(|op| j(op))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 fn schedule_json(g: &GenerateIntent, graph: &Graph) -> String {
@@ -218,8 +248,9 @@ fn graph_json(graph: &Graph) -> String {
         concat!(
             "{{\"ops\":{},\"payload_bytes\":{},\"scheduled_bytes\":{},",
             "\"resident_bytes\":{},\"dense_bytes\":{},\"expert_bytes\":{},",
-            "\"skipped_expert_bytes\":{},\"dense_neurons\":{},\"expert_tensors\":{},",
-            "\"top_k\":{},\"expert_layers\":{}}}"
+            "\"scheduled_expert_bytes\":{},\"skipped_expert_bytes\":{},",
+            "\"dense_neurons\":{},\"expert_tensors\":{},\"top_k\":{},",
+            "\"expert_layers\":{}}}"
         ),
         graph.ops.len(),
         graph.payload_bytes(),
@@ -227,6 +258,7 @@ fn graph_json(graph: &Graph) -> String {
         graph.resident_bytes,
         graph.dense_bytes,
         graph.expert_bytes,
+        graph.scheduled_expert_bytes,
         graph.skipped_expert_bytes(),
         graph.dense_neurons,
         graph.expert_tensors,

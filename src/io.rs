@@ -1,4 +1,5 @@
-use std::process::Command as ProcessCommand;
+use std::path::PathBuf;
+use std::process::{Command as ProcessCommand, Stdio};
 
 use crate::{Error, Graph, Manifest, Result};
 
@@ -28,21 +29,29 @@ pub struct DirectIoProbe {
     pub block: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelProbe {
+    pub bin: PathBuf,
+    pub backend: String,
+    pub file: String,
+    pub offset: u64,
+    pub bytes: u64,
+    pub alignment: u64,
+}
+
 impl TransferPlan {
     pub fn first_token(manifest: &Manifest, graph: &Graph) -> Result<Self> {
-        if manifest.tensors.len() != graph.ops.len() {
-            return Err(Error::Capability("manifest_graph_descriptor_mismatch"));
-        }
-
         let mut windows = Vec::with_capacity(graph.ops.len());
         let mut arena_offset = 0_u64;
         let mut scheduled_bytes = 0_u64;
         let mut max_alignment = 1_u64;
 
-        for (tensor, op) in manifest.tensors.iter().zip(&graph.ops) {
-            if tensor.name != op.tensor {
-                return Err(Error::Capability("manifest_graph_order_mismatch"));
-            }
+        for op in &graph.ops {
+            let tensor = manifest
+                .tensors
+                .iter()
+                .find(|tensor| tensor.name == op.tensor)
+                .ok_or(Error::Capability("manifest_graph_descriptor_mismatch"))?;
             max_alignment = max_alignment.max(tensor.alignment);
             let aligned_arena = align(arena_offset, tensor.alignment)?;
             let bytes = tensor.source.end - tensor.source.start;
@@ -68,6 +77,48 @@ impl TransferPlan {
             scheduled_bytes,
             max_alignment,
         })
+    }
+}
+
+impl KernelProbe {
+    pub fn first_window(plan: &TransferPlan) -> Option<Self> {
+        let window = plan.windows.iter().find(|w| w.file.is_some())?;
+        Some(Self {
+            bin: std::env::var_os("BLOK_BYTE_PROBE_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("build/blok-byte-probe")),
+            backend: std::env::var("BLOK_IO_BACKEND").unwrap_or_else(|_| "odirect".to_owned()),
+            file: window.file.clone()?,
+            offset: window.offset,
+            bytes: window.bytes,
+            alignment: window.alignment,
+        })
+    }
+
+    pub fn run(&self) -> Result<()> {
+        if !self.bin.is_file() {
+            return Err(Error::Capability("blok_byte_probe_binary_required"));
+        }
+        let status = ProcessCommand::new(&self.bin)
+            .args([
+                "--backend",
+                &self.backend,
+                "--file",
+                &self.file,
+                "--offset",
+                &self.offset.to_string(),
+                "--bytes",
+                &self.bytes.to_string(),
+                "--alignment",
+                &self.alignment.to_string(),
+            ])
+            .stderr(Stdio::inherit())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(Error::Capability("blok_byte_probe_failed"))
+        }
     }
 }
 

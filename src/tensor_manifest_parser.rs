@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ops::Range;
 
 use crate::{Error, Result};
@@ -94,7 +95,14 @@ impl Manifest {
                 "at least one tensor is required".to_owned(),
             ));
         }
+        let mut names = BTreeSet::new();
         for tensor in &self.tensors {
+            if !names.insert(tensor.name.as_str()) {
+                return Err(Error::Manifest(format!(
+                    "{} is declared more than once",
+                    tensor.name
+                )));
+            }
             if tensor.source.start >= tensor.source.end {
                 return Err(Error::Manifest(format!(
                     "{} has an empty range",
