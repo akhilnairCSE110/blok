@@ -34,10 +34,10 @@ rustup +nightly component add miri
 
 if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
   cargo install --locked just
-  cargo install --locked cargo-audit cargo-deny cargo-nextest dprint typos-cli
+  cargo install --locked cargo-audit cargo-deny cargo-geiger cargo-nextest dprint typos-cli
 else
   cargo install --locked just || true
-  cargo install --locked cargo-audit cargo-deny cargo-nextest dprint typos-cli || true
+  cargo install --locked cargo-audit cargo-deny cargo-geiger cargo-nextest dprint typos-cli || true
 fi
 
 pipx ensurepath

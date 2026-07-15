@@ -107,3 +107,82 @@ ugds:
     - byte_offsets_on_ugds_block_device
     - alignment_rules_on_target
     - raw_contiguous_copy_vs_filesystem_files
+
+target_hardware:
+  cpu:
+    vendor: AMD
+    check: lscpu contains AMD
+    docs: https://www.amd.com/en/products/processors/ecosystem/ryzen-storage-solutions.html
+  gpu:
+    vendor: NVIDIA
+    check: nvidia-smi detects target GPU and nvcc is installed
+    docs: https://www.nvidia.com/Download/index.aspx
+  storage:
+    vendor: Samsung
+    family: EVO
+    interface: NVMe preferred for uGDS path
+    check: lsblk model/transport shows Samsung/EVO/NVMe and /dev/ugds_drv0 exists
+    docs: https://download.semiconductor.samsung.com/resources/data-sheet/samsung_nvme_ssd_990_evo_plus_datasheet_rev.1.0.pdf
+  scripts:
+    hardware_check: scripts/check_hardware.sh
+
+tensor_contract:
+  runtime_index_check: scripts/check_kimi_contract.py
+  routed_expert_quantization:
+    format: pack-quantized
+    dtype: i32
+    num_bits: 4
+    group_size: 32
+    symmetric: true
+    zero_point: none
+    signed_decode: q = ((word >> (4 * lane)) & 0xF) - 8
+    projections:
+      gate_proj:
+        logical_shape: [2048, 7168]
+        packed_shape: [2048, 896]
+        scale_shape: [2048, 224]
+      up_proj:
+        logical_shape: [2048, 7168]
+        packed_shape: [2048, 896]
+        scale_shape: [2048, 224]
+      down_proj:
+        logical_shape: [7168, 2048]
+        packed_shape: [7168, 256]
+        scale_shape: [7168, 64]
+  shared_expert:
+    dtype: bf16
+    gate_proj_shape: [18432, 7168]
+    up_proj_shape: [18432, 7168]
+    down_proj_shape: [7168, 18432]
+
+verification:
+  local:
+    - cargo check
+    - python3 -m py_compile scripts/model_fetch.py
+    - git diff --check
+  target:
+    - just hardware-check
+    - BLOK_MODEL=/path/to/manifest.blok just model-contract
+    - just cuda-deep-linux
+  optional_tools:
+    rust_static:
+      - cargo clippy
+      - cargo miri
+      - cargo geiger
+      - cargo audit
+      - cargo deny
+    rust_dynamic:
+      - cargo fuzz
+      - cargo mutants
+      - proptest
+      - loom
+    cuda_static:
+      - clang-tidy
+      - cppcheck
+    cuda_dynamic:
+      - compute-sanitizer --tool memcheck
+      - compute-sanitizer --tool racecheck
+      - compute-sanitizer --tool initcheck
+      - compute-sanitizer --tool synccheck
+      - nsight-compute
+      - nsight-systems

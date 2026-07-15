@@ -30,8 +30,17 @@ rust-linux:
 rust-deep-linux:
     scripts/ci.sh rust-deep-linux
 
+cuda-deep-linux:
+    scripts/ci.sh cuda-deep-linux
+
 deps:
     scripts/ci.sh deps
+
+hardware-check:
+    scripts/ci.sh hardware-check
+
+model-contract:
+    scripts/ci.sh model-contract
 
 release-linux:
     scripts/ci.sh release-linux

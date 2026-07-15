@@ -27,7 +27,7 @@ fi
 source "$HOME/.cargo/env"
 
 rustup component add rustfmt clippy
-cargo install --locked cargo-audit cargo-deny cargo-nextest || true
+cargo install --locked cargo-audit cargo-deny cargo-geiger cargo-nextest || true
 
 pipx ensurepath
 pipx install pre-commit || true

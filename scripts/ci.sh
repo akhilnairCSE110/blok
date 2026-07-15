@@ -43,8 +43,8 @@ fmt() {
 
   run_if_available dprint dprint fmt
 
-  if have_files '*.cpp' '*.cc' '*.cxx' '*.c' '*.h' '*.hpp' '*.hxx'; then
-    read_files '*.cpp' '*.cc' '*.cxx' '*.c' '*.h' '*.hpp' '*.hxx'
+  if have_files '*.cpp' '*.cc' '*.cxx' '*.cu' '*.c' '*.h' '*.hpp' '*.hxx'; then
+    read_files '*.cpp' '*.cc' '*.cxx' '*.cu' '*.c' '*.h' '*.hpp' '*.hxx'
     run_if_available clang-format clang-format -i "${selected_files[@]}"
   fi
 
@@ -64,8 +64,8 @@ fmt_check() {
   run_if_available dprint dprint check
   run_if_available typos typos
 
-  if have_files '*.cpp' '*.cc' '*.cxx' '*.c' '*.h' '*.hpp' '*.hxx'; then
-    read_files '*.cpp' '*.cc' '*.cxx' '*.c' '*.h' '*.hpp' '*.hxx'
+  if have_files '*.cpp' '*.cc' '*.cxx' '*.cu' '*.c' '*.h' '*.hpp' '*.hxx'; then
+    read_files '*.cpp' '*.cc' '*.cxx' '*.cu' '*.c' '*.h' '*.hpp' '*.hxx'
     run_if_available clang-format clang-format --dry-run --Werror "${selected_files[@]}"
   fi
 
@@ -104,8 +104,8 @@ cxx_linux() {
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
   cmake --build build
 
-  if have_files '*.cpp' '*.cc' '*.cxx'; then
-    read_files '*.cpp' '*.cc' '*.cxx'
+  if have_files '*.cpp' '*.cc' '*.cxx' '*.cu'; then
+    read_files '*.cpp' '*.cc' '*.cxx' '*.cu'
     run_if_available clang-tidy clang-tidy "${selected_files[@]}" -p build
   fi
 
@@ -160,6 +160,22 @@ rust_deep_linux() {
   fi
 }
 
+cuda_deep_linux() {
+  if ! has_cmake_project; then
+    echo "skip: no CMakeLists.txt"
+    return 0
+  fi
+  if ! command -v nvcc >/dev/null 2>&1; then
+    echo "skip: nvcc is not installed"
+    return 0
+  fi
+
+  cmake -S . -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Debug
+  cmake --build build-cuda
+  run_if_available compute-sanitizer compute-sanitizer --tool memcheck build-cuda/blok-kimi-exec --help
+  run_if_available compute-sanitizer compute-sanitizer --tool synccheck build-cuda/blok-kimi-exec --help
+}
+
 deps() {
   if ! has_cargo_project; then
     echo "skip: no Cargo.toml"
@@ -172,6 +188,19 @@ deps() {
   fi
   run_if_available cargo-deny cargo deny check
   run_if_available cargo-audit cargo audit
+  run_if_available cargo-geiger cargo geiger --all-features
+}
+
+hardware_check() {
+  scripts/check_hardware.sh
+}
+
+model_contract() {
+  if [ -z "${BLOK_MODEL:-}" ]; then
+    echo "skip: set BLOK_MODEL to manifest.blok or model dir"
+    return 0
+  fi
+  scripts/check_kimi_contract.py "$BLOK_MODEL"
 }
 
 check_local() {
@@ -189,6 +218,8 @@ deep_linux() {
   check_linux
   cxx_sanitize_linux
   rust_deep_linux
+  cuda_deep_linux
+  model_contract
 }
 
 release_linux() {
@@ -218,13 +249,16 @@ case "${1:-}" in
   cxx-sanitize-linux) cxx_sanitize_linux ;;
   rust-linux) rust_linux ;;
   rust-deep-linux) rust_deep_linux ;;
+  cuda-deep-linux) cuda_deep_linux ;;
   deps) deps ;;
+  hardware-check) hardware_check ;;
+  model-contract) model_contract ;;
   check-local) check_local ;;
   check-linux) check_linux ;;
   deep-linux) deep_linux ;;
   release-linux) release_linux ;;
   *)
-    echo "usage: $0 {fmt|fmt-check|setup|cxx-linux|cxx-sanitize-linux|rust-linux|rust-deep-linux|deps|check-local|check-linux|deep-linux|release-linux}" >&2
+    echo "usage: $0 {fmt|fmt-check|setup|cxx-linux|cxx-sanitize-linux|rust-linux|rust-deep-linux|cuda-deep-linux|deps|hardware-check|model-contract|check-local|check-linux|deep-linux|release-linux}" >&2
     exit 2
     ;;
 esac
