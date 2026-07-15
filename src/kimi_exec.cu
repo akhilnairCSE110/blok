@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -12,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -38,6 +40,11 @@ struct Args {
 struct RuntimeIndex {
   std::string tokenizer_blok;
   std::vector<Tensor> tensors;
+};
+
+struct Generation {
+  std::string text;
+  std::uint64_t tokens = 0;
 };
 
 struct Io {
@@ -115,15 +122,131 @@ struct Buf {
 constexpr int LAYERS = 61, FIRST_DENSE = 1;
 constexpr int HIDDEN = 7168, HEADS = 64, QK_NOPE = 128, QK_ROPE = 64, V_HEAD = 128;
 constexpr int Q_RANK = 1536, KV_RANK = 512, KV_A = 576, EXPERTS = 384, TOPK = 8, MOE = 2048, VOCAB = 163840;
-constexpr int I4_GROUP = 32, I4_PER_WORD = 8;
+constexpr int I4_GROUP = 32, I4_PER_WORD = 8, QK_HEAD = QK_NOPE + QK_ROPE, K_DIM = HEADS * QK_HEAD, V_DIM = HEADS * V_HEAD;
+constexpr int HEAD_TILE = 256, EXPERT_TILE = 64, HIDDEN_TILE = 64;
 constexpr float RMS_EPS = 1.0e-5f, ROPE_THETA = 50000.0f, ROUTED_SCALE = 2.827f;
 constexpr std::uint32_t EOS_IM_END = 163586;
+
+std::uint64_t u64(const char *s, const char *n);
+
+constexpr std::uint64_t MAX_IO_BYTES = 4ull * 1024 * 1024;
+
+void read_exact(int fd, void *p, std::uint64_t bytes, std::uint64_t off) {
+  auto *b = static_cast<char *>(p);
+  std::uint64_t done = 0;
+  while (done < bytes) {
+    ssize_t n = pread(fd, b + done, bytes - done, off + done);
+    if (n <= 0) die(std::string("KV read failed: ") + std::strerror(errno));
+    done += (std::uint64_t)n;
+  }
+}
+
+void write_exact(int fd, const void *p, std::uint64_t bytes, std::uint64_t off) {
+  auto *b = static_cast<const char *>(p);
+  std::uint64_t done = 0;
+  while (done < bytes) {
+    ssize_t n = pwrite(fd, b + done, bytes - done, off + done);
+    if (n <= 0) die(std::string("KV write failed: ") + std::strerror(errno));
+    done += (std::uint64_t)n;
+  }
+}
+
+struct KvCache {
+  bool disk = true;
+  int fd = -1, lock_fd = -1, max_seq = 0;
+  std::uint64_t k_layer_bytes = 0, v_layer_bytes = 0, ugds_base = 0;
+  std::vector<Buf> k, v;
+  std::vector<float> host;
+  Buf kt, vt, score, hmax, hsum;
+  Io &io;
+  KvCache(Io &io_ref, std::uint64_t seq, int tile) : max_seq((int)seq), k_layer_bytes(seq * K_DIM * sizeof(float)), v_layer_bytes(seq * V_DIM * sizeof(float)), io(io_ref) {
+#ifdef BLOK_HAVE_UGDS
+    const char *base = std::getenv("BLOK_KV_UGDS_BASE");
+    if (!base) die("BLOK_KV_UGDS_BASE is required for uGDS-backed KV cache");
+    ugds_base = u64(base, "BLOK_KV_UGDS_BASE");
+    std::string lock_path = std::string("/tmp/blok-kv-") + std::to_string(ugds_base) + ".lock";
+    lock_fd = open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (lock_fd < 0 || flock(lock_fd, LOCK_EX | LOCK_NB) != 0) die("KV uGDS region is already reserved: " + lock_path);
+    if (const char *cap = std::getenv("BLOK_KV_UGDS_BYTES")) {
+      if (LAYERS * (k_layer_bytes + v_layer_bytes) > u64(cap, "BLOK_KV_UGDS_BYTES")) die("BLOK_KV_UGDS_BYTES is too small for requested KV schedule");
+    }
+#else
+    if (disk) {
+      std::filesystem::path dir = std::getenv("BLOK_KV_CACHE_DIR") ? std::getenv("BLOK_KV_CACHE_DIR") : ".blok-kv-cache";
+      std::filesystem::create_directories(dir);
+      auto path = dir / ("kv-" + std::to_string(getpid()) + ".bin");
+      fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC | O_CLOEXEC, 0600);
+      if (fd < 0) die(std::string("open KV cache failed: ") + std::strerror(errno));
+      host.resize(std::max(K_DIM, V_DIM) * (std::uint64_t)tile);
+    } else {
+      k.resize(LAYERS); v.resize(LAYERS);
+      for (int l = 0; l < LAYERS; ++l) { k[l].make(seq * K_DIM); v[l].make(seq * V_DIM); }
+    }
+#endif
+    kt.make((std::uint64_t)tile * K_DIM); vt.make((std::uint64_t)tile * V_DIM); score.make((std::uint64_t)HEADS * tile);
+    hmax.make(HEADS); hsum.make(HEADS);
+  }
+  ~KvCache() {
+    if (lock_fd >= 0) { flock(lock_fd, LOCK_UN); close(lock_fd); }
+    if (fd >= 0) close(fd);
+  }
+  std::uint64_t off(int layer, bool value, int pos = 0) const {
+    return ugds_base + (std::uint64_t)layer * (k_layer_bytes + v_layer_bytes) + (value ? k_layer_bytes : 0) +
+           (std::uint64_t)pos * (value ? V_DIM : K_DIM) * sizeof(float);
+  }
+  void store(int layer, int pos, const float *kp, const float *vp) {
+#ifdef BLOK_HAVE_UGDS
+    Io::ug(uGDSBufRegister(kp, K_DIM * sizeof(float), 0), "uGDSBufRegister KV K");
+    ssize_t nk = uGDSWrite(io.fh, kp, K_DIM * sizeof(float), (off_t)off(layer, false, pos), 0);
+    Io::ug(uGDSBufDeregister(kp), "uGDSBufDeregister KV K");
+    if (nk != (ssize_t)(K_DIM * sizeof(float))) die("short uGDS KV K write");
+    Io::ug(uGDSBufRegister(vp, V_DIM * sizeof(float), 0), "uGDSBufRegister KV V");
+    ssize_t nv = uGDSWrite(io.fh, vp, V_DIM * sizeof(float), (off_t)off(layer, true, pos), 0);
+    Io::ug(uGDSBufDeregister(vp), "uGDSBufDeregister KV V");
+    if (nv != (ssize_t)(V_DIM * sizeof(float))) die("short uGDS KV V write");
+#else
+    if (!disk) {
+      ck(cudaMemcpy(k[layer].p + (std::uint64_t)pos * K_DIM, kp, K_DIM * sizeof(float), cudaMemcpyDeviceToDevice), "store K");
+      ck(cudaMemcpy(v[layer].p + (std::uint64_t)pos * V_DIM, vp, V_DIM * sizeof(float), cudaMemcpyDeviceToDevice), "store V");
+      return;
+    }
+    ck(cudaMemcpy(host.data(), kp, K_DIM * sizeof(float), cudaMemcpyDeviceToHost), "copy K to KV cache");
+    write_exact(fd, host.data(), K_DIM * sizeof(float), off(layer, false, pos));
+    ck(cudaMemcpy(host.data(), vp, V_DIM * sizeof(float), cudaMemcpyDeviceToHost), "copy V to KV cache");
+    write_exact(fd, host.data(), V_DIM * sizeof(float), off(layer, true, pos));
+#endif
+  }
+  void load_tile(int layer, bool value, int start, int n) {
+    int dim = value ? V_DIM : K_DIM;
+    float *dst = value ? vt.p : kt.p;
+#ifdef BLOK_HAVE_UGDS
+    std::uint64_t bytes = (std::uint64_t)n * dim * sizeof(float);
+    Io::ug(uGDSBufRegister(dst, bytes, 0), "uGDSBufRegister KV tile");
+    ssize_t got = uGDSRead(io.fh, dst, bytes, (off_t)off(layer, value, start), 0);
+    Io::ug(uGDSBufDeregister(dst), "uGDSBufDeregister KV tile");
+    if (got != (ssize_t)bytes) die("short uGDS KV tile read");
+#else
+    if (!disk) {
+      float *src = (value ? v[layer].p : k[layer].p) + (std::uint64_t)start * dim;
+      ck(cudaMemcpy(dst, src, (std::uint64_t)n * dim * sizeof(float), cudaMemcpyDeviceToDevice), "load KV tile");
+      return;
+    }
+    read_exact(fd, host.data(), (std::uint64_t)n * dim * sizeof(float), off(layer, value, start));
+    ck(cudaMemcpy(dst, host.data(), (std::uint64_t)n * dim * sizeof(float), cudaMemcpyHostToDevice), "copy KV tile");
+#endif
+  }
+};
 
 __device__ float bf(const __nv_bfloat16 *p) { return __bfloat162float(*p); }
 
 __global__ void embed_k(const __nv_bfloat16 *e, const std::uint32_t *tok, float *x) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < HIDDEN) x[i] = bf(e + (unsigned long long)*tok * HIDDEN + i);
+}
+
+__global__ void bf16_to_f32_k(const __nv_bfloat16 *x, float *y, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = bf(x + i);
 }
 
 __global__ void add_k(float *a, const float *b, int n) {
@@ -227,50 +350,9 @@ __global__ void rope_k(float *q, float *k, int pos, int heads, int stride, int r
   k[base + 1] = k0 * s + k1 * c;
 }
 
-__global__ void kv_store_k(const float *k, const float *v, float *kc, float *vc, int pos, int kd, int vd) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < kd) kc[(unsigned long long)pos * kd + i] = k[i];
-  if (i < vd) vc[(unsigned long long)pos * vd + i] = v[i];
-}
-
 __global__ void k_rope_fill_k(float *k, const float *rope) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < HEADS * QK_ROPE) k[(i / QK_ROPE) * (QK_NOPE + QK_ROPE) + QK_NOPE + i % QK_ROPE] = rope[i % QK_ROPE];
-}
-
-__global__ void attn_score_k(const float *q, const float *kc, float *score, int seq, int dim) {
-  __shared__ float s[256];
-  int t = blockIdx.x;
-  float v = 0;
-  for (int i = threadIdx.x; i < dim; i += blockDim.x) v += q[i] * kc[(unsigned long long)t * dim + i];
-  s[threadIdx.x] = v;
-  __syncthreads();
-  for (int d = 128; d; d >>= 1) {
-    if (threadIdx.x < d) s[threadIdx.x] += s[threadIdx.x + d];
-    __syncthreads();
-  }
-  if (!threadIdx.x && t < seq) score[t] = s[0] * rsqrtf((float)dim);
-}
-
-__global__ void softmax_k(float *x, int n) {
-  __shared__ float s[256];
-  float m = -CUDART_INF_F;
-  for (int i = threadIdx.x; i < n; i += blockDim.x) m = fmaxf(m, x[i]);
-  s[threadIdx.x] = m;
-  __syncthreads();
-  for (int d = 128; d; d >>= 1) {
-    if (threadIdx.x < d) s[threadIdx.x] = fmaxf(s[threadIdx.x], s[threadIdx.x + d]);
-    __syncthreads();
-  }
-  float sum = 0, mx = s[0];
-  for (int i = threadIdx.x; i < n; i += blockDim.x) sum += expf(x[i] - mx);
-  s[threadIdx.x] = sum;
-  __syncthreads();
-  for (int d = 128; d; d >>= 1) {
-    if (threadIdx.x < d) s[threadIdx.x] += s[threadIdx.x + d];
-    __syncthreads();
-  }
-  for (int i = threadIdx.x; i < n; i += blockDim.x) x[i] = expf(x[i] - mx) / s[0];
 }
 
 __global__ void add_bf16_k(float *x, const __nv_bfloat16 *b, int n) {
@@ -310,12 +392,59 @@ __global__ void expert_accum_k(const float *y, const float *w, int slot, float *
   if (i < n) out[i] += y[i] * w[slot];
 }
 
-__global__ void attn_value_k(const float *p, const float *v, float *out, int seq, int dim) {
-  int d = blockIdx.x * blockDim.x + threadIdx.x;
-  if (d >= dim) return;
-  float x = 0;
-  for (int t = 0; t < seq; ++t) x += p[t] * v[(unsigned long long)t * dim + d];
-  out[d] = x;
+__global__ void fill_k(float *x, float v, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) x[i] = v;
+}
+
+__global__ void attn_tile_score_k(const float *q, const float *k, float *score, int n) {
+  __shared__ float s[256];
+  int h = blockIdx.x, t = blockIdx.y;
+  if (t >= n) return;
+  float v = 0;
+  for (int i = threadIdx.x; i < QK_HEAD; i += blockDim.x)
+    v += q[h * QK_HEAD + i] * k[(unsigned long long)t * K_DIM + h * QK_HEAD + i];
+  s[threadIdx.x] = v;
+  __syncthreads();
+  for (int d = 128; d; d >>= 1) {
+    if (threadIdx.x < d) s[threadIdx.x] += s[threadIdx.x + d];
+    __syncthreads();
+  }
+  if (!threadIdx.x) {
+    score[h * n + t] = s[0] * rsqrtf((float)QK_HEAD);
+  }
+}
+
+__global__ void attn_tile_max_k(const float *score, float *mx, int n) {
+  __shared__ float s[256];
+  int h = blockIdx.x;
+  float v = -CUDART_INF_F;
+  for (int t = threadIdx.x; t < n; t += blockDim.x) v = fmaxf(v, score[h * n + t]);
+  s[threadIdx.x] = v;
+  __syncthreads();
+  for (int d = 128; d; d >>= 1) {
+    if (threadIdx.x < d) s[threadIdx.x] = fmaxf(s[threadIdx.x], s[threadIdx.x + d]);
+    __syncthreads();
+  }
+  if (!threadIdx.x) mx[h] = fmaxf(mx[h], s[0]);
+}
+
+__global__ void attn_tile_accum_k(const float *score, const float *v, const float *mx, float *sum, float *out, int n) {
+  int h = blockIdx.x, d = blockIdx.y * blockDim.x + threadIdx.x;
+  if (d >= V_HEAD) return;
+  float acc = 0, s = 0, m = mx[h];
+  for (int t = 0; t < n; ++t) {
+    float p = expf(score[h * n + t] - m);
+    acc += p * v[(unsigned long long)t * V_DIM + h * V_HEAD + d];
+    if (d == 0) s += p;
+  }
+  out[h * V_HEAD + d] += acc;
+  if (d == 0) atomicAdd(sum + h, s);
+}
+
+__global__ void attn_finish_k(float *out, const float *sum) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < V_DIM) out[i] /= sum[i / V_HEAD];
 }
 
 __global__ void argmax_k(const float *x, std::uint32_t *id, int n) {
@@ -562,6 +691,7 @@ void validate_i4_pair(const Tensor &w, const Tensor &scale, int rows, int cols) 
 DeviceTensor load_tensor(Io &io, const Tensor &t) {
   if (t.dtype != "bf16" && t.dtype != "f32" && t.dtype != "i32") die("only bf16, f32, and i32 tensors are executable");
   if (t.data < t.off || t.data + t.data_bytes > t.off + t.bytes) die("tensor data range escapes aligned read");
+  if (t.bytes > MAX_IO_BYTES) die("refusing oversized tensor read; use a tiled loader for " + t.name);
   DeviceTensor d;
   d.bytes = t.bytes;
   d.skip = t.data - t.off;
@@ -584,10 +714,121 @@ DeviceTensor load_tensor(Io &io, const Tensor &t) {
   return d;
 }
 
+DeviceTensor load_tensor_slice(Io &io, const Tensor &t, std::uint64_t byte_start, std::uint64_t byte_len) {
+  if (t.data + byte_start + byte_len > t.data + t.data_bytes) die("tensor slice out of range: " + t.name);
+  std::uint64_t file_off = t.data + byte_start, aligned = file_off / t.align * t.align;
+  DeviceTensor d;
+  d.skip = file_off - aligned;
+  d.bytes = ((d.skip + byte_len + t.align - 1) / t.align) * t.align;
+  if (aligned < t.off || aligned + d.bytes > t.off + t.bytes) die("aligned tensor slice escapes materialized read range: " + t.name);
+  if (d.bytes > MAX_IO_BYTES) die("refusing oversized tensor slice read: " + t.name);
+  ck(cudaMalloc(&d.base, d.bytes), "cudaMalloc tensor slice");
+#ifdef BLOK_HAVE_UGDS
+  auto it = io.base.find(t.file);
+  if (it == io.base.end()) die("missing uGDS map entry: " + t.file);
+  Io::ug(uGDSBufRegister(d.base, d.bytes, 0), "uGDSBufRegister slice");
+  ssize_t n = uGDSRead(io.fh, d.base, d.bytes, (off_t)(it->second + aligned), 0);
+  Io::ug(uGDSBufDeregister(d.base), "uGDSBufDeregister slice");
+  if (n != (ssize_t)d.bytes) die("short uGDS slice read");
+#else
+  (void)io;
+  void *host = nullptr;
+  if (posix_memalign(&host, t.align, d.bytes)) die("posix_memalign slice failed");
+  int fd = open(t.file.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+  if (fd < 0) die(std::string("O_DIRECT slice open failed: ") + std::strerror(errno));
+  read_exact(fd, host, d.bytes, aligned);
+  close(fd);
+  ck(cudaMemcpy(d.base, host, d.bytes, cudaMemcpyHostToDevice), "cudaMemcpy tensor slice");
+  free(host);
+#endif
+  return d;
+}
+
+int dtype_bytes(const Tensor &t) {
+  if (t.dtype == "bf16") return sizeof(__nv_bfloat16);
+  if (t.dtype == "f32" || t.dtype == "i32") return 4;
+  die("unsupported sliced dtype: " + t.dtype);
+}
+
+DeviceTensor load_rows(Io &io, const Tensor &t, int row, int rows, int row_bytes) {
+  return load_tensor_slice(io, t, (std::uint64_t)row * row_bytes, (std::uint64_t)rows * row_bytes);
+}
+
+void embed_token(Io &io, const Tensor &emb, std::uint32_t id, float *x) {
+  if (id >= VOCAB) die("token id outside embedding table");
+  auto row = load_rows(io, emb, (int)id, 1, HIDDEN * sizeof(__nv_bfloat16));
+  bf16_to_f32_k<<<(HIDDEN + 255) / 256, 256>>>(row.bf16(), x, HIDDEN);
+}
+
+void matvec_bf16_rows(Io &io, const Tensor &w, const float *x, float *y, int row, int rows, int cols) {
+  auto tile = load_rows(io, w, row, rows, cols * dtype_bytes(w));
+  matvec_bf16_k<<<rows, 256>>>(tile.bf16(), x, y + row, rows, cols);
+}
+
+void matvec_bf16_all_rows(Io &io, const Tensor &w, const float *x, float *y, int rows, int cols, int tile_rows) {
+  for (int r = 0; r < rows; r += tile_rows) matvec_bf16_rows(io, w, x, y, r, std::min(tile_rows, rows - r), cols);
+}
+
+void bf16_mlp(Io &io, const Tensor &gw, const Tensor &uw, const Tensor &dw, const float *x, float *down, float *gate, float *up, float *mid, float *tmp, int ffn) {
+  for (int r = 0; r < ffn; r += EXPERT_TILE) {
+    int rows = std::min(EXPERT_TILE, ffn - r);
+    matvec_bf16_rows(io, gw, x, gate, r, rows, HIDDEN);
+    matvec_bf16_rows(io, uw, x, up, r, rows, HIDDEN);
+    silu_mul_k<<<(rows + 255) / 256, 256>>>(gate + r, up + r, mid + r, rows);
+  }
+  for (int r = 0; r < HIDDEN; r += HIDDEN_TILE) {
+    int rows = std::min(HIDDEN_TILE, HIDDEN - r);
+    matvec_bf16_rows(io, dw, mid, tmp, r, rows, ffn);
+    add_k<<<(rows + 255) / 256, 256>>>(down + r, tmp + r, rows);
+  }
+}
+
 void matvec_i4(const Tensor &wmeta, const Tensor &smeta, const DeviceTensor &w, const DeviceTensor &scale, const float *x, float *y, int rows, int cols) {
   validate_i4_pair(wmeta, smeta, rows, cols);
   if (scale.dtype == "f32") matvec_i4_f32_scale_k<<<rows, 256>>>(w.u32(), scale.f32(), x, y, rows, cols);
   else matvec_i4_bf16_scale_k<<<rows, 256>>>(w.u32(), scale.bf16(), x, y, rows, cols);
+}
+
+void matvec_i4_slice(const Tensor &smeta, const DeviceTensor &w, const DeviceTensor &scale, const float *x, float *y, int rows, int cols) {
+  if (smeta.dtype == "f32") matvec_i4_f32_scale_k<<<rows, 256>>>(w.u32(), scale.f32(), x, y, rows, cols);
+  else matvec_i4_bf16_scale_k<<<rows, 256>>>(w.u32(), scale.bf16(), x, y, rows, cols);
+}
+
+void tiled_attention(KvCache &kv, int layer, int seq, int tile, const float *q, float *out) {
+  fill_k<<<1, 256>>>(kv.hmax.p, -CUDART_INF_F, HEADS);
+  ck(cudaMemset(out, 0, V_DIM * sizeof(float)), "clear attention out");
+  for (int start = 0; start < seq; start += tile) {
+    int n = std::min(tile, seq - start);
+    kv.load_tile(layer, false, start, n);
+    attn_tile_score_k<<<dim3(HEADS, n), 256>>>(q, kv.kt.p, kv.score.p, n);
+    attn_tile_max_k<<<HEADS, 256>>>(kv.score.p, kv.hmax.p, n);
+  }
+  ck(cudaMemset(kv.hsum.p, 0, HEADS * sizeof(float)), "clear attention sum");
+  for (int start = 0; start < seq; start += tile) {
+    int n = std::min(tile, seq - start);
+    kv.load_tile(layer, false, start, n);
+    attn_tile_score_k<<<dim3(HEADS, n), 256>>>(q, kv.kt.p, kv.score.p, n);
+    kv.load_tile(layer, true, start, n);
+    attn_tile_accum_k<<<dim3(HEADS, (V_HEAD + 255) / 256), 256>>>(kv.score.p, kv.vt.p, kv.hmax.p, kv.hsum.p, out, n);
+  }
+  attn_finish_k<<<(V_DIM + 255) / 256, 256>>>(out, kv.hsum.p);
+}
+
+std::uint32_t sample_lm_head(Io &io, const Tensor &head, const float *x, float *logits, std::uint32_t *did) {
+  float best = -std::numeric_limits<float>::infinity();
+  std::uint32_t token = 0;
+  for (int row = 0; row < VOCAB; row += HEAD_TILE) {
+    int rows = std::min(HEAD_TILE, VOCAB - row);
+    auto h = load_tensor_slice(io, head, (std::uint64_t)row * HIDDEN * sizeof(__nv_bfloat16), (std::uint64_t)rows * HIDDEN * sizeof(__nv_bfloat16));
+    matvec_bf16_k<<<rows, 256>>>(h.bf16(), x, logits, rows, HIDDEN);
+    argmax_k<<<1, 256>>>(logits, did, rows);
+    std::uint32_t local = 0;
+    ck(cudaMemcpy(&local, did, sizeof(local), cudaMemcpyDeviceToHost), "cudaMemcpy lm head sample");
+    float value = 0;
+    ck(cudaMemcpy(&value, logits + local, sizeof(value), cudaMemcpyDeviceToHost), "cudaMemcpy lm head score");
+    if (value > best) { best = value; token = (std::uint32_t)row + local; }
+  }
+  return token;
 }
 
 void validate_forward_contract(const RuntimeIndex &rt) {
@@ -617,12 +858,11 @@ void validate_forward_contract(const RuntimeIndex &rt) {
     need_role(ts, i, "shared_expert_resident", "gate_proj");
     need_role(ts, i, "shared_expert_resident", "up_proj");
     need_role(ts, i, "shared_expert_resident", "down_proj");
-    need_routed_weight(ts, i, "gate_proj", 0);
-    need_routed_scale(ts, i, "gate_proj", 0);
-    need_routed_weight(ts, i, "up_proj", 0);
-    need_routed_scale(ts, i, "up_proj", 0);
-    need_routed_weight(ts, i, "down_proj", 0);
-    need_routed_scale(ts, i, "down_proj", 0);
+    for (int e = 0; e < EXPERTS; ++e) {
+      validate_i4_pair(need_routed_weight(ts, i, "gate_proj", e), need_routed_scale(ts, i, "gate_proj", e), MOE, HIDDEN);
+      validate_i4_pair(need_routed_weight(ts, i, "up_proj", e), need_routed_scale(ts, i, "up_proj", e), MOE, HIDDEN);
+      validate_i4_pair(need_routed_weight(ts, i, "down_proj", e), need_routed_scale(ts, i, "down_proj", e), HIDDEN, MOE);
+    }
   }
   if (count(ts, "attention_resident") == 0) die("missing attention tensors");
   if (count(ts, "router") == 0) die("missing router tensors");
@@ -657,76 +897,62 @@ std::string json(const std::string &s) {
   return o + "\"";
 }
 
-std::string generate(Io &io, const RuntimeIndex &rt, const Args &a) {
+Generation generate(Io &io, const RuntimeIndex &rt, const Args &a) {
   auto tokz = tokenizer(rt.tokenizer_blok);
   auto input = encode(tokz, a.prompt), made = std::vector<std::uint32_t>{};
   if (input.empty()) die("tokenizer produced no prompt tokens");
   int mlp_width = max_mlp_width(rt.tensors);
-  auto emb = load_tensor(io, need(rt.tensors, "embed_tokens"));
+  const Tensor &emb = need(rt.tensors, "embed_tokens");
   auto final_norm = load_tensor(io, need(rt.tensors, "norm.weight"));
-  auto head = load_tensor(io, need(rt.tensors, "lm_head"));
-  std::uint32_t *dtok = nullptr, *did = nullptr;
+  const Tensor &head = need(rt.tensors, "lm_head");
+  std::uint32_t *did = nullptr;
   std::uint16_t *dex = nullptr;
-  ck(cudaMalloc(&dtok, sizeof(std::uint32_t)), "cudaMalloc token");
   ck(cudaMalloc(&did, sizeof(std::uint32_t)), "cudaMalloc sample");
   ck(cudaMalloc(&dex, TOPK * sizeof(std::uint16_t)), "cudaMalloc experts");
-  Buf x, n, qa, q, kva, kv, k, v, av, score, router, route_select, ew, gate, up, mid, down, logits;
+  Buf x, n, qa, q, kva, kv, k, v, av, router, route_select, ew, gate, up, mid, down, logits;
   x.make(HIDDEN); n.make(HIDDEN); qa.make(Q_RANK); q.make(HEADS * (QK_NOPE + QK_ROPE));
   kva.make(KV_A); kv.make(HEADS * (QK_NOPE + V_HEAD)); k.make(HEADS * (QK_NOPE + QK_ROPE));
-  v.make(HEADS * V_HEAD); av.make(HEADS * V_HEAD); score.make(input.size() + a.tokens + 1);
+  v.make(HEADS * V_HEAD); av.make(HEADS * V_HEAD);
   router.make(EXPERTS); route_select.make(EXPERTS); ew.make(TOPK);
-  gate.make(mlp_width); up.make(mlp_width); mid.make(mlp_width); down.make(HIDDEN); logits.make(VOCAB);
-  std::vector<Buf> kc(LAYERS), vc(LAYERS);
-  for (int l = 0; l < LAYERS; ++l) {
-    kc[l].make((input.size() + a.tokens + 1) * HEADS * (QK_NOPE + QK_ROPE));
-    vc[l].make((input.size() + a.tokens + 1) * HEADS * V_HEAD);
-  }
+  gate.make(mlp_width); up.make(mlp_width); mid.make(mlp_width); down.make(HIDDEN); logits.make(HEAD_TILE);
+  int tile = 1;
+  KvCache kv_cache(io, input.size() + a.tokens + 1, tile);
   auto run = [&](std::uint32_t id, int pos) {
-    ck(cudaMemcpy(dtok, &id, sizeof(id), cudaMemcpyHostToDevice), "cudaMemcpy token");
-    embed_k<<<(HIDDEN + 255) / 256, 256>>>(emb.bf16(), dtok, x.p);
+    embed_token(io, emb, id, x.p);
     for (int l = 0; l < LAYERS; ++l) {
       auto ln0 = load_tensor(io, need(rt.tensors, l, "input_layernorm"));
-      auto qaw = load_tensor(io, need(rt.tensors, l, "q_a_proj"));
+      const Tensor &qaw = need(rt.tensors, l, "q_a_proj");
       auto qaln = load_tensor(io, need(rt.tensors, l, "q_a_layernorm"));
-      auto qbw = load_tensor(io, need(rt.tensors, l, "q_b_proj"));
-      auto kvaw = load_tensor(io, need(rt.tensors, l, "kv_a_proj"));
+      const Tensor &qbw = need(rt.tensors, l, "q_b_proj");
+      const Tensor &kvaw = need(rt.tensors, l, "kv_a_proj");
       auto kvaln = load_tensor(io, need(rt.tensors, l, "kv_a_layernorm"));
-      auto kvbw = load_tensor(io, need(rt.tensors, l, "kv_b_proj"));
-      auto ow = load_tensor(io, need(rt.tensors, l, "o_proj"));
+      const Tensor &kvbw = need(rt.tensors, l, "kv_b_proj");
+      const Tensor &ow = need(rt.tensors, l, "o_proj");
       rmsnorm_k<<<1, 256>>>(x.p, ln0.bf16(), n.p, HIDDEN);
-      matvec_bf16_k<<<Q_RANK, 256>>>(qaw.bf16(), n.p, qa.p, Q_RANK, HIDDEN);
+      matvec_bf16_all_rows(io, qaw, n.p, qa.p, Q_RANK, HIDDEN, EXPERT_TILE);
       rmsnorm_k<<<1, 256>>>(qa.p, qaln.bf16(), qa.p, Q_RANK);
-      matvec_bf16_k<<<HEADS * (QK_NOPE + QK_ROPE), 256>>>(qbw.bf16(), qa.p, q.p, HEADS * (QK_NOPE + QK_ROPE), Q_RANK);
-      matvec_bf16_k<<<KV_A, 256>>>(kvaw.bf16(), n.p, kva.p, KV_A, HIDDEN);
+      matvec_bf16_all_rows(io, qbw, qa.p, q.p, K_DIM, Q_RANK, EXPERT_TILE);
+      matvec_bf16_all_rows(io, kvaw, n.p, kva.p, KV_A, HIDDEN, EXPERT_TILE);
       rmsnorm_k<<<1, 256>>>(kva.p, kvaln.bf16(), kva.p, KV_RANK);
-      matvec_bf16_k<<<HEADS * (QK_NOPE + V_HEAD), 256>>>(kvbw.bf16(), kva.p, kv.p, HEADS * (QK_NOPE + V_HEAD), KV_RANK);
+      matvec_bf16_all_rows(io, kvbw, kva.p, kv.p, HEADS * (QK_NOPE + V_HEAD), KV_RANK, EXPERT_TILE);
       ck(cudaMemcpy(k.p, kv.p, HEADS * QK_NOPE * sizeof(float), cudaMemcpyDeviceToDevice), "cudaMemcpy k nope");
       k_rope_fill_k<<<(HEADS * QK_ROPE + 255) / 256, 256>>>(k.p, kva.p + KV_RANK);
       ck(cudaMemcpy(v.p, kv.p + HEADS * QK_NOPE, HEADS * V_HEAD * sizeof(float), cudaMemcpyDeviceToDevice), "cudaMemcpy v");
       rope_k<<<(HEADS * QK_ROPE / 2 + 255) / 256, 256>>>(q.p, k.p, pos, HEADS, QK_NOPE + QK_ROPE, QK_ROPE);
-      kv_store_k<<<(HEADS * (QK_NOPE + QK_ROPE) + 255) / 256, 256>>>(
-          k.p, v.p, kc[l].p, vc[l].p, pos, HEADS * (QK_NOPE + QK_ROPE), HEADS * V_HEAD);
-      attn_score_k<<<pos + 1, 256>>>(q.p, kc[l].p, score.p, pos + 1, HEADS * (QK_NOPE + QK_ROPE));
-      softmax_k<<<1, 256>>>(score.p, pos + 1);
-      attn_value_k<<<(HEADS * V_HEAD + 255) / 256, 256>>>(score.p, vc[l].p, av.p, pos + 1, HEADS * V_HEAD);
-      matvec_bf16_k<<<HIDDEN, 256>>>(ow.bf16(), av.p, down.p, HIDDEN, HEADS * V_HEAD);
+      kv_cache.store(l, pos, k.p, v.p);
+      tiled_attention(kv_cache, l, pos + 1, tile, q.p, av.p);
+      matvec_bf16_all_rows(io, ow, av.p, down.p, HIDDEN, HEADS * V_HEAD, HIDDEN_TILE);
       add_k<<<(HIDDEN + 255) / 256, 256>>>(x.p, down.p, HIDDEN);
       auto ln1 = load_tensor(io, need(rt.tensors, l, "post_attention_layernorm"));
       rmsnorm_k<<<1, 256>>>(x.p, ln1.bf16(), n.p, HIDDEN);
       ck(cudaMemset(down.p, 0, HIDDEN * sizeof(float)), "cudaMemset ffn");
       if (l < FIRST_DENSE) {
-        auto gw = load_tensor(io, need(rt.tensors, l, "gate_proj"));
-        auto uw = load_tensor(io, need(rt.tensors, l, "up_proj"));
-        auto dw = load_tensor(io, need(rt.tensors, l, "down_proj"));
-        int ffn = shape_dim(need(rt.tensors, l, "gate_proj"), 0);
-        matvec_bf16_k<<<ffn, 256>>>(gw.bf16(), n.p, gate.p, ffn, HIDDEN);
-        matvec_bf16_k<<<ffn, 256>>>(uw.bf16(), n.p, up.p, ffn, HIDDEN);
-        silu_mul_k<<<(ffn + 255) / 256, 256>>>(gate.p, up.p, mid.p, ffn);
-        matvec_bf16_k<<<HIDDEN, 256>>>(dw.bf16(), mid.p, down.p, HIDDEN, ffn);
+        const Tensor &gw = need(rt.tensors, l, "gate_proj"), &uw = need(rt.tensors, l, "up_proj"), &dw = need(rt.tensors, l, "down_proj");
+        bf16_mlp(io, gw, uw, dw, n.p, down.p, gate.p, up.p, mid.p, av.p, shape_dim(gw, 0));
       } else {
-        auto rw = load_tensor(io, need_role(rt.tensors, l, "router", "gate"));
+        const Tensor &rw = need_role(rt.tensors, l, "router", "gate");
         auto rb = load_tensor(io, need_role(rt.tensors, l, "router", "e_score_correction_bias"));
-        matvec_bf16_k<<<EXPERTS, 256>>>(rw.bf16(), n.p, router.p, EXPERTS, HIDDEN);
+        matvec_bf16_all_rows(io, rw, n.p, router.p, EXPERTS, HIDDEN, EXPERT_TILE);
         sigmoid_k<<<(EXPERTS + 255) / 256, 256>>>(router.p, EXPERTS);
         ck(cudaMemcpy(route_select.p, router.p, EXPERTS * sizeof(float), cudaMemcpyDeviceToDevice), "cudaMemcpy router scores");
         if (rb.dtype == "f32") add_f32_k<<<(EXPERTS + 255) / 256, 256>>>(route_select.p, rb.f32(), EXPERTS);
@@ -741,35 +967,33 @@ std::string generate(Io &io, const RuntimeIndex &rt, const Args &a) {
           const Tensor &usm = need_routed_scale(rt.tensors, l, "up_proj", ex[i]);
           const Tensor &dwm = need_routed_weight(rt.tensors, l, "down_proj", ex[i]);
           const Tensor &dsm = need_routed_scale(rt.tensors, l, "down_proj", ex[i]);
-          auto gw = load_tensor(io, gwm);
-          auto gs = load_tensor(io, gsm);
-          auto uw = load_tensor(io, uwm);
-          auto us = load_tensor(io, usm);
-          auto dw = load_tensor(io, dwm);
-          auto ds = load_tensor(io, dsm);
-          matvec_i4(gwm, gsm, gw, gs, n.p, gate.p, MOE, HIDDEN);
-          matvec_i4(uwm, usm, uw, us, n.p, up.p, MOE, HIDDEN);
-          silu_mul_k<<<(MOE + 255) / 256, 256>>>(gate.p, up.p, mid.p, MOE);
-          matvec_i4(dwm, dsm, dw, ds, mid.p, av.p, HIDDEN, MOE);
-          expert_accum_k<<<(HIDDEN + 255) / 256, 256>>>(av.p, ew.p, i, down.p, HIDDEN);
+          for (int r = 0; r < MOE; r += EXPERT_TILE) {
+            int rows = std::min(EXPERT_TILE, MOE - r);
+            auto gw = load_rows(io, gwm, r, rows, HIDDEN / I4_PER_WORD * dtype_bytes(gwm));
+            auto gs = load_rows(io, gsm, r, rows, HIDDEN / I4_GROUP * dtype_bytes(gsm));
+            auto uw = load_rows(io, uwm, r, rows, HIDDEN / I4_PER_WORD * dtype_bytes(uwm));
+            auto us = load_rows(io, usm, r, rows, HIDDEN / I4_GROUP * dtype_bytes(usm));
+            matvec_i4_slice(gsm, gw, gs, n.p, gate.p + r, rows, HIDDEN);
+            matvec_i4_slice(usm, uw, us, n.p, up.p + r, rows, HIDDEN);
+            silu_mul_k<<<(rows + 255) / 256, 256>>>(gate.p + r, up.p + r, mid.p + r, rows);
+          }
+          for (int r = 0; r < HIDDEN; r += HIDDEN_TILE) {
+            int rows = std::min(HIDDEN_TILE, HIDDEN - r);
+            auto dw = load_rows(io, dwm, r, rows, MOE / I4_PER_WORD * dtype_bytes(dwm));
+            auto ds = load_rows(io, dsm, r, rows, MOE / I4_GROUP * dtype_bytes(dsm));
+            matvec_i4_slice(dsm, dw, ds, mid.p, av.p + r, rows, MOE);
+            expert_accum_k<<<(rows + 255) / 256, 256>>>(av.p + r, ew.p, i, down.p + r, rows);
+          }
         }
-        auto sgw = load_tensor(io, need_role(rt.tensors, l, "shared_expert_resident", "gate_proj"));
-        auto suw = load_tensor(io, need_role(rt.tensors, l, "shared_expert_resident", "up_proj"));
-        auto sdw = load_tensor(io, need_role(rt.tensors, l, "shared_expert_resident", "down_proj"));
-        int ffn = shape_dim(need_role(rt.tensors, l, "shared_expert_resident", "gate_proj"), 0);
-        matvec_bf16_k<<<ffn, 256>>>(sgw.bf16(), n.p, gate.p, ffn, HIDDEN);
-        matvec_bf16_k<<<ffn, 256>>>(suw.bf16(), n.p, up.p, ffn, HIDDEN);
-        silu_mul_k<<<(ffn + 255) / 256, 256>>>(gate.p, up.p, mid.p, ffn);
-        matvec_bf16_k<<<HIDDEN, 256>>>(sdw.bf16(), mid.p, av.p, HIDDEN, ffn);
-        add_k<<<(HIDDEN + 255) / 256, 256>>>(down.p, av.p, HIDDEN);
+        const Tensor &sgw = need_role(rt.tensors, l, "shared_expert_resident", "gate_proj");
+        const Tensor &suw = need_role(rt.tensors, l, "shared_expert_resident", "up_proj");
+        const Tensor &sdw = need_role(rt.tensors, l, "shared_expert_resident", "down_proj");
+        bf16_mlp(io, sgw, suw, sdw, n.p, down.p, gate.p, up.p, mid.p, av.p, shape_dim(sgw, 0));
       }
       add_k<<<(HIDDEN + 255) / 256, 256>>>(x.p, down.p, HIDDEN);
     }
     rmsnorm_k<<<1, 256>>>(x.p, final_norm.bf16(), n.p, HIDDEN);
-    matvec_bf16_k<<<VOCAB, 256>>>(head.bf16(), n.p, logits.p, VOCAB, HIDDEN);
-    argmax_k<<<1, 256>>>(logits.p, did, VOCAB);
-    std::uint32_t next = 0;
-    ck(cudaMemcpy(&next, did, sizeof(next), cudaMemcpyDeviceToHost), "cudaMemcpy sample");
+    std::uint32_t next = sample_lm_head(io, head, n.p, logits.p, did);
     ck(cudaDeviceSynchronize(), "decode sync");
     return next;
   };
@@ -779,8 +1003,8 @@ std::string generate(Io &io, const RuntimeIndex &rt, const Args &a) {
     made.push_back(next);
     next = run(next, (int)(input.size() + i));
   }
-  cudaFree(dtok); cudaFree(did); cudaFree(dex);
-  return decode(tokz, made);
+  cudaFree(did); cudaFree(dex);
+  return {decode(tokz, made), (std::uint64_t)made.size()};
 }
 
 int main(int argc, char **argv) {
@@ -788,12 +1012,12 @@ int main(int argc, char **argv) {
   auto rt = runtime_index(a.manifest);
   validate_forward_contract(rt);
   Io io;
-  auto text = generate(io, rt, a);
+  auto gen = generate(io, rt, a);
 #ifdef BLOK_HAVE_UGDS
   const char *io_mode = "ugds";
 #else
   const char *io_mode = "odirect";
 #endif
-  std::cout << "{\"protocol\":\"blok-kimi-exec-v1\",\"status\":\"ok\",\"io_mode\":\"" << io_mode << "\",\"text\":" << json(text)
-            << ",\"tokens\":" << a.tokens << ",\"predicted_tps\":0,\"watts\":null}\n";
+  std::cout << "{\"protocol\":\"blok-kimi-exec-v1\",\"status\":\"ok\",\"io_mode\":\"" << io_mode << "\",\"text\":" << json(gen.text)
+            << ",\"tokens\":" << gen.tokens << ",\"predicted_tps\":null,\"watts\":null}\n";
 }

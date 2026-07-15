@@ -92,7 +92,9 @@ fn generate<W: Write>(g: Generate, out: &mut W) -> Result<()> {
         "{{\"status\":\"ok\",\"text\":{},\"tokens\":{},\"predicted_tps\":{},\"watts\":{}}}",
         json(&response.text),
         response.tokens,
-        response.predicted_tps,
+        response
+            .predicted_tps
+            .map_or_else(|| "null".to_owned(), |tps| tps.to_string()),
         response
             .watts
             .map_or_else(|| "null".to_owned(), |watts| watts.to_string())
@@ -130,4 +132,28 @@ fn json(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run;
+    use std::ffi::OsString;
+
+    #[test]
+    fn missing_prompt_is_cli_error() {
+        let args = ["blok", "generate", "--model", "m", "--tokens", "1"].map(OsString::from);
+        let err = run(args, &mut Vec::new()).unwrap_err().to_string();
+        assert!(err.contains("--prompt is required"));
+    }
+
+    #[test]
+    fn help_is_stable() {
+        let args = ["blok", "--help"].map(OsString::from);
+        let mut out = Vec::new();
+        run(args, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "usage: blok generate --model <manifest-or-dir> --prompt <text> --tokens <n>\n"
+        );
+    }
 }

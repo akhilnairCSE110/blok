@@ -15,7 +15,7 @@ pub struct KimiNativeRequest<'a> {
 pub struct KimiNativeResponse {
     pub text: String,
     pub tokens: u64,
-    pub predicted_tps: f64,
+    pub predicted_tps: Option<f64>,
     pub watts: Option<f64>,
 }
 
@@ -125,7 +125,7 @@ fn parse_executor_json(text: &str) -> Result<KimiNativeResponse> {
         .ok_or_else(|| Error::Native("executor response missing text".to_owned()))?;
     let tokens = json_u64(text, "tokens")
         .ok_or_else(|| Error::Native("executor response missing tokens".to_owned()))?;
-    let predicted_tps = json_f64(text, "predicted_tps").unwrap_or(0.0);
+    let predicted_tps = json_f64(text, "predicted_tps");
     let watts = json_f64(text, "watts");
     Ok(KimiNativeResponse {
         text: text_value,
@@ -200,4 +200,31 @@ fn validate_request(request: &KimiNativeRequest<'_>) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_executor_json;
+
+    #[test]
+    fn parses_null_measurements_as_unknown() {
+        let got = parse_executor_json(
+            r#"{"status":"ok","text":"paris","tokens":1,"predicted_tps":null,"watts":null}"#,
+        )
+        .unwrap();
+        assert_eq!(got.text, "paris");
+        assert_eq!(got.tokens, 1);
+        assert_eq!(got.predicted_tps, None);
+        assert_eq!(got.watts, None);
+    }
+
+    #[test]
+    fn parses_positive_measurements() {
+        let got = parse_executor_json(
+            r#"{"status":"ok","text":"x","tokens":2,"predicted_tps":7.5,"watts":199.0}"#,
+        )
+        .unwrap();
+        assert_eq!(got.predicted_tps, Some(7.5));
+        assert_eq!(got.watts, Some(199.0));
+    }
 }

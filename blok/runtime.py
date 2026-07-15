@@ -55,7 +55,7 @@ class PowerReport:
     watts: float | None
 
     def low(self) -> bool:
-        return self.watts is None or self.watts <= 250.0
+        return self.watts is not None and self.watts <= 250.0
 
 
 @dataclass(frozen=True)
@@ -64,7 +64,7 @@ class PlanReport:
     predicted_tokens_per_second: float | None
 
     def predicted(self) -> bool:
-        return self.predicted_tokens_per_second is not None
+        return self.predicted_tokens_per_second is not None and self.predicted_tokens_per_second > 0
 
 
 @dataclass(frozen=True)
@@ -87,14 +87,14 @@ class KimiThread:
 
     def run(self) -> GenerationResponse:
         model_dir = resolve_model_dir(self.model_dir)
-        validate_kimi_config(model_dir)
-        ensure_complete_model(model_dir)
+        check_ready(model_dir)
         manifest = ensure_manifest(model_dir)
         started = time.perf_counter()
         report = run_native_generate(model_dir, manifest, self.prompt, self.max_tokens)
         elapsed = max(time.perf_counter() - started, 1.0e-9)
         text = normalize_answer(report["text"])
-        tps = max(1.0, float(report["tokens"])) / elapsed
+        tokens = float(report["tokens"])
+        tps = tokens / elapsed if tokens else 0.0
         return GenerationResponse(
             text=TextValue(text),
             ttft=elapsed,
@@ -176,6 +176,51 @@ def validate_kimi_config(model_dir: Path) -> None:
         raise BlokRuntimeError("unsupported Kimi config: " + "; ".join(mismatches))
 
 
+def check_ready(model_dir: str | os.PathLike[str]) -> None:
+    model_dir = resolve_model_dir(Path(model_dir))
+    issues: list[str] = []
+    config_path = model_dir / "config.json"
+    if config_path.is_file():
+        try:
+            validate_kimi_config(model_dir)
+        except BlokRuntimeError as error:
+            issues.append(str(error))
+    else:
+        issues.append(f"missing config.json: {config_path}")
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        if not (model_dir / name).is_file():
+            issues.append(f"missing {name}: {model_dir / name}")
+    try:
+        ensure_complete_model(model_dir)
+    except BlokRuntimeError as error:
+        issues.append(str(error))
+    for path, hint in (
+        (model_dir / "blok" / "manifest.blok", "run scripts/model_fetch.py kimi-k2.6 materialize"),
+        (model_dir / "blok" / "runtime-index.blok", "run scripts/model_fetch.py kimi-k2.6 materialize"),
+        (model_dir / "blok" / "tokenizer.blok", "run scripts/model_fetch.py kimi-k2.6 materialize"),
+    ):
+        if not path.is_file():
+            issues.append(f"missing {path.name}: {path}; {hint}")
+    if not _blok_bin().is_file():
+        issues.append("native blok binary is missing; run cargo build --release")
+    if not Path(os.getenv("BLOK_KIMI_EXEC_BIN", "build/blok-kimi-exec")).is_file():
+        issues.append("CUDA executor is missing; run cmake -S . -B build && cmake --build build")
+    for key in ("BLOK_UGDS_DEVICE", "BLOK_UGDS_MAP"):
+        value = os.getenv(key)
+        if not value:
+            issues.append(f"missing {key}")
+        elif not Path(value).exists():
+            issues.append(f"{key} does not exist: {value}")
+    for key in ("BLOK_KV_UGDS_BASE", "BLOK_KV_UGDS_BYTES"):
+        value = os.getenv(key)
+        if not value:
+            issues.append(f"missing {key}")
+        elif not value.isdigit() or int(value) <= 0:
+            issues.append(f"{key} must be a positive byte count/offset")
+    if issues:
+        raise BlokRuntimeError("model is not ready:\n- " + "\n- ".join(issues))
+
+
 def ensure_complete_model(model_dir: Path) -> None:
     shards = sorted(model_dir.glob("model-*-of-*.safetensors"))
     if not shards:
@@ -198,9 +243,7 @@ def ensure_manifest(model_dir: Path) -> Path:
 
 
 def run_native_generate(model_dir: Path, manifest: Path, prompt: str, max_tokens: int) -> dict:
-    exe = Path(os.getenv("BLOK_BIN", Path(__file__).resolve().parents[1] / "target" / "release" / "blok"))
-    if not exe.is_file():
-        exe = Path(__file__).resolve().parents[1] / "target" / "debug" / "blok"
+    exe = _blok_bin()
     if not exe.is_file():
         raise BlokRuntimeError("native blok binary is missing; run cargo build --release")
     proc = subprocess.run(
@@ -225,6 +268,11 @@ def run_native_generate(model_dir: Path, manifest: Path, prompt: str, max_tokens
     if report.get("status") != "ok" or "text" not in report:
         raise BlokRuntimeError(f"native generation did not emit text: {proc.stdout.strip()}")
     return report
+
+
+def _blok_bin() -> Path:
+    exe = Path(os.getenv("BLOK_BIN", Path(__file__).resolve().parents[1] / "target" / "release" / "blok"))
+    return exe if exe.is_file() else Path(__file__).resolve().parents[1] / "target" / "debug" / "blok"
 
 
 def normalize_answer(text: str) -> str:
