@@ -98,7 +98,7 @@ fn run_executor(
             request.prompt,
             "--tokens",
             &request.max_tokens.to_string(),
-            "--top-k",
+            "--router-top-k",
             &plan.top_k.to_string(),
         ])
         .stderr(Stdio::piped())

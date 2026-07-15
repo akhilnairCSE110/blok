@@ -42,6 +42,24 @@ hardware-check:
 model-contract:
     scripts/ci.sh model-contract
 
+verify-l0:
+    scripts/ci.sh verify-l0
+
+verify-l1:
+    scripts/ci.sh verify-l1
+
+verify-l2:
+    scripts/ci.sh verify-l2
+
+verify-l3:
+    scripts/ci.sh verify-l3
+
+verify-l4:
+    scripts/ci.sh verify-l4
+
+verify-l5:
+    scripts/ci.sh verify-l5
+
 release-linux:
     scripts/ci.sh release-linux
 

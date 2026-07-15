@@ -207,6 +207,32 @@ check_local() {
   fmt_check
 }
 
+verify_l0() {
+  check_local
+}
+
+verify_l1() {
+  model_contract
+}
+
+verify_l2() {
+  cuda_deep_linux
+}
+
+verify_l3() {
+  echo "missing: official tokenizer/MLA/logit parity fixtures are not implemented"
+  return 1
+}
+
+verify_l4() {
+  hardware_check
+}
+
+verify_l5() {
+  echo "missing: revision-keyed regression fixtures are not implemented"
+  return 1
+}
+
 check_linux() {
   fmt_check
   cxx_linux
@@ -253,12 +279,18 @@ case "${1:-}" in
   deps) deps ;;
   hardware-check) hardware_check ;;
   model-contract) model_contract ;;
+  verify-l0) verify_l0 ;;
+  verify-l1) verify_l1 ;;
+  verify-l2) verify_l2 ;;
+  verify-l3) verify_l3 ;;
+  verify-l4) verify_l4 ;;
+  verify-l5) verify_l5 ;;
   check-local) check_local ;;
   check-linux) check_linux ;;
   deep-linux) deep_linux ;;
   release-linux) release_linux ;;
   *)
-    echo "usage: $0 {fmt|fmt-check|setup|cxx-linux|cxx-sanitize-linux|rust-linux|rust-deep-linux|cuda-deep-linux|deps|hardware-check|model-contract|check-local|check-linux|deep-linux|release-linux}" >&2
+    echo "usage: $0 {fmt|fmt-check|setup|cxx-linux|cxx-sanitize-linux|rust-linux|rust-deep-linux|cuda-deep-linux|deps|hardware-check|model-contract|verify-l0|verify-l1|verify-l2|verify-l3|verify-l4|verify-l5|check-local|check-linux|deep-linux|release-linux}" >&2
     exit 2
     ;;
 esac

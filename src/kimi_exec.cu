@@ -390,15 +390,15 @@ std::string hex(const std::string &s) {
 Args args(int argc, char **argv) {
   Args a;
   for (int i = 1; i < argc; i += 2) {
-    if (i + 1 >= argc) die("usage: blok-kimi-exec --manifest m --prompt p --tokens n --top-k 8");
+    if (i + 1 >= argc) die("usage: blok-kimi-exec --manifest m --prompt p --tokens n --router-top-k 8");
     std::string f = argv[i];
     if (f == "--manifest") a.manifest = argv[i + 1];
     else if (f == "--prompt") a.prompt = argv[i + 1];
     else if (f == "--tokens") a.tokens = u64(argv[i + 1], "tokens");
-    else if (f == "--top-k") a.topk = u64(argv[i + 1], "top-k");
+    else if (f == "--router-top-k") a.topk = u64(argv[i + 1], "router-top-k");
     else die("unknown flag: " + f);
   }
-  if (a.manifest.empty() || a.prompt.empty() || a.tokens == 0 || a.topk != 8) die("bad args");
+  if (a.manifest.empty() || a.prompt.empty() || a.tokens == 0 || a.topk != TOPK) die("bad args");
   return a;
 }
 
@@ -789,5 +789,11 @@ int main(int argc, char **argv) {
   validate_forward_contract(rt);
   Io io;
   auto text = generate(io, rt, a);
-  std::cout << "{\"status\":\"ok\",\"text\":" << json(text) << ",\"tokens\":" << a.tokens << ",\"predicted_tps\":0,\"watts\":null}\n";
+#ifdef BLOK_HAVE_UGDS
+  const char *io_mode = "ugds";
+#else
+  const char *io_mode = "odirect";
+#endif
+  std::cout << "{\"protocol\":\"blok-kimi-exec-v1\",\"status\":\"ok\",\"io_mode\":\"" << io_mode << "\",\"text\":" << json(text)
+            << ",\"tokens\":" << a.tokens << ",\"predicted_tps\":0,\"watts\":null}\n";
 }

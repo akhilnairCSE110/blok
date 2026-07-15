@@ -1,6 +1,11 @@
 model:
   hf_repo: moonshotai/Kimi-K2-Thinking
   architecture_class: DeepseekV3ForCausalLM
+  supported_modalities:
+    text: target
+    image: not_implemented
+    video: not_implemented
+  capability_statement: experimental text-only native runtime; not numerically validated
   auto_map:
     config: configuration_deepseek.DeepseekV3Config
     model: modeling_deepseek.DeepseekV3ForCausalLM
@@ -30,6 +35,9 @@ config:
     theta: 50000
     yarn_scaling_factor: 64
     original_max_position_embeddings: 4096
+    beta_fast: 32
+    beta_slow: 1
+    status: required_for_long_context_parity_not_implemented
   rms_norm_eps: 1.0e-05
   max_position_embeddings: 262144
   vocab_size: 163840
@@ -70,6 +78,7 @@ tokenizer:
 
 forward_contract:
   source_file: modeling_deepseek.py
+  parity_gate: official implementation token/logit parity before performance work
   mla_required:
     - q_down_up_path
     - kv_compressed_path
@@ -83,7 +92,8 @@ forward_contract:
     - shared_expert_combination
     - expert_tensor_orientation
   router:
-    correction_bias_order: add_to_sigmoid_scores_before_topk
+    correction_bias_order: add_to_sigmoid_scores_for_selection_only
+    selected_weight_source: unbiased_sigmoid_scores
     selected_weight_norm: renormalize_to_sum_1_then_scale
 
 required_fetch:
@@ -156,6 +166,40 @@ tensor_contract:
     down_proj_shape: [7168, 18432]
 
 verification:
+  levels:
+    0_static:
+      description: formatting, linting, schema parsing, basic build checks
+      command: just verify-l0
+      status: implemented
+    1_model_contract:
+      description: safetensor/runtime-index tensor names, dtypes, shapes, tokenizer sidecar presence
+      command: BLOK_MODEL=/path/to/manifest.blok just verify-l1
+      status: implemented
+    2_gpu_kernel:
+      description: CUDA build and sanitizer availability; per-kernel reference tests still needed
+      command: just verify-l2
+      status: partial
+    3_end_to_end_parity:
+      description: official tokenizer/chat-template, per-layer trace, final logits, exact greedy tokens
+      command: just verify-l3
+      status: missing
+    4_target_hardware:
+      description: AMD/NVIDIA/NVMe/uGDS probe plus one-token target smoke
+      command: just verify-l4
+      status: partial
+    5_regression:
+      description: known-good outputs keyed by model revision and tokenizer revision
+      command: just verify-l5
+      status: missing
+  required_next_milestone:
+    name: deterministic_text_prompt_official_parity
+    artifacts:
+      - official token ids after chat template
+      - embedding output sample
+      - per-layer RMSNorm and attention output samples
+      - router logits, selected experts, unbiased selected weights, routed contribution
+      - final logits sample
+      - exact greedy token ids
   local:
     - cargo check
     - python3 -m py_compile scripts/model_fetch.py
