@@ -35,7 +35,7 @@ struct Args {
 };
 
 struct RuntimeIndex {
-  std::string tokenizer, tokenizer_blok;
+  std::string tokenizer_blok;
   std::vector<Tensor> tensors;
 };
 
@@ -368,10 +368,6 @@ RuntimeIndex runtime_index(const std::string &manifest) {
   RuntimeIndex out;
   std::string line;
   while (std::getline(in, line)) {
-    if (line.starts_with("tokenizer ")) {
-      out.tokenizer = line.substr(10);
-      continue;
-    }
     if (line.starts_with("tokenizer_blok ")) {
       out.tokenizer_blok = line.substr(15);
       continue;
@@ -387,7 +383,6 @@ RuntimeIndex runtime_index(const std::string &manifest) {
     if (!t.file.empty()) out.tensors.push_back(t);
   }
   if (out.tensors.empty()) die("runtime index has no file-backed tensors");
-  if (out.tokenizer.empty() || !std::filesystem::is_regular_file(out.tokenizer)) die("tokenizer.json missing from runtime index");
   if (out.tokenizer_blok.empty() || !std::filesystem::is_regular_file(out.tokenizer_blok)) die("tokenizer.blok missing from runtime index");
   return out;
 }

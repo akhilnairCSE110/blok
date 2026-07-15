@@ -124,7 +124,7 @@ def materialize(c):
         rows = [f"tok {i} {s.encode().hex()}" for s, i in vocab.items()]
         rows += [f"merge {i} " + " ".join(x.encode().hex() for x in (m.split() if isinstance(m, str) else m)) for i, m in enumerate(merges)]
         tb.write_text("blok-tokenizer-v1\n" + "\n".join(rows) + "\n")
-        runtime += [f"tokenizer {tok}", f"tokenizer_blok {tb}"]
+        runtime.append(f"tokenizer_blok {tb}")
     index, alignment = [], 4096
     for name, r, dtype, shape, file, start, size in tensors(c):
         off, end = align_down(start, alignment), align(start + size, alignment)
