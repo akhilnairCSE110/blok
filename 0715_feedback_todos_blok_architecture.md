@@ -773,3 +773,117 @@ target machine can run one prompt, produce one token, and match official first-t
 ```
 
 Only after that should the project spend serious effort on caching, batching, uGDS async paths, performance tuning, or richer API surface.
+
+## Repo-Grounded Claim Audit Addendum
+
+Audit date: 2026-07-15.
+
+This addendum records the current-source verification for the material factual and technical claims in this file. Labels are intentionally limited to:
+
+- VERIFIED IN REPO
+- CONTRADICTED BY REPO
+- PLAUSIBLE BUT UNPROVEN
+- EXTERNAL CLAIM SUPPORTED
+- EXTERNAL CLAIM NOT VERIFIED
+
+### Read-Only Checks Run
+
+Commands run from the repository root:
+
+```sh
+git status --short
+git log --oneline -5
+rg --files
+rg -n "tokenizer|first-token|first token|logits|parity|MLA|attention|BLOK_UGDS|UGDS_MAP|paris|PowerReport|PlanReport|predicted_tps|watts|tokens"
+find build -maxdepth 2 -type f -name 'blok-kimi-exec' -print
+find . -maxdepth 4 -type f -name 'manifest.blok' -o -name 'runtime-index.blok' -o -name 'tokenizer.blok' -o -name '*ugds*map*' -o -name '*UGDS*MAP*'
+find . -maxdepth 4 -type f -path '*test*' -print
+find . -maxdepth 3 -type f -name '*parity*' -print
+which ninja
+which nvcc
+cargo build
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features -- --list
+target/debug/blok --help
+target/debug/blok generate --model Cargo.toml --prompt hello --tokens 1
+cmake --build build
+```
+
+Observed current state:
+
+- `git status --short` was clean.
+- `cargo build` passed.
+- `cargo clippy --all-targets --all-features -- -D warnings` passed.
+- `cargo test --all-features -- --list` reported zero Rust tests and zero doctests.
+- `target/debug/blok --help` printed `usage: blok generate --model <manifest-or-dir> --prompt <text> --tokens <n>`.
+- `target/debug/blok generate --model Cargo.toml --prompt hello --tokens 1` failed at manifest parsing with `manifest error: line 1 is unknown`.
+- `find build ... blok-kimi-exec` found no executor artifact.
+- `which ninja` and `which nvcc` failed.
+- `cmake --build build` failed. The direct output was terse (`permission denied`), and `build/CMakeCache.txt` records `CMAKE_GENERATOR:INTERNAL=Ninja` with `CMAKE_MAKE_PROGRAM:FILEPATH=CMAKE_MAKE_PROGRAM-NOTFOUND`, which supports the missing-Ninja explanation.
+
+### External Sources Consulted
+
+External paper-search was used only for methodological claims about attention correctness and inference benchmarking.
+
+- Vaswani et al., "Attention Is All You Need", arXiv:1706.03762. Used to support the general claim that standard multi-head attention runs separate attention functions per head, then concatenates/project outputs. This supports the concern that one flattened shared softmax is suspicious, but it does not by itself prove Kimi MLA semantics.
+- Reddi et al., "MLPerf Inference Benchmark", arXiv:1911.02549. Used to support the general claim that inference benchmarking requires reproducible latency/throughput measurement methodology.
+- Banbury et al., "MLPerf Tiny Benchmark", arXiv:2106.07597. Used to support the general claim that low-power inference claims require measured accuracy, latency, and energy/power-style evidence.
+
+### Claim-By-Claim Verification
+
+| Claim | Label | Repo/source evidence |
+|---|---|---|
+| The native CUDA executor is wired to run an autoregressive path: tokenize prompt, read tensor payloads, run a 61-layer decode loop, run attention/MLP/MoE kernels, project through LM head, choose argmax, and detokenize. | VERIFIED IN REPO | `src/kimi_exec.cu:115-120`, `src/kimi_exec.cu:660-683`, `src/kimi_exec.cu:687-775`, `src/kimi_exec.cu:778-783`. |
+| The repo does not prove a correct full Kimi K2.6 forward pass. | VERIFIED IN REPO | `README.md:3-5`, `README.md:32-39`, `scripts/ci.sh:222-234`, `docs/kimi-forward-ugds-status.md:87-103`. |
+| Local Rust build, clippy, help, fake-manifest behavior, and zero-test state are as reported. | VERIFIED IN REPO | Re-run commands above; zero tests from `cargo test --all-features -- --list`; CLI implementation in `src/blok_runtime_library.rs:20-34`, `src/blok_runtime_library.rs:81-100`. |
+| CUDA executor artifact `build/blok-kimi-exec` is absent in the current checkout. | VERIFIED IN REPO | `find build -maxdepth 2 -type f -name 'blok-kimi-exec' -print` returned no paths. |
+| `ninja` and `nvcc` are not installed locally. | VERIFIED IN REPO | `which ninja` and `which nvcc` both failed. `build/CMakeCache.txt:23-24` records missing CMake make program. |
+| `cmake --build build` failed because the configured Ninja build tool is missing. | VERIFIED IN REPO | Direct `cmake --build build` output was `permission denied`; `build/CMakeCache.txt:23-24` records `CMAKE_MAKE_PROGRAM-NOTFOUND`, and `build/CMakeCache.txt:69` records generator `Ninja`. |
+| The intended product path is Python runtime or CLI to Rust `blok generate` to `src/kimi_runtime.rs` to `build/blok-kimi-exec` to `src/kimi_exec.cu` and JSON output. | VERIFIED IN REPO | `blok/runtime.py:200-227`, `src/blok_runtime_library.rs:81-100`, `src/kimi_runtime.rs:79-120`, `src/kimi_exec.cu:786-798`. |
+| The Rust layer is a launcher and parser; native model execution is in `src/kimi_exec.cu`. | VERIFIED IN REPO | `src/kimi_runtime.rs:79-120`, `src/kimi_runtime.rs:123-136`, `src/kimi_exec.cu:660-798`. |
+| Rust success can coexist with missing CUDA executor. | VERIFIED IN REPO | `src/kimi_runtime.rs:89-92` returns `blok_kimi_exec_binary_required` if the executor binary is absent. |
+| `src/kimi_exec.cu` defines tokenizer load/encode/decode, runtime index parsing, tensor loading, contract validation, decode loop, and layer loop. | VERIFIED IN REPO | `src/kimi_exec.cu:405-455`, `src/kimi_exec.cu:457-481`, `src/kimi_exec.cu:562-585`, `src/kimi_exec.cu:593-634`, `src/kimi_exec.cu:660-783`, `src/kimi_exec.cu:684-775`. |
+| The executor loads embeddings, final norm, and LM head once before per-token/layer execution. | VERIFIED IN REPO | `src/kimi_exec.cu:665-667`. |
+| The executor performs a loop over all 61 layers. | VERIFIED IN REPO | `src/kimi_exec.cu:115`, `src/kimi_exec.cu:687`. |
+| `CMAKE_CUDA_ARCHITECTURES` is set to `120`. | VERIFIED IN REPO | `CMakeLists.txt:8`. |
+| Attention currently computes one scalar score per timestep by dotting flattened query/key state and uses one shared softmax over sequence positions. | VERIFIED IN REPO | `src/kimi_exec.cu:241-253`, `src/kimi_exec.cu:255-274`, `src/kimi_exec.cu:709-711`. |
+| Standard multi-head attention usually computes separate per-head attention distributions. | EXTERNAL CLAIM SUPPORTED | Vaswani et al., arXiv:1706.03762, section 3.2.2 defines separate `head_i = Attention(...)` functions run in parallel and concatenated. |
+| The flattened attention path is likely wrong for Kimi MLA. | PLAUSIBLE BUT UNPROVEN | Repo evidence proves flattened behavior, but no official Kimi MLA trace/config implementation is present locally to conclusively prove divergence. See `docs/specs/kimi_k2_forward.yaml:79-88` for required missing MLA parity. |
+| KV layout assumes key-nope values occupy the first contiguous projected segment and values occupy the next segment. | VERIFIED IN REPO | `src/kimi_exec.cu:703-705`. |
+| Actual Kimi KV layout may differ and needs shape/layout verification. | PLAUSIBLE BUT UNPROVEN | No complete real `runtime-index.blok`, safetensor headers, or official Kimi attention projection trace were found in repo. |
+| RoPE uses `ROPE_THETA = 50000.0f` and a simple frequency formula. | VERIFIED IN REPO | `src/kimi_exec.cu:119`, `src/kimi_exec.cu:217-228`. |
+| YaRN long-context scaling is not implemented. | VERIFIED IN REPO | `docs/kimi-forward-ugds-status.md:92`, `docs/specs/kimi_k2_forward.yaml:34-40`. |
+| The executor builds a custom tokenizer from `tokenizer.blok` and tokenizes raw prompt bytes. | VERIFIED IN REPO | `src/kimi_exec.cu:405-455`, especially `src/kimi_exec.cu:425-427`. |
+| The executor does not apply a chat template. | VERIFIED IN REPO | No chat-template application exists in `src/kimi_exec.cu`; tokenizer config/chat template is only referenced as required/missing in `docs/specs/kimi_k2_forward.yaml:57-78`. |
+| The executor only handles one EOS id, `EOS_IM_END = 163586`. | VERIFIED IN REPO | `src/kimi_exec.cu:120`, `src/kimi_exec.cu:778`. |
+| Tokenizer parity tests, first-token-logits parity tests, and layer-level attention/MLA parity tests do not exist. | VERIFIED IN REPO | `find ... '*parity*'` found no files; `scripts/ci.sh:222-225` hard-fails `verify-l3`; `README.md:34-35` marks tokenizer/chat-template and MLA/YaRN parity unverified. |
+| `validate_forward_contract` is shallow and spot-checks routed expert 0. | VERIFIED IN REPO | CUDA executor contract checks broad slots and expert 0 only at `src/kimi_exec.cu:593-634`, especially `src/kimi_exec.cu:620-625`. |
+| A separate model-side contract script validates all 384 routed experts for all MoE layers. | VERIFIED IN REPO | `scripts/check_kimi_contract.py:46-56`. This does not contradict the executor spot-check claim; it means stronger validation exists as a separate script when `verify-l1` is run with `BLOK_MODEL`. |
+| INT4 routed expert path assumes packed symmetric INT4 with `q = nibble - 8`, group size 32, and 8 values per `i32`. | VERIFIED IN REPO | `src/kimi_exec.cu:167-180`, `src/kimi_exec.cu:192-205`, `src/kimi_exec.cu:555-560`; local spec mirrors it at `docs/specs/kimi_k2_forward.yaml:139-161`. |
+| The actual checkpoint quantization convention needs checkpoint-specific validation. | EXTERNAL CLAIM NOT VERIFIED | The repo has a local spec, but no official quantization document, official checkpoint dequantization script, or reference matvec result was found. |
+| Executor reloads many tensors inside every layer and token. | VERIFIED IN REPO | Tensor loads are inside the `run` lambda and layer loop: `src/kimi_exec.cu:684-695`, `src/kimi_exec.cu:714-728`, `src/kimi_exec.cu:737-758`. |
+| Executor prints `"tokens": a.tokens`, `"predicted_tps": 0`, and `"watts": null`. | VERIFIED IN REPO | `src/kimi_exec.cu:797-798`. |
+| Reported `tokens` are requested tokens, not actual generated tokens. | VERIFIED IN REPO | Generation can stop before `a.tokens` at `src/kimi_exec.cu:778-781`, but output still reports `a.tokens` at `src/kimi_exec.cu:798`. |
+| `scripts/ci.sh` verification levels are honest but incomplete; `verify-l3` and `verify-l5` currently fail because fixtures are missing. | VERIFIED IN REPO | `scripts/ci.sh:210-234`; README also documents this at `README.md:41-50`. |
+| `end_goal_prompt.py` asserts text, TTFT, TPS, power, and plan. | VERIFIED IN REPO | `end_goal_prompt.py:20-25`. |
+| `end_goal_prompt.py` asks for Kimi K2 via public Python API and expects `"paris"`. | VERIFIED IN REPO | `end_goal_prompt.py:5-20`. |
+| `blok/runtime.py` resolves a model directory, validates `config.json`, checks safetensor shard count, finds `manifest.blok`, launches Rust, parses JSON, and normalizes text. | VERIFIED IN REPO | `blok/runtime.py:88-105`, `blok/runtime.py:142-161`, `blok/runtime.py:164-177`, `blok/runtime.py:179-197`, `blok/runtime.py:200-227`, `blok/runtime.py:230-234`. |
+| Python TPS uses executor-reported `tokens`. | VERIFIED IN REPO | `blok/runtime.py:93-104`, especially `blok/runtime.py:97`. |
+| `PowerReport.low()` returns true if watts are missing. | VERIFIED IN REPO | `blok/runtime.py:53-59`. |
+| `PlanReport.predicted()` returns true if `predicted_tokens_per_second` is not `None`; `predicted_tps: 0` therefore passes. | VERIFIED IN REPO | `blok/runtime.py:61-68`, `blok/runtime.py:103-104`, `src/kimi_exec.cu:798`. |
+| The model-load path is not product-quality because readiness is distributed across runtime checks, scripts, docs, env vars, and artifacts. | VERIFIED IN REPO | Python checks config/shards/manifest/Rust binary only: `blok/runtime.py:89-92`, `blok/runtime.py:200-205`; CUDA executor checks `BLOK_UGDS_DEVICE` and `BLOK_UGDS_MAP` only when compiled with uGDS: `src/kimi_exec.cu:48-63`; hardware script checks target environment separately: `scripts/check_hardware.sh:6-20`. |
+| `BLOK_UGDS_DEVICE` and `BLOK_UGDS_MAP` are required when the executor is compiled with uGDS. | VERIFIED IN REPO | `src/kimi_exec.cu:44-72`, especially `src/kimi_exec.cu:49-50`; documented at `docs/kimi-forward-ugds-status.md:55-57`. |
+| `BLOK_UGDS_MAP` is not generated by the repo. | VERIFIED IN REPO | No map artifact found; `docs/kimi-forward-ugds-status.md:91` states it directly; `docs/kimi-forward-ugds-status.md:120-126` describes manual map requirements. |
+| `scripts/model_fetch.py` materializes `manifest.blok`, `runtime-index.blok`, and `tokenizer.blok`. | VERIFIED IN REPO | `scripts/model_fetch.py:112-138`, especially `scripts/model_fetch.py:122-127` and `scripts/model_fetch.py:135-137`. |
+| A mechanical full pass and a numerically correct model full pass are different definitions. | VERIFIED IN REPO | Repo capability matrix distinguishes wired/unverified decode from unverified tokenizer/MLA/INT4 paths at `README.md:28-39`; specs require parity artifacts at `docs/specs/kimi_k2_forward.yaml:168-202`. |
+| The `"paris"` assertion is useful but insufficient as a correctness test. | EXTERNAL CLAIM SUPPORTED | Repo normalizes output text at `blok/runtime.py:230-234`, and no raw token-id or first-token-logit parity tests exist. Standard validation practice for model/runtime correctness requires token/logit or numerical parity evidence, not a single normalized answer. |
+| Inference latency/TPS/power claims require measured evidence. | EXTERNAL CLAIM SUPPORTED | MLPerf Inference and MLPerf Tiny papers support reproducible measurement of latency/throughput and energy/power-related metrics; repo currently emits placeholder `predicted_tps` and `watts` at `src/kimi_exec.cu:798`. |
+
+### Contradictions Found
+
+No material claim in this Markdown was directly contradicted by the current repository.
+
+Two caveats should be addressed in the next edit:
+
+1. The CMake failure wording should mention the exact current observation: `cmake --build build` prints `permission denied`, while `build/CMakeCache.txt` confirms the configured Ninja build tool is missing.
+2. There is a repo-internal model naming/spec inconsistency outside this Markdown: `scripts/model_fetch.py:5`, `README.md:3`, and this document target `moonshotai/Kimi-K2.6`, but `docs/specs/kimi_k2_forward.yaml:2` says `moonshotai/Kimi-K2-Thinking`. The spec should be reconciled before treating it as authoritative source material for Kimi K2.6.
