@@ -5,7 +5,7 @@ from pathlib import Path
 MODELS = {"kimi-k2.6": ("moonshotai/Kimi-K2.6", "7eb5002f6aadc958aed6a9177b7ed26bb94011bb", 595421860056, 64)}
 ATTN = ("q_proj", "k_proj", "v_proj", "o_proj", "q_a_proj", "q_b_proj", "kv_a_proj", "kv_b_proj")
 UP, DOWN = ("up_proj", "gate_proj", "w1", "w3"), ("down_proj", "w2")
-DTYPE = {"BF16": "bf16", "F16": "f16", "F32": "f32", "I8": "i8", "U8": "u8"}
+DTYPE = {"BF16": "bf16", "F16": "f16", "F32": "f32", "I32": "i32", "I8": "i8", "U8": "u8"}
 
 def die(msg=None):
     if msg: print(msg, file=sys.stderr)

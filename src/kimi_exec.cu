@@ -95,6 +95,7 @@ struct DeviceTensor {
   ~DeviceTensor() { if (base) cudaFree(base); }
   __nv_bfloat16 *bf16() const { return reinterpret_cast<__nv_bfloat16 *>(static_cast<char *>(base) + skip); }
   float *f32() const { return reinterpret_cast<float *>(static_cast<char *>(base) + skip); }
+  std::uint32_t *u32() const { return reinterpret_cast<std::uint32_t *>(static_cast<char *>(base) + skip); }
 };
 
 struct Buf {
@@ -114,6 +115,7 @@ struct Buf {
 constexpr int LAYERS = 61, FIRST_DENSE = 1;
 constexpr int HIDDEN = 7168, HEADS = 64, QK_NOPE = 128, QK_ROPE = 64, V_HEAD = 128;
 constexpr int Q_RANK = 1536, KV_RANK = 512, KV_A = 576, EXPERTS = 384, TOPK = 8, MOE = 2048, VOCAB = 163840;
+constexpr int I4_GROUP = 32, I4_PER_WORD = 8;
 constexpr float RMS_EPS = 1.0e-5f, ROPE_THETA = 50000.0f, ROUTED_SCALE = 2.827f;
 constexpr std::uint32_t EOS_IM_END = 163586;
 
@@ -153,6 +155,56 @@ __global__ void matvec_bf16_k(const __nv_bfloat16 *w, const float *x, float *y, 
   int r = blockIdx.x;
   float v = 0;
   for (int c = threadIdx.x; c < cols; c += blockDim.x) v += bf(w + (unsigned long long)r * cols + c) * x[c];
+  s[threadIdx.x] = v;
+  __syncthreads();
+  for (int d = 128; d; d >>= 1) {
+    if (threadIdx.x < d) s[threadIdx.x] += s[threadIdx.x + d];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0 && r < rows) y[r] = s[0];
+}
+
+__global__ void matvec_i4_bf16_scale_k(const std::uint32_t *w, const __nv_bfloat16 *scale, const float *x, float *y, int rows, int cols) {
+  __shared__ float s[256];
+  int r = blockIdx.x;
+  float v = 0;
+  int groups = cols / I4_GROUP, packed_cols = cols / I4_PER_WORD;
+  for (int g = threadIdx.x; g < groups; g += blockDim.x) {
+    float sc = bf(scale + (unsigned long long)r * groups + g);
+    int base = g * I4_GROUP;
+    for (int p = 0; p < I4_GROUP / I4_PER_WORD; ++p) {
+      std::uint32_t word = w[(unsigned long long)r * packed_cols + g * (I4_GROUP / I4_PER_WORD) + p];
+      for (int lane = 0; lane < I4_PER_WORD; ++lane) {
+        int q = (int)((word >> (4 * lane)) & 0xf) - 8;
+        v += x[base + p * I4_PER_WORD + lane] * ((float)q * sc);
+      }
+    }
+  }
+  s[threadIdx.x] = v;
+  __syncthreads();
+  for (int d = 128; d; d >>= 1) {
+    if (threadIdx.x < d) s[threadIdx.x] += s[threadIdx.x + d];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0 && r < rows) y[r] = s[0];
+}
+
+__global__ void matvec_i4_f32_scale_k(const std::uint32_t *w, const float *scale, const float *x, float *y, int rows, int cols) {
+  __shared__ float s[256];
+  int r = blockIdx.x;
+  float v = 0;
+  int groups = cols / I4_GROUP, packed_cols = cols / I4_PER_WORD;
+  for (int g = threadIdx.x; g < groups; g += blockDim.x) {
+    float sc = scale[(unsigned long long)r * groups + g];
+    int base = g * I4_GROUP;
+    for (int p = 0; p < I4_GROUP / I4_PER_WORD; ++p) {
+      std::uint32_t word = w[(unsigned long long)r * packed_cols + g * (I4_GROUP / I4_PER_WORD) + p];
+      for (int lane = 0; lane < I4_PER_WORD; ++lane) {
+        int q = (int)((word >> (4 * lane)) & 0xf) - 8;
+        v += x[base + p * I4_PER_WORD + lane] * ((float)q * sc);
+      }
+    }
+  }
   s[threadIdx.x] = v;
   __syncthreads();
   for (int d = 128; d; d >>= 1) {
@@ -236,11 +288,11 @@ __global__ void sigmoid_k(float *x, int n) {
   if (i < n) x[i] = 1.0f / (1.0f + expf(-x[i]));
 }
 
-__global__ void router_topk_k(const float *score, std::uint16_t *expert, float *weight) {
+__global__ void router_topk_k(const float *score, const float *select_score, std::uint16_t *expert, float *weight) {
   __shared__ float s[384];
   int tid = threadIdx.x;
   if (tid >= EXPERTS) return;
-  s[tid] = score[tid];
+  s[tid] = select_score[tid];
   __syncthreads();
   if (tid) return;
   float sum = 0;
@@ -248,7 +300,7 @@ __global__ void router_topk_k(const float *score, std::uint16_t *expert, float *
     int id = 0;
     float best = -1;
     for (int i = 0; i < EXPERTS; ++i) if (s[i] > best) best = s[i], id = i;
-    expert[k] = (std::uint16_t)id; weight[k] = best; sum += best; s[id] = -1;
+    expert[k] = (std::uint16_t)id; weight[k] = score[id]; sum += score[id]; s[id] = -1;
   }
   for (int k = 0; k < TOPK; ++k) weight[k] = weight[k] / sum * ROUTED_SCALE;
 }
@@ -324,7 +376,7 @@ int shape_dim(const Tensor &t, int dim) {
 int max_mlp_width(const std::vector<Tensor> &ts) {
   int width = MOE;
   for (const auto &t : ts)
-    if (t.slot.find("gate_proj") != std::string::npos || t.slot.find("up_proj") != std::string::npos)
+    if ((t.slot.find("gate_proj") != std::string::npos || t.slot.find("up_proj") != std::string::npos) && t.name.ends_with(".weight"))
       width = std::max(width, shape_dim(t, 0));
   return width;
 }
@@ -468,7 +520,9 @@ const Tensor &need(const std::vector<Tensor> &ts, const std::string &part) {
 
 const Tensor &need(const std::vector<Tensor> &ts, int layer, const std::string &slot, int expert = -1) {
   for (const auto &t : ts)
-    if (t.layer == layer && t.slot.find(slot) != std::string::npos && (expert < 0 ? t.expert < 0 : t.expert == expert)) return t;
+    if (t.layer == layer && t.slot.find(slot) != std::string::npos && t.name.ends_with(".weight") &&
+        (expert < 0 ? t.expert < 0 : t.expert == expert))
+      return t;
   die("missing layer tensor: " + std::to_string(layer) + " " + slot);
 }
 
@@ -484,8 +538,29 @@ const Tensor &need_role(const std::vector<Tensor> &ts, int layer, const std::str
   die("missing layer tensor: " + std::to_string(layer) + " " + role + " " + slot);
 }
 
+const Tensor &need_routed_weight(const std::vector<Tensor> &ts, int layer, const std::string &proj, int expert) {
+  std::string suffix = ".mlp.experts." + std::to_string(expert) + "." + proj + ".weight";
+  for (const auto &t : ts)
+    if (t.layer == layer && t.role == "routed_expert" && t.expert == expert && t.name.ends_with(suffix)) return t;
+  die("missing routed expert weight: " + std::to_string(layer) + " " + proj + " expert " + std::to_string(expert));
+}
+
+const Tensor &need_routed_scale(const std::vector<Tensor> &ts, int layer, const std::string &proj, int expert) {
+  std::string suffix = ".mlp.experts." + std::to_string(expert) + "." + proj + ".weight_scale";
+  for (const auto &t : ts)
+    if (t.layer == layer && t.role == "routed_expert" && t.expert == expert && t.name.ends_with(suffix)) return t;
+  die("missing routed expert scale: " + std::to_string(layer) + " " + proj + " expert " + std::to_string(expert));
+}
+
+void validate_i4_pair(const Tensor &w, const Tensor &scale, int rows, int cols) {
+  if (w.dtype != "i32") die("routed expert weight must be packed i32: " + w.name);
+  if (scale.dtype != "bf16" && scale.dtype != "f32") die("routed expert scale must be bf16 or f32: " + scale.name);
+  if (shape_dim(w, 0) != rows || shape_dim(w, 1) != cols / I4_PER_WORD) die("bad routed expert packed shape: " + w.name);
+  if (shape_dim(scale, 0) != rows || shape_dim(scale, 1) != cols / I4_GROUP) die("bad routed expert scale shape: " + scale.name);
+}
+
 DeviceTensor load_tensor(Io &io, const Tensor &t) {
-  if (t.dtype != "bf16" && t.dtype != "f32") die("only bf16 and f32 tensors are executable");
+  if (t.dtype != "bf16" && t.dtype != "f32" && t.dtype != "i32") die("only bf16, f32, and i32 tensors are executable");
   if (t.data < t.off || t.data + t.data_bytes > t.off + t.bytes) die("tensor data range escapes aligned read");
   DeviceTensor d;
   d.bytes = t.bytes;
@@ -507,6 +582,12 @@ DeviceTensor load_tensor(Io &io, const Tensor &t) {
   free(host);
 #endif
   return d;
+}
+
+void matvec_i4(const Tensor &wmeta, const Tensor &smeta, const DeviceTensor &w, const DeviceTensor &scale, const float *x, float *y, int rows, int cols) {
+  validate_i4_pair(wmeta, smeta, rows, cols);
+  if (scale.dtype == "f32") matvec_i4_f32_scale_k<<<rows, 256>>>(w.u32(), scale.f32(), x, y, rows, cols);
+  else matvec_i4_bf16_scale_k<<<rows, 256>>>(w.u32(), scale.bf16(), x, y, rows, cols);
 }
 
 void validate_forward_contract(const RuntimeIndex &rt) {
@@ -536,6 +617,12 @@ void validate_forward_contract(const RuntimeIndex &rt) {
     need_role(ts, i, "shared_expert_resident", "gate_proj");
     need_role(ts, i, "shared_expert_resident", "up_proj");
     need_role(ts, i, "shared_expert_resident", "down_proj");
+    need_routed_weight(ts, i, "gate_proj", 0);
+    need_routed_scale(ts, i, "gate_proj", 0);
+    need_routed_weight(ts, i, "up_proj", 0);
+    need_routed_scale(ts, i, "up_proj", 0);
+    need_routed_weight(ts, i, "down_proj", 0);
+    need_routed_scale(ts, i, "down_proj", 0);
   }
   if (count(ts, "attention_resident") == 0) die("missing attention tensors");
   if (count(ts, "router") == 0) die("missing router tensors");
@@ -583,11 +670,12 @@ std::string generate(Io &io, const RuntimeIndex &rt, const Args &a) {
   ck(cudaMalloc(&dtok, sizeof(std::uint32_t)), "cudaMalloc token");
   ck(cudaMalloc(&did, sizeof(std::uint32_t)), "cudaMalloc sample");
   ck(cudaMalloc(&dex, TOPK * sizeof(std::uint16_t)), "cudaMalloc experts");
-  Buf x, n, qa, q, kva, kv, k, v, av, score, router, ew, gate, up, mid, down, logits;
+  Buf x, n, qa, q, kva, kv, k, v, av, score, router, route_select, ew, gate, up, mid, down, logits;
   x.make(HIDDEN); n.make(HIDDEN); qa.make(Q_RANK); q.make(HEADS * (QK_NOPE + QK_ROPE));
   kva.make(KV_A); kv.make(HEADS * (QK_NOPE + V_HEAD)); k.make(HEADS * (QK_NOPE + QK_ROPE));
   v.make(HEADS * V_HEAD); av.make(HEADS * V_HEAD); score.make(input.size() + a.tokens + 1);
-  router.make(EXPERTS); ew.make(TOPK); gate.make(mlp_width); up.make(mlp_width); mid.make(mlp_width); down.make(HIDDEN); logits.make(VOCAB);
+  router.make(EXPERTS); route_select.make(EXPERTS); ew.make(TOPK);
+  gate.make(mlp_width); up.make(mlp_width); mid.make(mlp_width); down.make(HIDDEN); logits.make(VOCAB);
   std::vector<Buf> kc(LAYERS), vc(LAYERS);
   for (int l = 0; l < LAYERS; ++l) {
     kc[l].make((input.size() + a.tokens + 1) * HEADS * (QK_NOPE + QK_ROPE));
@@ -640,20 +728,29 @@ std::string generate(Io &io, const RuntimeIndex &rt, const Args &a) {
         auto rb = load_tensor(io, need_role(rt.tensors, l, "router", "e_score_correction_bias"));
         matvec_bf16_k<<<EXPERTS, 256>>>(rw.bf16(), n.p, router.p, EXPERTS, HIDDEN);
         sigmoid_k<<<(EXPERTS + 255) / 256, 256>>>(router.p, EXPERTS);
-        if (rb.dtype == "f32") add_f32_k<<<(EXPERTS + 255) / 256, 256>>>(router.p, rb.f32(), EXPERTS);
-        else add_bf16_k<<<(EXPERTS + 255) / 256, 256>>>(router.p, rb.bf16(), EXPERTS);
-        router_topk_k<<<1, EXPERTS>>>(router.p, dex, ew.p);
+        ck(cudaMemcpy(route_select.p, router.p, EXPERTS * sizeof(float), cudaMemcpyDeviceToDevice), "cudaMemcpy router scores");
+        if (rb.dtype == "f32") add_f32_k<<<(EXPERTS + 255) / 256, 256>>>(route_select.p, rb.f32(), EXPERTS);
+        else add_bf16_k<<<(EXPERTS + 255) / 256, 256>>>(route_select.p, rb.bf16(), EXPERTS);
+        router_topk_k<<<1, EXPERTS>>>(router.p, route_select.p, dex, ew.p);
         std::uint16_t ex[TOPK];
         ck(cudaMemcpy(ex, dex, sizeof(ex), cudaMemcpyDeviceToHost), "cudaMemcpy experts");
         for (int i = 0; i < TOPK; ++i) {
-          auto gw = load_tensor(io, need(rt.tensors, l, "gate_proj", ex[i]));
-          auto uw = load_tensor(io, need(rt.tensors, l, "up_proj", ex[i]));
-          auto dw = load_tensor(io, need(rt.tensors, l, "down_proj", ex[i]));
-          int ffn = shape_dim(need(rt.tensors, l, "gate_proj", ex[i]), 0);
-          matvec_bf16_k<<<ffn, 256>>>(gw.bf16(), n.p, gate.p, ffn, HIDDEN);
-          matvec_bf16_k<<<ffn, 256>>>(uw.bf16(), n.p, up.p, ffn, HIDDEN);
-          silu_mul_k<<<(ffn + 255) / 256, 256>>>(gate.p, up.p, mid.p, ffn);
-          matvec_bf16_k<<<HIDDEN, 256>>>(dw.bf16(), mid.p, av.p, HIDDEN, ffn);
+          const Tensor &gwm = need_routed_weight(rt.tensors, l, "gate_proj", ex[i]);
+          const Tensor &gsm = need_routed_scale(rt.tensors, l, "gate_proj", ex[i]);
+          const Tensor &uwm = need_routed_weight(rt.tensors, l, "up_proj", ex[i]);
+          const Tensor &usm = need_routed_scale(rt.tensors, l, "up_proj", ex[i]);
+          const Tensor &dwm = need_routed_weight(rt.tensors, l, "down_proj", ex[i]);
+          const Tensor &dsm = need_routed_scale(rt.tensors, l, "down_proj", ex[i]);
+          auto gw = load_tensor(io, gwm);
+          auto gs = load_tensor(io, gsm);
+          auto uw = load_tensor(io, uwm);
+          auto us = load_tensor(io, usm);
+          auto dw = load_tensor(io, dwm);
+          auto ds = load_tensor(io, dsm);
+          matvec_i4(gwm, gsm, gw, gs, n.p, gate.p, MOE, HIDDEN);
+          matvec_i4(uwm, usm, uw, us, n.p, up.p, MOE, HIDDEN);
+          silu_mul_k<<<(MOE + 255) / 256, 256>>>(gate.p, up.p, mid.p, MOE);
+          matvec_i4(dwm, dsm, dw, ds, mid.p, av.p, HIDDEN, MOE);
           expert_accum_k<<<(HIDDEN + 255) / 256, 256>>>(av.p, ew.p, i, down.p, HIDDEN);
         }
         auto sgw = load_tensor(io, need_role(rt.tensors, l, "shared_expert_resident", "gate_proj"));

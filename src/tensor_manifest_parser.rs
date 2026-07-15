@@ -24,6 +24,7 @@ pub enum DType {
     Bf16,
     F16,
     F32,
+    I32,
     I8,
     U8,
 }
@@ -178,6 +179,7 @@ fn parse_dtype(value: &str) -> Result<DType> {
         "bf16" => Ok(DType::Bf16),
         "f16" => Ok(DType::F16),
         "f32" => Ok(DType::F32),
+        "i32" => Ok(DType::I32),
         "i8" => Ok(DType::I8),
         "u8" => Ok(DType::U8),
         _ => Err(Error::Manifest(format!("unknown dtype: {value}"))),

@@ -75,6 +75,12 @@ The first correctness implementation is intentionally simple: decode batch 1, gr
   - layers 1-60 use routed top-8 MoE plus shared expert contribution
 - Native executor applies router sigmoid, adds `e_score_correction_bias` before top-k, renormalizes selected weights, and applies Kimi's routed scaling factor.
 - Native executor uses Kimi config constants for RMSNorm epsilon, RoPE theta, routed scaling factor, and `<|im_end|>` EOS id.
+- Materializer and manifest parser preserve safetensors `I32` tensors for compressed routed expert weights.
+- Native executor loads routed expert `weight` plus `weight_scale` tensors and runs packed symmetric INT4 group-size-32 matvec:
+  - `gate_proj`: packed `[2048, 896]`, scale `[2048, 224]`
+  - `up_proj`: packed `[2048, 896]`, scale `[2048, 224]`
+  - `down_proj`: packed `[7168, 256]`, scale `[7168, 64]`
+- Native executor uses correction bias only for expert selection and gathers unbiased sigmoid scores for routed mixture weights.
 
 ## Not Done
 
@@ -89,7 +95,7 @@ The first correctness implementation is intentionally simple: decode batch 1, gr
 - MLA math has not been numerically compared against a known-good Kimi forward pass.
 - Only greedy argmax sampling is implemented.
 - Only `<|im_end|>` EOS handling is implemented; full stop-token/chat-template handling is not implemented.
-- Routed expert int4/compressed-tensors execution is not implemented; current CUDA matvec path executes bf16/f32 tensors only.
+- Routed expert INT4 execution has not been target-compiled or numerically validated against the real checkpoint.
 - No power reporting is implemented.
 - `predicted_tps` is currently `0`.
 
@@ -140,7 +146,6 @@ The first correctness implementation is intentionally simple: decode batch 1, gr
 7. Add missing model behavior:
    - Full stop-token handling beyond `<|im_end|>`.
    - Correct tokenizer special-token handling.
-   - Routed expert int4/compressed-tensors decode path, unless the target model is materialized as bf16.
    - Optional non-greedy sampling after greedy works.
 
 8. Validate numerics:
@@ -160,6 +165,6 @@ Do this on the target Linux/CUDA/uGDS box:
 2. Generate `BLOK_UGDS_MAP`.
 3. Run one-token generation.
 4. Patch exact tensor-name/shape issues from real errors.
-5. Add routed expert int4/compressed-tensors execution if the target weights are not materialized as bf16.
+5. Validate routed expert INT4 dequantized matvec against the real checkpoint.
 6. Validate tokenizer and one-token logits.
 7. Run `end_goal_prompt.py`.
