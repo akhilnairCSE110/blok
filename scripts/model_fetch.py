@@ -83,6 +83,14 @@ def role(name):
     if any(x in name for x in UP + DOWN): return "dense_ffn_rowcol"
     return "resident"
 
+def runtime_slot(name):
+    m = re.search(r"\.layers\.(\d+)\.", name)
+    layer = int(m.group(1)) if m else -1
+    m = re.search(r"\.experts?\.(\d+)\.", name)
+    expert = int(m.group(1)) if m else -1
+    leaf = name.rsplit(".", 1)[0].rsplit(".", 1)[-1] if name.endswith(".weight") else name.rsplit(".", 1)[-1]
+    return layer, expert, leaf
+
 def tensors(c):
     out = []
     for path in sorted(c["local_dir"].glob("*.safetensors")):
@@ -106,12 +114,18 @@ def materialize(c):
     if not s["complete"]: raise SystemExit(f"incomplete download: {s['safetensors']}/{s['expected_safetensors']} shards")
     c["meta_dir"].mkdir(parents=True, exist_ok=True)
     lines = ["blok-manifest-v1", "architecture=hybrid", "layout=sidecar"]
+    runtime = ["blok-runtime-index-v1"]
+    tok = c["local_dir"] / "tokenizer.json"
+    if tok.is_file(): runtime.append(f"tokenizer {tok}")
     index, alignment = [], 4096
     for name, r, dtype, shape, file, start, size in tensors(c):
         off, end = align_down(start, alignment), align(start + size, alignment)
         lines.append(f"tensor {name} {r} {dtype} {shape} {off} {end - off} {alignment} {file}")
+        layer, expert, slot = runtime_slot(name)
+        runtime.append(f"tensor {name} {r} {layer} {expert} {slot} {dtype} {shape} {off} {end - off} {alignment} {file}")
         index.append({"name": name, "role": r, "dtype": dtype, "shape": shape, "file": file, "offset": off, "bytes": end - off})
     (c["meta_dir"] / "manifest.blok").write_text("\n".join(lines) + "\n")
+    (c["meta_dir"] / "runtime-index.blok").write_text("\n".join(runtime) + "\n")
     (c["meta_dir"] / "layout-index.json").write_text(js({"schema": "blok.layout.v1", "layout": "sidecar", "tensors": index}) + "\n")
     return {"model": c["model"], "layout": "sidecar", "tensors": len(index), "manifest": str(c["meta_dir"] / "manifest.blok")}
 
