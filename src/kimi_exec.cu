@@ -13,15 +13,19 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #ifdef BLOK_HAVE_UGDS
 #include <ugds.h>
 #endif
 
+void ck(cudaError_t e, const char *m);
+[[noreturn]] void die(const std::string &m);
+
 struct Tensor {
   std::string name, role, slot, dtype, shape, file;
-  std::uint64_t off = 0, bytes = 0, align = 4096;
+  std::uint64_t off = 0, bytes = 0, align = 4096, data = 0, data_bytes = 0;
   int layer = -1, expert = -1;
 };
 
@@ -31,12 +35,82 @@ struct Args {
 };
 
 struct RuntimeIndex {
-  std::string tokenizer;
+  std::string tokenizer, tokenizer_blok;
   std::vector<Tensor> tensors;
 };
 
+struct Io {
+  std::unordered_map<std::string, std::uint64_t> base;
+#ifdef BLOK_HAVE_UGDS
+  int fd = -1;
+  uGDSHandle_t fh = nullptr;
+  Io() {
+    const char *dev = std::getenv("BLOK_UGDS_DEVICE"), *map = std::getenv("BLOK_UGDS_MAP");
+    if (!dev || !map) die("BLOK_UGDS_DEVICE and BLOK_UGDS_MAP are required");
+    ug(uGDSDriverOpen(), "uGDSDriverOpen");
+    fd = open(dev, O_RDWR);
+    if (fd < 0) die(std::string("open uGDS device failed: ") + std::strerror(errno));
+    uGDSDescr_t d = {};
+    d.type = UGDS_HANDLE_TYPE_OPAQUE_FD;
+    d.handle.fd = fd;
+    ug(uGDSHandleRegister(&fh, &d), "uGDSHandleRegister");
+    std::ifstream in(map);
+    if (!in) die("open BLOK_UGDS_MAP failed");
+    std::string file;
+    std::uint64_t off;
+    while (in >> file >> off) base[file] = off;
+  }
+  ~Io() {
+    if (fh) uGDSHandleDeregister(fh);
+    if (fd >= 0) close(fd);
+    uGDSDriverClose();
+  }
+  static void ug(uGDSError_t e, const char *m) {
+    if (e.err != UGDS_SUCCESS) die(std::string(m) + ": " + uGDS_status_error(e.err));
+  }
+#endif
+};
+
+struct Tokenizer {
+  std::unordered_map<std::string, std::uint32_t> ids;
+  std::unordered_map<std::string, int> merges;
+  std::unordered_map<std::uint32_t, std::string> text;
+};
+
+struct DeviceTensor {
+  void *base = nullptr;
+  std::uint64_t bytes = 0, skip = 0;
+  DeviceTensor() = default;
+  DeviceTensor(const DeviceTensor &) = delete;
+  DeviceTensor &operator=(const DeviceTensor &) = delete;
+  DeviceTensor(DeviceTensor &&o) noexcept : base(o.base), bytes(o.bytes), skip(o.skip) { o.base = nullptr; }
+  DeviceTensor &operator=(DeviceTensor &&o) noexcept {
+    if (this != &o) {
+      if (base) cudaFree(base);
+      base = o.base; bytes = o.bytes; skip = o.skip; o.base = nullptr;
+    }
+    return *this;
+  }
+  ~DeviceTensor() { if (base) cudaFree(base); }
+  __nv_bfloat16 *bf16() const { return reinterpret_cast<__nv_bfloat16 *>(static_cast<char *>(base) + skip); }
+};
+
+struct Buf {
+  float *p = nullptr;
+  Buf() = default;
+  Buf(const Buf &) = delete;
+  Buf &operator=(const Buf &) = delete;
+  Buf(Buf &&o) noexcept : p(o.p) { o.p = nullptr; }
+  Buf &operator=(Buf &&o) noexcept {
+    if (this != &o) { if (p) cudaFree(p); p = o.p; o.p = nullptr; }
+    return *this;
+  }
+  ~Buf() { if (p) cudaFree(p); }
+  void make(std::uint64_t n) { ck(cudaMalloc(&p, n * sizeof(float)), "cudaMalloc buf"); }
+};
+
 constexpr int HIDDEN = 7168, HEADS = 64, QK_NOPE = 128, QK_ROPE = 64, V_HEAD = 128;
-constexpr int Q_RANK = 1536, KV_RANK = 512, EXPERTS = 384, TOPK = 8, MOE = 2048, VOCAB = 163840;
+constexpr int Q_RANK = 1536, KV_RANK = 512, KV_A = 576, EXPERTS = 384, TOPK = 8, MOE = 2048, VOCAB = 163840;
 
 __device__ float bf(const __nv_bfloat16 *p) { return __bfloat162float(*p); }
 
@@ -48,11 +122,6 @@ __global__ void embed_k(const __nv_bfloat16 *e, const std::uint32_t *tok, float 
 __global__ void add_k(float *a, const float *b, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) a[i] += b[i];
-}
-
-__global__ void scale_add_k(float *a, const float *b, float s, int n) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) a[i] += b[i] * s;
 }
 
 __global__ void silu_mul_k(const float *a, const float *b, float *y, int n) {
@@ -105,6 +174,11 @@ __global__ void kv_store_k(const float *k, const float *v, float *kc, float *vc,
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < kd) kc[(unsigned long long)pos * kd + i] = k[i];
   if (i < vd) vc[(unsigned long long)pos * vd + i] = v[i];
+}
+
+__global__ void k_rope_fill_k(float *k, const float *rope) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < HEADS * QK_ROPE) k[(i / QK_ROPE) * (QK_NOPE + QK_ROPE) + QK_NOPE + i % QK_ROPE] = rope[i % QK_ROPE];
 }
 
 __global__ void attn_score_k(const float *q, const float *kc, float *score, int seq, int dim) {
@@ -214,6 +288,12 @@ int i32(const std::string &s, const char *n) {
   return static_cast<int>(v);
 }
 
+std::string hex(const std::string &s) {
+  std::string o;
+  for (std::size_t i = 0; i + 1 < s.size(); i += 2) o.push_back((char)std::strtoul(s.substr(i, 2).c_str(), nullptr, 16));
+  return o;
+}
+
 Args args(int argc, char **argv) {
   Args a;
   for (int i = 1; i < argc; i += 2) {
@@ -229,6 +309,58 @@ Args args(int argc, char **argv) {
   return a;
 }
 
+Tokenizer tokenizer(const std::string &path) {
+  std::ifstream in(path);
+  if (!in) die("open tokenizer.blok failed: " + path);
+  Tokenizer t;
+  std::string tag, a, b, c;
+  in >> tag;
+  if (tag != "blok-tokenizer-v1") die("bad tokenizer.blok");
+  while (in >> tag >> a >> b) {
+    if (tag == "tok") {
+      auto s = hex(b);
+      auto id = (std::uint32_t)std::stoul(a);
+      t.ids[s] = id; t.text[id] = s;
+    } else if (tag == "merge" && in >> c) {
+      t.merges[hex(b) + hex(c)] = std::stoi(a);
+    }
+  }
+  if (t.ids.empty()) die("empty tokenizer");
+  return t;
+}
+
+std::vector<std::uint32_t> encode(const Tokenizer &t, const std::string &s) {
+  std::vector<std::string> pieces;
+  for (unsigned char c : s) pieces.emplace_back(1, (char)c);
+  for (;;) {
+    int at = -1, rank = 1 << 30;
+    for (int i = 0; i + 1 < (int)pieces.size(); ++i) {
+      auto m = t.merges.find(pieces[i] + pieces[i + 1]);
+      if (m != t.merges.end() && m->second < rank) rank = m->second, at = i;
+    }
+    if (at < 0) break;
+    pieces[at] += pieces[at + 1];
+    pieces.erase(pieces.begin() + at + 1);
+  }
+  std::vector<std::uint32_t> out;
+  for (auto &p : pieces) {
+    auto it = t.ids.find(p);
+    if (it == t.ids.end()) die("prompt contains token missing from tokenizer vocab");
+    out.push_back(it->second);
+  }
+  return out;
+}
+
+std::string decode(const Tokenizer &t, const std::vector<std::uint32_t> &ids) {
+  std::string out;
+  for (auto id : ids) {
+    auto it = t.text.find(id);
+    if (it == t.text.end()) die("sampled token missing from tokenizer vocab");
+    out += it->second;
+  }
+  return out;
+}
+
 RuntimeIndex runtime_index(const std::string &manifest) {
   std::filesystem::path path = std::filesystem::path(manifest).parent_path() / "runtime-index.blok";
   std::ifstream in(path);
@@ -240,17 +372,23 @@ RuntimeIndex runtime_index(const std::string &manifest) {
       out.tokenizer = line.substr(10);
       continue;
     }
+    if (line.starts_with("tokenizer_blok ")) {
+      out.tokenizer_blok = line.substr(15);
+      continue;
+    }
     if (!line.starts_with("tensor ")) continue;
     std::istringstream ss(line);
     std::string tag, layer, expert;
     Tensor t;
-    ss >> tag >> t.name >> t.role >> layer >> expert >> t.slot >> t.dtype >> t.shape >> t.off >> t.bytes >> t.align >> t.file;
+    ss >> tag >> t.name >> t.role >> layer >> expert >> t.slot >> t.dtype >> t.shape >> t.off >>
+        t.bytes >> t.align >> t.data >> t.data_bytes >> t.file;
     t.layer = i32(layer, "layer");
     t.expert = i32(expert, "expert");
     if (!t.file.empty()) out.tensors.push_back(t);
   }
   if (out.tensors.empty()) die("runtime index has no file-backed tensors");
   if (out.tokenizer.empty() || !std::filesystem::is_regular_file(out.tokenizer)) die("tokenizer.json missing from runtime index");
+  if (out.tokenizer_blok.empty() || !std::filesystem::is_regular_file(out.tokenizer_blok)) die("tokenizer.blok missing from runtime index");
   return out;
 }
 
@@ -282,24 +420,51 @@ std::uint64_t count(const std::vector<Tensor> &ts, const std::string &role) {
 
 bool has_layer_slot(const std::vector<Tensor> &ts, int layer, const std::string &slot) {
   for (const auto &t : ts)
-    if (t.layer == layer && t.slot == slot) return true;
+    if (t.layer == layer && t.slot.find(slot) != std::string::npos) return true;
   return false;
 }
 
-void stage_tensor(const Tensor &t) {
-  void *host = nullptr, *dev = nullptr;
+const Tensor &need(const std::vector<Tensor> &ts, const std::string &part) {
+  auto *t = find(ts, "resident", part);
+  if (!t) die("missing tensor: " + part);
+  return *t;
+}
+
+const Tensor &need(const std::vector<Tensor> &ts, int layer, const std::string &slot, int expert = -1) {
+  for (const auto &t : ts)
+    if (t.layer == layer && t.slot.find(slot) != std::string::npos && (expert < 0 ? t.expert < 0 : t.expert == expert)) return t;
+  die("missing layer tensor: " + std::to_string(layer) + " " + slot);
+}
+
+DeviceTensor load_tensor(Io &io, const Tensor &t) {
+  if (t.dtype != "bf16") die("only bf16 tensors are executable");
+  if (t.data < t.off || t.data + t.data_bytes > t.off + t.bytes) die("tensor data range escapes aligned read");
+  DeviceTensor d;
+  d.bytes = t.bytes;
+  d.skip = t.data - t.off;
+  ck(cudaMalloc(&d.base, t.bytes), "cudaMalloc tensor");
+#ifdef BLOK_HAVE_UGDS
+  auto it = io.base.find(t.file);
+  if (it == io.base.end()) die("missing uGDS map entry: " + t.file);
+  Io::ug(uGDSBufRegister(d.base, t.bytes, 0), "uGDSBufRegister");
+  ssize_t n = uGDSRead(io.fh, d.base, t.bytes, (off_t)(it->second + t.off), 0);
+  Io::ug(uGDSBufDeregister(d.base), "uGDSBufDeregister");
+  if (n != (ssize_t)t.bytes) die("short uGDS read");
+#else
+  (void)io;
+  void *host = nullptr;
   if (posix_memalign(&host, t.align, t.bytes)) die("posix_memalign failed");
   read_direct(t, host);
-  ck(cudaMalloc(&dev, t.bytes), "cudaMalloc");
-  ck(cudaMemcpy(dev, host, t.bytes, cudaMemcpyHostToDevice), "cudaMemcpy");
-  ck(cudaFree(dev), "cudaFree");
+  ck(cudaMemcpy(d.base, host, t.bytes, cudaMemcpyHostToDevice), "cudaMemcpy tensor");
   free(host);
+#endif
+  return d;
 }
 
 void validate_forward_contract(const RuntimeIndex &rt) {
   const auto &ts = rt.tensors;
   bool attn[61] = {}, router[61] = {};
-  const char *attn_slots[] = {"q_a_proj", "q_b_proj", "kv_a_proj", "kv_b_proj", "o_proj"};
+  const char *attn_slots[] = {"q_a_proj", "q_a_layernorm", "q_b_proj", "kv_a_proj", "kv_a_layernorm", "kv_b_proj", "o_proj"};
   for (const auto &t : ts) {
     if (t.slot.empty() || t.dtype.empty() || t.shape.empty()) die("runtime index has incomplete tensor metadata");
     if (t.layer >= 61 || t.expert >= 384) die("runtime index has out-of-range Kimi coordinates");
@@ -320,70 +485,108 @@ void validate_forward_contract(const RuntimeIndex &rt) {
   if (!find(ts, "resident", "lm_head")) die("missing lm_head");
 }
 
-void decode_kernel_skeleton() {
-  float *x = nullptr, *n = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *av = nullptr, *score = nullptr;
-  float *gate = nullptr, *up = nullptr, *mid = nullptr, *down = nullptr, *logits = nullptr;
-  __nv_bfloat16 *w = nullptr;
-  std::uint32_t *tok = nullptr, *id = nullptr;
-  std::uint16_t *experts = nullptr;
-  float *ew = nullptr;
-  ck(cudaMalloc(&x, HIDDEN * sizeof(float)), "cudaMalloc x");
-  ck(cudaMalloc(&n, HIDDEN * sizeof(float)), "cudaMalloc norm");
-  ck(cudaMalloc(&q, HEADS * (QK_NOPE + QK_ROPE) * sizeof(float)), "cudaMalloc q");
-  ck(cudaMalloc(&k, HEADS * (QK_NOPE + QK_ROPE) * sizeof(float)), "cudaMalloc k");
-  ck(cudaMalloc(&v, HEADS * V_HEAD * sizeof(float)), "cudaMalloc v");
-  ck(cudaMalloc(&av, HEADS * V_HEAD * sizeof(float)), "cudaMalloc av");
-  ck(cudaMalloc(&score, 16 * sizeof(float)), "cudaMalloc score");
-  ck(cudaMalloc(&gate, MOE * sizeof(float)), "cudaMalloc gate");
-  ck(cudaMalloc(&up, MOE * sizeof(float)), "cudaMalloc up");
-  ck(cudaMalloc(&mid, MOE * sizeof(float)), "cudaMalloc mid");
-  ck(cudaMalloc(&down, HIDDEN * sizeof(float)), "cudaMalloc down");
-  ck(cudaMalloc(&logits, VOCAB * sizeof(float)), "cudaMalloc logits");
-  ck(cudaMalloc(&w, (unsigned long long)VOCAB * HIDDEN * sizeof(__nv_bfloat16)), "cudaMalloc weights");
-  ck(cudaMalloc(&tok, sizeof(std::uint32_t)), "cudaMalloc tok");
-  ck(cudaMalloc(&id, sizeof(std::uint32_t)), "cudaMalloc id");
-  ck(cudaMalloc(&experts, TOPK * sizeof(std::uint16_t)), "cudaMalloc experts");
-  ck(cudaMalloc(&ew, TOPK * sizeof(float)), "cudaMalloc expert weights");
-  ck(cudaMemset(w, 0, (unsigned long long)VOCAB * HIDDEN * sizeof(__nv_bfloat16)), "cudaMemset weights");
-  ck(cudaMemset(tok, 0, sizeof(std::uint32_t)), "cudaMemset tok");
-  ck(cudaMemset(x, 0, HIDDEN * sizeof(float)), "cudaMemset x");
-  embed_k<<<(HIDDEN + 255) / 256, 256>>>(w, tok, x);
-  for (int layer = 0; layer < 61; ++layer) {
-    rmsnorm_k<<<1, 256>>>(x, w, n, HIDDEN);
-    matvec_bf16_k<<<HEADS * (QK_NOPE + QK_ROPE), 256>>>(w, n, q, HEADS * (QK_NOPE + QK_ROPE), HIDDEN);
-    matvec_bf16_k<<<HEADS * (QK_NOPE + QK_ROPE), 256>>>(w, n, k, HEADS * (QK_NOPE + QK_ROPE), HIDDEN);
-    matvec_bf16_k<<<HEADS * V_HEAD, 256>>>(w, n, v, HEADS * V_HEAD, HIDDEN);
-    rope_k<<<(HEADS * QK_ROPE / 2 + 255) / 256, 256>>>(q, k, layer, HEADS, QK_NOPE + QK_ROPE, QK_ROPE);
-    kv_store_k<<<(HEADS * (QK_NOPE + QK_ROPE) + 255) / 256, 256>>>(k, v, k, v, 0, HEADS * (QK_NOPE + QK_ROPE), HEADS * V_HEAD);
-    attn_score_k<<<1, 256>>>(q, k, score, 1, HEADS * (QK_NOPE + QK_ROPE));
-    softmax_k<<<1, 256>>>(score, 1);
-    attn_value_k<<<(HEADS * V_HEAD + 255) / 256, 256>>>(score, v, av, 1, HEADS * V_HEAD);
-    matvec_bf16_k<<<HIDDEN, 256>>>(w, av, down, HIDDEN, HEADS * V_HEAD);
-    add_k<<<(HIDDEN + 255) / 256, 256>>>(x, down, HIDDEN);
-    rmsnorm_k<<<1, 256>>>(x, w, n, HIDDEN);
-    matvec_bf16_k<<<EXPERTS, 256>>>(w, n, gate, EXPERTS, HIDDEN);
-    router_topk_k<<<1, EXPERTS>>>(gate, experts, ew);
-    matvec_bf16_k<<<MOE, 256>>>(w, n, gate, MOE, HIDDEN);
-    matvec_bf16_k<<<MOE, 256>>>(w, n, up, MOE, HIDDEN);
-    silu_mul_k<<<(MOE + 255) / 256, 256>>>(gate, up, mid, MOE);
-    matvec_bf16_k<<<HIDDEN, 256>>>(w, mid, down, HIDDEN, MOE);
-    expert_accum_k<<<(HIDDEN + 255) / 256, 256>>>(down, ew, 0, x, HIDDEN);
+std::string json(const std::string &s) {
+  std::string o = "\"";
+  for (char c : s) {
+    if (c == '"' || c == '\\') o += '\\';
+    if (c == '\n') o += "\\n";
+    else o += c;
   }
-  rmsnorm_k<<<1, 256>>>(x, w, n, HIDDEN);
-  matvec_bf16_k<<<VOCAB, 256>>>(w, n, logits, VOCAB, HIDDEN);
-  argmax_k<<<1, 256>>>(logits, id, VOCAB);
-  ck(cudaGetLastError(), "decode kernel launch");
-  ck(cudaDeviceSynchronize(), "decode kernel sync");
-  for (void *p : {x, n, q, k, v, av, score, gate, up, mid, down, logits, w, tok, id, experts, ew}) ck(cudaFree(p), "cudaFree decode");
+  return o + "\"";
+}
+
+std::string generate(Io &io, const RuntimeIndex &rt, const Args &a) {
+  auto tokz = tokenizer(rt.tokenizer_blok);
+  auto input = encode(tokz, a.prompt), made = std::vector<std::uint32_t>{};
+  if (input.empty()) die("tokenizer produced no prompt tokens");
+  auto emb = load_tensor(io, need(rt.tensors, "embed_tokens"));
+  auto final_norm = load_tensor(io, need(rt.tensors, "norm.weight"));
+  auto head = load_tensor(io, need(rt.tensors, "lm_head"));
+  std::uint32_t *dtok = nullptr, *did = nullptr;
+  std::uint16_t *dex = nullptr;
+  ck(cudaMalloc(&dtok, sizeof(std::uint32_t)), "cudaMalloc token");
+  ck(cudaMalloc(&did, sizeof(std::uint32_t)), "cudaMalloc sample");
+  ck(cudaMalloc(&dex, TOPK * sizeof(std::uint16_t)), "cudaMalloc experts");
+  Buf x, n, qa, q, kva, kv, k, v, av, score, router, ew, gate, up, mid, down, logits;
+  x.make(HIDDEN); n.make(HIDDEN); qa.make(Q_RANK); q.make(HEADS * (QK_NOPE + QK_ROPE));
+  kva.make(KV_A); kv.make(HEADS * (QK_NOPE + V_HEAD)); k.make(HEADS * (QK_NOPE + QK_ROPE));
+  v.make(HEADS * V_HEAD); av.make(HEADS * V_HEAD); score.make(input.size() + a.tokens + 1);
+  router.make(EXPERTS); ew.make(TOPK); gate.make(MOE); up.make(MOE); mid.make(MOE); down.make(HIDDEN); logits.make(VOCAB);
+  std::vector<Buf> kc(61), vc(61);
+  for (int l = 0; l < 61; ++l) {
+    kc[l].make((input.size() + a.tokens + 1) * HEADS * (QK_NOPE + QK_ROPE));
+    vc[l].make((input.size() + a.tokens + 1) * HEADS * V_HEAD);
+  }
+  auto run = [&](std::uint32_t id, int pos) {
+    ck(cudaMemcpy(dtok, &id, sizeof(id), cudaMemcpyHostToDevice), "cudaMemcpy token");
+    embed_k<<<(HIDDEN + 255) / 256, 256>>>(emb.bf16(), dtok, x.p);
+    for (int l = 0; l < 61; ++l) {
+      auto ln0 = load_tensor(io, need(rt.tensors, l, "input_layernorm"));
+      auto qaw = load_tensor(io, need(rt.tensors, l, "q_a_proj"));
+      auto qaln = load_tensor(io, need(rt.tensors, l, "q_a_layernorm"));
+      auto qbw = load_tensor(io, need(rt.tensors, l, "q_b_proj"));
+      auto kvaw = load_tensor(io, need(rt.tensors, l, "kv_a_proj"));
+      auto kvaln = load_tensor(io, need(rt.tensors, l, "kv_a_layernorm"));
+      auto kvbw = load_tensor(io, need(rt.tensors, l, "kv_b_proj"));
+      auto ow = load_tensor(io, need(rt.tensors, l, "o_proj"));
+      rmsnorm_k<<<1, 256>>>(x.p, ln0.bf16(), n.p, HIDDEN);
+      matvec_bf16_k<<<Q_RANK, 256>>>(qaw.bf16(), n.p, qa.p, Q_RANK, HIDDEN);
+      rmsnorm_k<<<1, 256>>>(qa.p, qaln.bf16(), qa.p, Q_RANK);
+      matvec_bf16_k<<<HEADS * (QK_NOPE + QK_ROPE), 256>>>(qbw.bf16(), qa.p, q.p, HEADS * (QK_NOPE + QK_ROPE), Q_RANK);
+      matvec_bf16_k<<<KV_A, 256>>>(kvaw.bf16(), n.p, kva.p, KV_A, HIDDEN);
+      rmsnorm_k<<<1, 256>>>(kva.p, kvaln.bf16(), kva.p, KV_RANK);
+      matvec_bf16_k<<<HEADS * (QK_NOPE + V_HEAD), 256>>>(kvbw.bf16(), kva.p, kv.p, HEADS * (QK_NOPE + V_HEAD), KV_RANK);
+      ck(cudaMemcpy(k.p, kv.p, HEADS * QK_NOPE * sizeof(float), cudaMemcpyDeviceToDevice), "cudaMemcpy k nope");
+      k_rope_fill_k<<<(HEADS * QK_ROPE + 255) / 256, 256>>>(k.p, kva.p + KV_RANK);
+      ck(cudaMemcpy(v.p, kv.p + HEADS * QK_NOPE, HEADS * V_HEAD * sizeof(float), cudaMemcpyDeviceToDevice), "cudaMemcpy v");
+      rope_k<<<(HEADS * QK_ROPE / 2 + 255) / 256, 256>>>(q.p, k.p, pos, HEADS, QK_NOPE + QK_ROPE, QK_ROPE);
+      kv_store_k<<<(HEADS * (QK_NOPE + QK_ROPE) + 255) / 256, 256>>>(
+          k.p, v.p, kc[l].p, vc[l].p, pos, HEADS * (QK_NOPE + QK_ROPE), HEADS * V_HEAD);
+      attn_score_k<<<pos + 1, 256>>>(q.p, kc[l].p, score.p, pos + 1, HEADS * (QK_NOPE + QK_ROPE));
+      softmax_k<<<1, 256>>>(score.p, pos + 1);
+      attn_value_k<<<(HEADS * V_HEAD + 255) / 256, 256>>>(score.p, vc[l].p, av.p, pos + 1, HEADS * V_HEAD);
+      matvec_bf16_k<<<HIDDEN, 256>>>(ow.bf16(), av.p, down.p, HIDDEN, HEADS * V_HEAD);
+      add_k<<<(HIDDEN + 255) / 256, 256>>>(x.p, down.p, HIDDEN);
+      auto ln1 = load_tensor(io, need(rt.tensors, l, "post_attention_layernorm"));
+      auto rw = load_tensor(io, need(rt.tensors, l, "gate"));
+      rmsnorm_k<<<1, 256>>>(x.p, ln1.bf16(), n.p, HIDDEN);
+      matvec_bf16_k<<<EXPERTS, 256>>>(rw.bf16(), n.p, router.p, EXPERTS, HIDDEN);
+      router_topk_k<<<1, EXPERTS>>>(router.p, dex, ew.p);
+      std::uint16_t ex[TOPK];
+      ck(cudaMemcpy(ex, dex, sizeof(ex), cudaMemcpyDeviceToHost), "cudaMemcpy experts");
+      ck(cudaMemset(down.p, 0, HIDDEN * sizeof(float)), "cudaMemset ffn");
+      for (int i = 0; i < TOPK; ++i) {
+        auto gw = load_tensor(io, need(rt.tensors, l, "gate_proj", ex[i]));
+        auto uw = load_tensor(io, need(rt.tensors, l, "up_proj", ex[i]));
+        auto dw = load_tensor(io, need(rt.tensors, l, "down_proj", ex[i]));
+        matvec_bf16_k<<<MOE, 256>>>(gw.bf16(), n.p, gate.p, MOE, HIDDEN);
+        matvec_bf16_k<<<MOE, 256>>>(uw.bf16(), n.p, up.p, MOE, HIDDEN);
+        silu_mul_k<<<(MOE + 255) / 256, 256>>>(gate.p, up.p, mid.p, MOE);
+        matvec_bf16_k<<<HIDDEN, 256>>>(dw.bf16(), mid.p, av.p, HIDDEN, MOE);
+        expert_accum_k<<<(HIDDEN + 255) / 256, 256>>>(av.p, ew.p, i, down.p, HIDDEN);
+      }
+      add_k<<<(HIDDEN + 255) / 256, 256>>>(x.p, down.p, HIDDEN);
+    }
+    rmsnorm_k<<<1, 256>>>(x.p, final_norm.bf16(), n.p, HIDDEN);
+    matvec_bf16_k<<<VOCAB, 256>>>(head.bf16(), n.p, logits.p, VOCAB, HIDDEN);
+    argmax_k<<<1, 256>>>(logits.p, did, VOCAB);
+    std::uint32_t next = 0;
+    ck(cudaMemcpy(&next, did, sizeof(next), cudaMemcpyDeviceToHost), "cudaMemcpy sample");
+    ck(cudaDeviceSynchronize(), "decode sync");
+    return next;
+  };
+  std::uint32_t next = input[0];
+  for (std::size_t i = 0; i < input.size(); ++i) next = run(input[i], (int)i);
+  for (std::uint64_t i = 0; i < a.tokens; ++i) { made.push_back(next); next = run(next, (int)(input.size() + i)); }
+  cudaFree(dtok); cudaFree(did); cudaFree(dex);
+  return decode(tokz, made);
 }
 
 int main(int argc, char **argv) {
   Args a = args(argc, argv);
   auto rt = runtime_index(a.manifest);
   validate_forward_contract(rt);
-  if (std::getenv("BLOK_KERNEL_SELFTEST")) decode_kernel_skeleton();
-  stage_tensor(*find(rt.tensors, "resident", "embed_tokens"));
-  stage_tensor(*find(rt.tensors, "attention_resident"));
-  stage_tensor(*find(rt.tensors, "router"));
-  die("forward kernels incomplete: tokenizer, MLA attention, expert GEMM, lm_head, and sampler must emit real tokens");
+  Io io;
+  auto text = generate(io, rt, a);
+  std::cout << "{\"status\":\"ok\",\"text\":" << json(text) << ",\"tokens\":" << a.tokens << ",\"predicted_tps\":0,\"watts\":null}\n";
 }

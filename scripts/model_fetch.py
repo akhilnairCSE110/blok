@@ -116,13 +116,21 @@ def materialize(c):
     lines = ["blok-manifest-v1", "architecture=hybrid", "layout=sidecar"]
     runtime = ["blok-runtime-index-v1"]
     tok = c["local_dir"] / "tokenizer.json"
-    if tok.is_file(): runtime.append(f"tokenizer {tok}")
+    if tok.is_file():
+        tj = json.loads(tok.read_text())
+        if tj.get("model", {}).get("type") != "BPE": raise SystemExit("only tokenizer.json BPE model is supported")
+        tb = c["meta_dir"] / "tokenizer.blok"
+        vocab, merges = tj["model"]["vocab"], tj["model"].get("merges", [])
+        rows = [f"tok {i} {s.encode().hex()}" for s, i in vocab.items()]
+        rows += [f"merge {i} " + " ".join(x.encode().hex() for x in (m.split() if isinstance(m, str) else m)) for i, m in enumerate(merges)]
+        tb.write_text("blok-tokenizer-v1\n" + "\n".join(rows) + "\n")
+        runtime += [f"tokenizer {tok}", f"tokenizer_blok {tb}"]
     index, alignment = [], 4096
     for name, r, dtype, shape, file, start, size in tensors(c):
         off, end = align_down(start, alignment), align(start + size, alignment)
         lines.append(f"tensor {name} {r} {dtype} {shape} {off} {end - off} {alignment} {file}")
         layer, expert, slot = runtime_slot(name)
-        runtime.append(f"tensor {name} {r} {layer} {expert} {slot} {dtype} {shape} {off} {end - off} {alignment} {file}")
+        runtime.append(f"tensor {name} {r} {layer} {expert} {slot} {dtype} {shape} {off} {end - off} {alignment} {start} {size} {file}")
         index.append({"name": name, "role": r, "dtype": dtype, "shape": shape, "file": file, "offset": off, "bytes": end - off})
     (c["meta_dir"] / "manifest.blok").write_text("\n".join(lines) + "\n")
     (c["meta_dir"] / "runtime-index.blok").write_text("\n".join(runtime) + "\n")

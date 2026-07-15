@@ -1,0 +1,3 @@
+[submodule "sub_dir/uGDS"]
+	path = sub_dir/uGDS
+	url = git@github.com:ScaleX-IO/uGDS.git
