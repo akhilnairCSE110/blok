@@ -179,28 +179,21 @@ def validate_kimi_config(model_dir: Path) -> None:
 def check_ready(model_dir: str | os.PathLike[str]) -> None:
     model_dir = resolve_model_dir(Path(model_dir))
     issues: list[str] = []
-    config_path = model_dir / "config.json"
-    if config_path.is_file():
+    if (model_dir / "config.json").is_file():
         try:
             validate_kimi_config(model_dir)
         except BlokRuntimeError as error:
             issues.append(str(error))
     else:
-        issues.append(f"missing config.json: {config_path}")
+        issues.append(f"missing config.json: {model_dir / 'config.json'}")
     for name in ("tokenizer.json", "tokenizer_config.json"):
-        if not (model_dir / name).is_file():
-            issues.append(f"missing {name}: {model_dir / name}")
+        require_file(model_dir / name, issues)
     try:
         ensure_complete_model(model_dir)
     except BlokRuntimeError as error:
         issues.append(str(error))
-    for path, hint in (
-        (model_dir / "blok" / "manifest.blok", "run scripts/model_fetch.py kimi-k2.6 materialize"),
-        (model_dir / "blok" / "runtime-index.blok", "run scripts/model_fetch.py kimi-k2.6 materialize"),
-        (model_dir / "blok" / "tokenizer.blok", "run scripts/model_fetch.py kimi-k2.6 materialize"),
-    ):
-        if not path.is_file():
-            issues.append(f"missing {path.name}: {path}; {hint}")
+    for name in ("manifest.blok", "runtime-index.blok", "tokenizer.blok"):
+        require_file(model_dir / "blok" / name, issues, "; run scripts/model_fetch.py kimi-k2.6 materialize")
     if not _blok_bin().is_file():
         issues.append("native blok binary is missing; run cargo build --release")
     if not Path(os.getenv("BLOK_KIMI_EXEC_BIN", "build/blok-kimi-exec")).is_file():
@@ -219,6 +212,11 @@ def check_ready(model_dir: str | os.PathLike[str]) -> None:
             issues.append(f"{key} must be a positive byte count/offset")
     if issues:
         raise BlokRuntimeError("model is not ready:\n- " + "\n- ".join(issues))
+
+
+def require_file(path: Path, issues: list[str], suffix: str = "") -> None:
+    if not path.is_file():
+        issues.append(f"missing {path.name}: {path}{suffix}")
 
 
 def ensure_complete_model(model_dir: Path) -> None:

@@ -21,6 +21,8 @@
 
 #ifdef BLOK_HAVE_UGDS
 #include <ugds.h>
+#else
+#error "blok-kimi-exec requires uGDS; host-bounced fallback paths are intentionally disabled"
 #endif
 
 void ck(cudaError_t e, const char *m);
@@ -49,7 +51,6 @@ struct Generation {
 
 struct Io {
   std::unordered_map<std::string, std::uint64_t> base;
-#ifdef BLOK_HAVE_UGDS
   int fd = -1;
   uGDSHandle_t fh = nullptr;
   Io() {
@@ -76,7 +77,6 @@ struct Io {
   static void ug(uGDSError_t e, const char *m) {
     if (e.err != UGDS_SUCCESS) die(std::string(m) + ": " + uGDS_status_error(e.err));
   }
-#endif
 };
 
 struct Tokenizer {
@@ -100,6 +100,12 @@ struct DeviceTensor {
     return *this;
   }
   ~DeviceTensor() { if (base) cudaFree(base); }
+  void reserve(std::uint64_t n) {
+    if (bytes >= n) return;
+    if (base) cudaFree(base);
+    ck(cudaMalloc(&base, n), "cudaMalloc tensor");
+    bytes = n;
+  }
   __nv_bfloat16 *bf16() const { return reinterpret_cast<__nv_bfloat16 *>(static_cast<char *>(base) + skip); }
   float *f32() const { return reinterpret_cast<float *>(static_cast<char *>(base) + skip); }
   std::uint32_t *u32() const { return reinterpret_cast<std::uint32_t *>(static_cast<char *>(base) + skip); }
@@ -121,9 +127,9 @@ struct Buf {
 
 constexpr int LAYERS = 61, FIRST_DENSE = 1;
 constexpr int HIDDEN = 7168, HEADS = 64, QK_NOPE = 128, QK_ROPE = 64, V_HEAD = 128;
-constexpr int Q_RANK = 1536, KV_RANK = 512, KV_A = 576, EXPERTS = 384, TOPK = 8, MOE = 2048, VOCAB = 163840;
+constexpr int Q_RANK = 1536, KV_RANK = 512, KV_A = 576, EXPERTS = 384, TOPK = 8, MOE = 2048, SHARED = 18432, VOCAB = 163840;
 constexpr int I4_GROUP = 32, I4_PER_WORD = 8, QK_HEAD = QK_NOPE + QK_ROPE, K_DIM = HEADS * QK_HEAD, V_DIM = HEADS * V_HEAD;
-constexpr int HEAD_TILE = 256, EXPERT_TILE = 64, HIDDEN_TILE = 64;
+constexpr int HEAD_TILE = 256, EXPERT_TILE = 64, HIDDEN_TILE = 64, KV_TILE = 64;
 constexpr float RMS_EPS = 1.0e-5f, ROPE_THETA = 50000.0f, ROUTED_SCALE = 2.827f;
 constexpr std::uint32_t EOS_IM_END = 163586;
 
@@ -131,36 +137,12 @@ std::uint64_t u64(const char *s, const char *n);
 
 constexpr std::uint64_t MAX_IO_BYTES = 4ull * 1024 * 1024;
 
-void read_exact(int fd, void *p, std::uint64_t bytes, std::uint64_t off) {
-  auto *b = static_cast<char *>(p);
-  std::uint64_t done = 0;
-  while (done < bytes) {
-    ssize_t n = pread(fd, b + done, bytes - done, off + done);
-    if (n <= 0) die(std::string("KV read failed: ") + std::strerror(errno));
-    done += (std::uint64_t)n;
-  }
-}
-
-void write_exact(int fd, const void *p, std::uint64_t bytes, std::uint64_t off) {
-  auto *b = static_cast<const char *>(p);
-  std::uint64_t done = 0;
-  while (done < bytes) {
-    ssize_t n = pwrite(fd, b + done, bytes - done, off + done);
-    if (n <= 0) die(std::string("KV write failed: ") + std::strerror(errno));
-    done += (std::uint64_t)n;
-  }
-}
-
 struct KvCache {
-  bool disk = true;
-  int fd = -1, lock_fd = -1, max_seq = 0;
+  int lock_fd = -1;
   std::uint64_t k_layer_bytes = 0, v_layer_bytes = 0, ugds_base = 0;
-  std::vector<Buf> k, v;
-  std::vector<float> host;
   Buf kt, vt, score, hmax, hsum;
   Io &io;
-  KvCache(Io &io_ref, std::uint64_t seq, int tile) : max_seq((int)seq), k_layer_bytes(seq * K_DIM * sizeof(float)), v_layer_bytes(seq * V_DIM * sizeof(float)), io(io_ref) {
-#ifdef BLOK_HAVE_UGDS
+  KvCache(Io &io_ref, std::uint64_t seq, int tile) : k_layer_bytes(seq * K_DIM * sizeof(float)), v_layer_bytes(seq * V_DIM * sizeof(float)), io(io_ref) {
     const char *base = std::getenv("BLOK_KV_UGDS_BASE");
     if (!base) die("BLOK_KV_UGDS_BASE is required for uGDS-backed KV cache");
     ugds_base = u64(base, "BLOK_KV_UGDS_BASE");
@@ -170,32 +152,17 @@ struct KvCache {
     if (const char *cap = std::getenv("BLOK_KV_UGDS_BYTES")) {
       if (LAYERS * (k_layer_bytes + v_layer_bytes) > u64(cap, "BLOK_KV_UGDS_BYTES")) die("BLOK_KV_UGDS_BYTES is too small for requested KV schedule");
     }
-#else
-    if (disk) {
-      std::filesystem::path dir = std::getenv("BLOK_KV_CACHE_DIR") ? std::getenv("BLOK_KV_CACHE_DIR") : ".blok-kv-cache";
-      std::filesystem::create_directories(dir);
-      auto path = dir / ("kv-" + std::to_string(getpid()) + ".bin");
-      fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC | O_CLOEXEC, 0600);
-      if (fd < 0) die(std::string("open KV cache failed: ") + std::strerror(errno));
-      host.resize(std::max(K_DIM, V_DIM) * (std::uint64_t)tile);
-    } else {
-      k.resize(LAYERS); v.resize(LAYERS);
-      for (int l = 0; l < LAYERS; ++l) { k[l].make(seq * K_DIM); v[l].make(seq * V_DIM); }
-    }
-#endif
     kt.make((std::uint64_t)tile * K_DIM); vt.make((std::uint64_t)tile * V_DIM); score.make((std::uint64_t)HEADS * tile);
     hmax.make(HEADS); hsum.make(HEADS);
   }
   ~KvCache() {
     if (lock_fd >= 0) { flock(lock_fd, LOCK_UN); close(lock_fd); }
-    if (fd >= 0) close(fd);
   }
   std::uint64_t off(int layer, bool value, int pos = 0) const {
     return ugds_base + (std::uint64_t)layer * (k_layer_bytes + v_layer_bytes) + (value ? k_layer_bytes : 0) +
            (std::uint64_t)pos * (value ? V_DIM : K_DIM) * sizeof(float);
   }
   void store(int layer, int pos, const float *kp, const float *vp) {
-#ifdef BLOK_HAVE_UGDS
     Io::ug(uGDSBufRegister(kp, K_DIM * sizeof(float), 0), "uGDSBufRegister KV K");
     ssize_t nk = uGDSWrite(io.fh, kp, K_DIM * sizeof(float), (off_t)off(layer, false, pos), 0);
     Io::ug(uGDSBufDeregister(kp), "uGDSBufDeregister KV K");
@@ -204,45 +171,19 @@ struct KvCache {
     ssize_t nv = uGDSWrite(io.fh, vp, V_DIM * sizeof(float), (off_t)off(layer, true, pos), 0);
     Io::ug(uGDSBufDeregister(vp), "uGDSBufDeregister KV V");
     if (nv != (ssize_t)(V_DIM * sizeof(float))) die("short uGDS KV V write");
-#else
-    if (!disk) {
-      ck(cudaMemcpy(k[layer].p + (std::uint64_t)pos * K_DIM, kp, K_DIM * sizeof(float), cudaMemcpyDeviceToDevice), "store K");
-      ck(cudaMemcpy(v[layer].p + (std::uint64_t)pos * V_DIM, vp, V_DIM * sizeof(float), cudaMemcpyDeviceToDevice), "store V");
-      return;
-    }
-    ck(cudaMemcpy(host.data(), kp, K_DIM * sizeof(float), cudaMemcpyDeviceToHost), "copy K to KV cache");
-    write_exact(fd, host.data(), K_DIM * sizeof(float), off(layer, false, pos));
-    ck(cudaMemcpy(host.data(), vp, V_DIM * sizeof(float), cudaMemcpyDeviceToHost), "copy V to KV cache");
-    write_exact(fd, host.data(), V_DIM * sizeof(float), off(layer, true, pos));
-#endif
   }
   void load_tile(int layer, bool value, int start, int n) {
     int dim = value ? V_DIM : K_DIM;
     float *dst = value ? vt.p : kt.p;
-#ifdef BLOK_HAVE_UGDS
     std::uint64_t bytes = (std::uint64_t)n * dim * sizeof(float);
     Io::ug(uGDSBufRegister(dst, bytes, 0), "uGDSBufRegister KV tile");
     ssize_t got = uGDSRead(io.fh, dst, bytes, (off_t)off(layer, value, start), 0);
     Io::ug(uGDSBufDeregister(dst), "uGDSBufDeregister KV tile");
     if (got != (ssize_t)bytes) die("short uGDS KV tile read");
-#else
-    if (!disk) {
-      float *src = (value ? v[layer].p : k[layer].p) + (std::uint64_t)start * dim;
-      ck(cudaMemcpy(dst, src, (std::uint64_t)n * dim * sizeof(float), cudaMemcpyDeviceToDevice), "load KV tile");
-      return;
-    }
-    read_exact(fd, host.data(), (std::uint64_t)n * dim * sizeof(float), off(layer, value, start));
-    ck(cudaMemcpy(dst, host.data(), (std::uint64_t)n * dim * sizeof(float), cudaMemcpyHostToDevice), "copy KV tile");
-#endif
   }
 };
 
 __device__ float bf(const __nv_bfloat16 *p) { return __bfloat162float(*p); }
-
-__global__ void embed_k(const __nv_bfloat16 *e, const std::uint32_t *tok, float *x) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < HIDDEN) x[i] = bf(e + (unsigned long long)*tok * HIDDEN + i);
-}
 
 __global__ void bf16_to_f32_k(const __nv_bfloat16 *x, float *y, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -502,14 +443,6 @@ int shape_dim(const Tensor &t, int dim) {
   }
 }
 
-int max_mlp_width(const std::vector<Tensor> &ts) {
-  int width = MOE;
-  for (const auto &t : ts)
-    if ((t.slot.find("gate_proj") != std::string::npos || t.slot.find("up_proj") != std::string::npos) && t.name.ends_with(".weight"))
-      width = std::max(width, shape_dim(t, 0));
-  return width;
-}
-
 std::string hex(const std::string &s) {
   std::string o;
   for (std::size_t i = 0; i + 1 < s.size(); i += 2) o.push_back((char)std::strtoul(s.substr(i, 2).c_str(), nullptr, 16));
@@ -609,30 +542,10 @@ RuntimeIndex runtime_index(const std::string &manifest) {
   return out;
 }
 
-void read_direct(const Tensor &t, void *dst) {
-  int fd = open(t.file.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
-  if (fd < 0) die(std::string("O_DIRECT open failed: ") + std::strerror(errno));
-  auto *p = static_cast<std::uint8_t *>(dst);
-  std::uint64_t done = 0;
-  while (done < t.bytes) {
-    ssize_t n = pread(fd, p + done, t.bytes - done, t.off + done);
-    if (n <= 0) die(std::string("O_DIRECT read failed: ") + std::strerror(errno));
-    done += static_cast<std::uint64_t>(n);
-  }
-  close(fd);
-}
-
 const Tensor *find(const std::vector<Tensor> &ts, const std::string &role, const std::string &part = "") {
   for (const auto &t : ts)
     if (t.role == role && (part.empty() || t.name.find(part) != std::string::npos)) return &t;
   return nullptr;
-}
-
-std::uint64_t count(const std::vector<Tensor> &ts, const std::string &role) {
-  std::uint64_t n = 0;
-  for (const auto &t : ts)
-    if (t.role == role) ++n;
-  return n;
 }
 
 bool has_layer_slot(const std::vector<Tensor> &ts, int layer, const std::string &slot) {
@@ -653,12 +566,6 @@ const Tensor &need(const std::vector<Tensor> &ts, int layer, const std::string &
         (expert < 0 ? t.expert < 0 : t.expert == expert))
       return t;
   die("missing layer tensor: " + std::to_string(layer) + " " + slot);
-}
-
-const Tensor *maybe(const std::vector<Tensor> &ts, int layer, const std::string &slot, int expert = -1) {
-  for (const auto &t : ts)
-    if (t.layer == layer && t.slot.find(slot) != std::string::npos && (expert < 0 ? t.expert < 0 : t.expert == expert)) return &t;
-  return nullptr;
 }
 
 const Tensor &need_role(const std::vector<Tensor> &ts, int layer, const std::string &role, const std::string &slot) {
@@ -696,51 +603,34 @@ DeviceTensor load_tensor(Io &io, const Tensor &t) {
   d.bytes = t.bytes;
   d.skip = t.data - t.off;
   ck(cudaMalloc(&d.base, t.bytes), "cudaMalloc tensor");
-#ifdef BLOK_HAVE_UGDS
   auto it = io.base.find(t.file);
   if (it == io.base.end()) die("missing uGDS map entry: " + t.file);
   Io::ug(uGDSBufRegister(d.base, t.bytes, 0), "uGDSBufRegister");
   ssize_t n = uGDSRead(io.fh, d.base, t.bytes, (off_t)(it->second + t.off), 0);
   Io::ug(uGDSBufDeregister(d.base), "uGDSBufDeregister");
   if (n != (ssize_t)t.bytes) die("short uGDS read");
-#else
-  (void)io;
-  void *host = nullptr;
-  if (posix_memalign(&host, t.align, t.bytes)) die("posix_memalign failed");
-  read_direct(t, host);
-  ck(cudaMemcpy(d.base, host, t.bytes, cudaMemcpyHostToDevice), "cudaMemcpy tensor");
-  free(host);
-#endif
   return d;
 }
 
-DeviceTensor load_tensor_slice(Io &io, const Tensor &t, std::uint64_t byte_start, std::uint64_t byte_len) {
+void load_tensor_slice_into(Io &io, const Tensor &t, std::uint64_t byte_start, std::uint64_t byte_len, DeviceTensor &d) {
   if (t.data + byte_start + byte_len > t.data + t.data_bytes) die("tensor slice out of range: " + t.name);
   std::uint64_t file_off = t.data + byte_start, aligned = file_off / t.align * t.align;
-  DeviceTensor d;
   d.skip = file_off - aligned;
-  d.bytes = ((d.skip + byte_len + t.align - 1) / t.align) * t.align;
-  if (aligned < t.off || aligned + d.bytes > t.off + t.bytes) die("aligned tensor slice escapes materialized read range: " + t.name);
-  if (d.bytes > MAX_IO_BYTES) die("refusing oversized tensor slice read: " + t.name);
-  ck(cudaMalloc(&d.base, d.bytes), "cudaMalloc tensor slice");
-#ifdef BLOK_HAVE_UGDS
+  std::uint64_t bytes = ((d.skip + byte_len + t.align - 1) / t.align) * t.align;
+  if (aligned < t.off || aligned + bytes > t.off + t.bytes) die("aligned tensor slice escapes materialized read range: " + t.name);
+  if (bytes > MAX_IO_BYTES) die("refusing oversized tensor slice read: " + t.name);
+  d.reserve(bytes);
   auto it = io.base.find(t.file);
   if (it == io.base.end()) die("missing uGDS map entry: " + t.file);
-  Io::ug(uGDSBufRegister(d.base, d.bytes, 0), "uGDSBufRegister slice");
-  ssize_t n = uGDSRead(io.fh, d.base, d.bytes, (off_t)(it->second + aligned), 0);
+  Io::ug(uGDSBufRegister(d.base, bytes, 0), "uGDSBufRegister slice");
+  ssize_t n = uGDSRead(io.fh, d.base, bytes, (off_t)(it->second + aligned), 0);
   Io::ug(uGDSBufDeregister(d.base), "uGDSBufDeregister slice");
-  if (n != (ssize_t)d.bytes) die("short uGDS slice read");
-#else
-  (void)io;
-  void *host = nullptr;
-  if (posix_memalign(&host, t.align, d.bytes)) die("posix_memalign slice failed");
-  int fd = open(t.file.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
-  if (fd < 0) die(std::string("O_DIRECT slice open failed: ") + std::strerror(errno));
-  read_exact(fd, host, d.bytes, aligned);
-  close(fd);
-  ck(cudaMemcpy(d.base, host, d.bytes, cudaMemcpyHostToDevice), "cudaMemcpy tensor slice");
-  free(host);
-#endif
+  if (n != (ssize_t)bytes) die("short uGDS slice read");
+}
+
+DeviceTensor load_tensor_slice(Io &io, const Tensor &t, std::uint64_t byte_start, std::uint64_t byte_len) {
+  DeviceTensor d;
+  load_tensor_slice_into(io, t, byte_start, byte_len, d);
   return d;
 }
 
@@ -783,12 +673,6 @@ void bf16_mlp(Io &io, const Tensor &gw, const Tensor &uw, const Tensor &dw, cons
   }
 }
 
-void matvec_i4(const Tensor &wmeta, const Tensor &smeta, const DeviceTensor &w, const DeviceTensor &scale, const float *x, float *y, int rows, int cols) {
-  validate_i4_pair(wmeta, smeta, rows, cols);
-  if (scale.dtype == "f32") matvec_i4_f32_scale_k<<<rows, 256>>>(w.u32(), scale.f32(), x, y, rows, cols);
-  else matvec_i4_bf16_scale_k<<<rows, 256>>>(w.u32(), scale.bf16(), x, y, rows, cols);
-}
-
 void matvec_i4_slice(const Tensor &smeta, const DeviceTensor &w, const DeviceTensor &scale, const float *x, float *y, int rows, int cols) {
   if (smeta.dtype == "f32") matvec_i4_f32_scale_k<<<rows, 256>>>(w.u32(), scale.f32(), x, y, rows, cols);
   else matvec_i4_bf16_scale_k<<<rows, 256>>>(w.u32(), scale.bf16(), x, y, rows, cols);
@@ -817,9 +701,10 @@ void tiled_attention(KvCache &kv, int layer, int seq, int tile, const float *q, 
 std::uint32_t sample_lm_head(Io &io, const Tensor &head, const float *x, float *logits, std::uint32_t *did) {
   float best = -std::numeric_limits<float>::infinity();
   std::uint32_t token = 0;
+  DeviceTensor h;
   for (int row = 0; row < VOCAB; row += HEAD_TILE) {
     int rows = std::min(HEAD_TILE, VOCAB - row);
-    auto h = load_tensor_slice(io, head, (std::uint64_t)row * HIDDEN * sizeof(__nv_bfloat16), (std::uint64_t)rows * HIDDEN * sizeof(__nv_bfloat16));
+    load_tensor_slice_into(io, head, (std::uint64_t)row * HIDDEN * sizeof(__nv_bfloat16), (std::uint64_t)rows * HIDDEN * sizeof(__nv_bfloat16), h);
     matvec_bf16_k<<<rows, 256>>>(h.bf16(), x, logits, rows, HIDDEN);
     argmax_k<<<1, 256>>>(logits, did, rows);
     std::uint32_t local = 0;
@@ -848,8 +733,7 @@ void validate_forward_contract(const RuntimeIndex &rt) {
     if (!has_layer_slot(ts, i, "input_layernorm")) die("missing layer input_layernorm");
     if (!has_layer_slot(ts, i, "post_attention_layernorm")) die("missing layer post_attention_layernorm");
     if (i < FIRST_DENSE) {
-      if (!maybe(ts, i, "gate_proj") || !maybe(ts, i, "up_proj") || !maybe(ts, i, "down_proj"))
-        die("missing dense first-layer MLP tensors");
+      need(ts, i, "gate_proj"); need(ts, i, "up_proj"); need(ts, i, "down_proj");
       continue;
     }
     if (!router[i]) die("missing layer router tensors");
@@ -864,10 +748,6 @@ void validate_forward_contract(const RuntimeIndex &rt) {
       validate_i4_pair(need_routed_weight(ts, i, "down_proj", e), need_routed_scale(ts, i, "down_proj", e), HIDDEN, MOE);
     }
   }
-  if (count(ts, "attention_resident") == 0) die("missing attention tensors");
-  if (count(ts, "router") == 0) die("missing router tensors");
-  if (count(ts, "routed_expert") == 0) die("missing routed expert tensors");
-  if (count(ts, "shared_expert_resident") == 0) die("missing shared expert tensors");
   if (!find(ts, "resident", "embed_tokens")) die("missing token embedding");
   if (!find(ts, "resident", "norm.weight")) die("missing final norm");
   if (!find(ts, "resident", "lm_head")) die("missing lm_head");
@@ -901,7 +781,6 @@ Generation generate(Io &io, const RuntimeIndex &rt, const Args &a) {
   auto tokz = tokenizer(rt.tokenizer_blok);
   auto input = encode(tokz, a.prompt), made = std::vector<std::uint32_t>{};
   if (input.empty()) die("tokenizer produced no prompt tokens");
-  int mlp_width = max_mlp_width(rt.tensors);
   const Tensor &emb = need(rt.tensors, "embed_tokens");
   auto final_norm = load_tensor(io, need(rt.tensors, "norm.weight"));
   const Tensor &head = need(rt.tensors, "lm_head");
@@ -914,9 +793,8 @@ Generation generate(Io &io, const RuntimeIndex &rt, const Args &a) {
   kva.make(KV_A); kv.make(HEADS * (QK_NOPE + V_HEAD)); k.make(HEADS * (QK_NOPE + QK_ROPE));
   v.make(HEADS * V_HEAD); av.make(HEADS * V_HEAD);
   router.make(EXPERTS); route_select.make(EXPERTS); ew.make(TOPK);
-  gate.make(mlp_width); up.make(mlp_width); mid.make(mlp_width); down.make(HIDDEN); logits.make(HEAD_TILE);
-  int tile = 1;
-  KvCache kv_cache(io, input.size() + a.tokens + 1, tile);
+  gate.make(SHARED); up.make(SHARED); mid.make(SHARED); down.make(HIDDEN); logits.make(HEAD_TILE);
+  KvCache kv_cache(io, input.size() + a.tokens + 1, KV_TILE);
   auto run = [&](std::uint32_t id, int pos) {
     embed_token(io, emb, id, x.p);
     for (int l = 0; l < LAYERS; ++l) {
@@ -940,7 +818,7 @@ Generation generate(Io &io, const RuntimeIndex &rt, const Args &a) {
       ck(cudaMemcpy(v.p, kv.p + HEADS * QK_NOPE, HEADS * V_HEAD * sizeof(float), cudaMemcpyDeviceToDevice), "cudaMemcpy v");
       rope_k<<<(HEADS * QK_ROPE / 2 + 255) / 256, 256>>>(q.p, k.p, pos, HEADS, QK_NOPE + QK_ROPE, QK_ROPE);
       kv_cache.store(l, pos, k.p, v.p);
-      tiled_attention(kv_cache, l, pos + 1, tile, q.p, av.p);
+      tiled_attention(kv_cache, l, pos + 1, KV_TILE, q.p, av.p);
       matvec_bf16_all_rows(io, ow, av.p, down.p, HIDDEN, HEADS * V_HEAD, HIDDEN_TILE);
       add_k<<<(HIDDEN + 255) / 256, 256>>>(x.p, down.p, HIDDEN);
       auto ln1 = load_tensor(io, need(rt.tensors, l, "post_attention_layernorm"));
@@ -1013,11 +891,6 @@ int main(int argc, char **argv) {
   validate_forward_contract(rt);
   Io io;
   auto gen = generate(io, rt, a);
-#ifdef BLOK_HAVE_UGDS
-  const char *io_mode = "ugds";
-#else
-  const char *io_mode = "odirect";
-#endif
-  std::cout << "{\"protocol\":\"blok-kimi-exec-v1\",\"status\":\"ok\",\"io_mode\":\"" << io_mode << "\",\"text\":" << json(gen.text)
+  std::cout << "{\"protocol\":\"blok-kimi-exec-v1\",\"status\":\"ok\",\"io_mode\":\"ugds\",\"text\":" << json(gen.text)
             << ",\"tokens\":" << gen.tokens << ",\"predicted_tps\":null,\"watts\":null}\n";
 }

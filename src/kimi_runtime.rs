@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::{Error, Manifest, Result, KIMI_K26_TEXT};
+use crate::{Error, Manifest, Result, KIMI_EXPERTS_PER_TOKEN};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KimiNativeRequest<'a> {
@@ -19,73 +19,12 @@ pub struct KimiNativeResponse {
     pub watts: Option<f64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KimiExecutionPlan {
-    pub resident_router_bytes: u64,
-    pub resident_shared_expert_bytes: u64,
-    pub resident_attention_bytes: u64,
-    pub streamed_expert_bytes_per_token_floor: u64,
-    pub top_k: u32,
-    pub expert_cache_policy: &'static str,
-    pub io_policy: &'static str,
-    pub kernel_policy: &'static str,
-    pub max_concurrent_instances: u32,
-    pub decode_batch_cap: u32,
-}
-
-impl KimiExecutionPlan {
-    pub fn from_manifest(manifest: &Manifest) -> Self {
-        let mut resident_router_bytes = 0_u64;
-        let mut resident_shared_expert_bytes = 0_u64;
-        let mut resident_attention_bytes = 0_u64;
-        let mut routed_expert_bytes = 0_u64;
-        let mut routed_expert_tensors = 0_u64;
-
-        for tensor in &manifest.tensors {
-            let bytes = tensor.source.end - tensor.source.start;
-            match tensor.role.as_str() {
-                "router" => resident_router_bytes += bytes,
-                "shared_expert_resident" => resident_shared_expert_bytes += bytes,
-                "attention_resident" => resident_attention_bytes += bytes,
-                "routed_expert" => {
-                    routed_expert_bytes += bytes;
-                    routed_expert_tensors += 1;
-                }
-                _ => {}
-            }
-        }
-
-        let bytes_per_expert_tensor = routed_expert_bytes
-            .checked_div(routed_expert_tensors)
-            .unwrap_or(0);
-        let streamed_expert_bytes_per_token_floor =
-            bytes_per_expert_tensor * u64::from(KIMI_K26_TEXT.experts_per_token) * 60;
-
-        Self {
-            resident_router_bytes,
-            resident_shared_expert_bytes,
-            resident_attention_bytes,
-            streamed_expert_bytes_per_token_floor,
-            top_k: KIMI_K26_TEXT.experts_per_token,
-            expert_cache_policy: "layer_partitioned_lfu_lru_hbm_cache",
-            io_policy: "host_issued_gds_or_odirect_into_registered_gpu_slabs",
-            kernel_policy: "grouped_router_sorted_expert_decode",
-            max_concurrent_instances: concurrency_from_cache_budget(),
-            decode_batch_cap: 48,
-        }
-    }
-}
-
 pub fn generate_native(request: KimiNativeRequest<'_>) -> Result<KimiNativeResponse> {
     validate_request(&request)?;
-    let plan = KimiExecutionPlan::from_manifest(request.manifest);
-    run_executor(&request, &plan)
+    run_executor(&request)
 }
 
-fn run_executor(
-    request: &KimiNativeRequest<'_>,
-    plan: &KimiExecutionPlan,
-) -> Result<KimiNativeResponse> {
+fn run_executor(request: &KimiNativeRequest<'_>) -> Result<KimiNativeResponse> {
     let bin = executor_bin();
     if !bin.is_file() {
         return Err(Error::Capability("blok_kimi_exec_binary_required"));
@@ -99,7 +38,7 @@ fn run_executor(
             "--tokens",
             &request.max_tokens.to_string(),
             "--router-top-k",
-            &plan.top_k.to_string(),
+            &KIMI_EXPERTS_PER_TOKEN.to_string(),
         ])
         .stderr(Stdio::piped())
         .output()?;
@@ -173,14 +112,6 @@ fn json_string(text: &str, key: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn concurrency_from_cache_budget() -> u32 {
-    std::env::var("BLOK_MAX_CONCURRENT_INSTANCES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1)
 }
 
 fn validate_request(request: &KimiNativeRequest<'_>) -> Result<()> {

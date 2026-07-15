@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 pub use error::{Error, Result};
 use kimi_runtime::{generate_native, KimiNativeRequest};
 use manifest::Manifest;
-pub use primitives::KIMI_K26_TEXT;
+pub use primitives::KIMI_EXPERTS_PER_TOKEN;
 
 const USAGE: &str = "usage: blok generate --model <manifest-or-dir> --prompt <text> --tokens <n>\n";
 

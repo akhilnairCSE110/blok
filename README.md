@@ -16,7 +16,7 @@ That calls:
 blok.runtime -> target/{debug,release}/blok generate -> build/blok-kimi-exec
 ```
 
-The native executor owns the model path: manifest parsing, O_DIRECT/uGDS payload movement, CUDA
+The native executor owns the model path: manifest parsing, uGDS payload movement, CUDA
 kernels, and token emission. vLLM/Transformers are not part of the product path.
 
 Required external state:
