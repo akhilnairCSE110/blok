@@ -1,174 +1,64 @@
-# Kimi Forward Over uGDS Status
+# Kimi Forward Over uGDS
 
-## Goal
-
-Run Kimi K2.6 text generation through:
+Goal path:
 
 ```text
-end_goal_prompt.py -> blok.runtime -> blok generate -> blok-kimi-exec
+end_goal_prompt.py -> blok.runtime -> blok generate -> blok-kimi-exec -> uGDS -> CUDA kernels
 ```
 
-The native executor must tokenize the prompt, stream real model tensors from an uGDS-owned NVMe block device into GPU memory, execute the full 61-layer Kimi forward pass, sample tokens, detokenize, and emit JSON text. No fake text, descriptor-only success, or generic model runtime.
+Target box:
 
-Current scope is text-only Kimi K2.6. Image/video inputs are not implemented.
+- GPU: NVIDIA RTX 5060 Ti, GB206, `sm_120`.
+- CPU: AMD Ryzen 9 5950X.
+- Storage: Samsung 9100 Pro NVMe, PCIe 5.0 x4.
+- Board: MSI MAG X870 Tomahawk.
 
-## Bare Bones Architecture
+Runtime contract:
 
-```text
-scripts/model_fetch.py materialize
-  -> manifest.blok
-  -> runtime-index.blok
-  -> tokenizer.blok
+- Model: `moonshotai/Kimi-K2.6`, text-only.
+- Materialized files: `manifest.blok`, `runtime-index.blok`, `tokenizer.blok`.
+- Model reads: `BLOK_UGDS_DEVICE` + `BLOK_UGDS_MAP`.
+- KV scratch: `BLOK_KV_UGDS_BASE`, optional `BLOK_KV_UGDS_BYTES`.
+- Executor: `build/blok-kimi-exec`, launched by Rust.
 
-blok generate
-  -> parse manifest
-  -> launch blok-kimi-exec
+Implemented:
 
-blok-kimi-exec
-  -> parse runtime-index.blok
-  -> parse tokenizer.blok
-  -> open /dev/ugds_drvN
-  -> map safetensor shard path -> block-device byte offset
-  -> uGDSRead aligned tensor windows into CUDA buffers
-  -> run decode loop
-  -> emit {"status":"ok","text":...}
+- Manifest/runtime-index/tokenizer sidecars.
+- Rust launcher and JSON parser.
+- uGDS-only CUDA executor.
+- Batch-1 greedy prefill/decode loop over 61 layers.
+- RMSNorm, RoPE, bf16 matvec, attention, router top-k, shared expert, routed INT4 expert, residual, LM head, argmax.
+- Kimi dense layer 0 and routed top-8 MoE layers 1-60.
+- Generated-token count in executor JSON; `predicted_tps` and `watts` are `null`.
+
+Not proven:
+
+- Target CUDA/uGDS compile and run.
+- `BLOK_UGDS_MAP` generation.
+- KV scratch placement safety.
+- Official tokenizer/chat-template parity.
+- MLA, RoPE/YaRN, first-token logits, and routed INT4 numerical parity.
+- Performance, power, or production sampling.
+
+Target smoke:
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cargo build --release
+
+BLOK_UGDS_DEVICE=/dev/ugds_drv0 \
+BLOK_UGDS_MAP=/path/to/ugds-map.txt \
+BLOK_KV_UGDS_BASE=<scratch_byte_offset> \
+BLOK_KV_UGDS_BYTES=<scratch_bytes> \
+BLOK_KIMI_EXEC_BIN=build/blok-kimi-exec \
+target/release/blok generate --model /path/to/manifest.blok --prompt "hello" --tokens 1
 ```
 
-The first correctness implementation is intentionally simple: decode batch 1, greedy sampling, on-demand tensor streaming. Speed work comes after viable tokens.
+Next:
 
-## Done
-
-- Materializer emits `runtime-index.blok` with tensor role, layer, expert, slot, dtype, shape, aligned read offset/size, true tensor data offset/size, and source shard path.
-- Materializer emits `tokenizer.blok` from BPE `tokenizer.json` vocab and merges.
-- CMake links vendored `sub_dir/uGDS` as a submodule when present, otherwise falls back to a system `ugds` library.
-- Native executor parses runtime index and tokenizer sidecar.
-- Native executor validates required Kimi layer slots before generation:
-  - `q_a_proj`
-  - `q_a_layernorm`
-  - `q_b_proj`
-  - `kv_a_proj`
-  - `kv_a_layernorm`
-  - `kv_b_proj`
-  - `o_proj`
-  - routers
-  - embedding, final norm, LM head
-- Native executor implements BPE encode/decode from `tokenizer.blok`.
-- Native executor requires `BLOK_UGDS_DEVICE` and `BLOK_UGDS_MAP` when compiled with uGDS.
-- Native executor opens uGDS driver, registers `/dev/ugds_drvN`, registers CUDA tensor buffers, and uses `uGDSRead` into GPU memory.
-- CUDA kernels exist and are used for:
-  - embedding gather
-  - RMSNorm
-  - bf16 matvec
-  - RoPE
-  - KV cache store
-  - attention score
-  - softmax
-  - attention value accumulation
-  - router top-k
-  - SiLU gated MLP
-  - expert weighted accumulation
-  - shared expert MLP contribution
-  - residual add
-  - LM head
-  - greedy argmax
-- Native executor has a full prompt/decode loop over 61 layers and emits JSON text from generated token ids.
-- Native executor handles Kimi's `first_k_dense_replace: 1` contract:
-  - layer 0 uses dense MLP tensors
-  - layers 1-60 use routed top-8 MoE plus shared expert contribution
-- Native executor applies router sigmoid, adds `e_score_correction_bias` before top-k, renormalizes selected weights, and applies Kimi's routed scaling factor.
-- Native executor uses Kimi config constants for RMSNorm epsilon, RoPE theta, routed scaling factor, and `<|im_end|>` EOS id.
-- Materializer and manifest parser preserve safetensors `I32` tensors for compressed routed expert weights.
-- Native executor loads routed expert `weight` plus `weight_scale` tensors and runs packed symmetric INT4 group-size-32 matvec:
-  - `gate_proj`: packed `[2048, 896]`, scale `[2048, 224]`
-  - `up_proj`: packed `[2048, 896]`, scale `[2048, 224]`
-  - `down_proj`: packed `[7168, 256]`, scale `[7168, 64]`
-- Native executor uses correction bias only for expert selection and gathers unbiased sigmoid scores for routed mixture weights.
-
-## Not Done
-
-- No target-machine CUDA compile has been run.
-- No target-machine uGDS run has been run.
-- `BLOK_UGDS_MAP` is not generated by the repo.
-- YaRN RoPE scaling for long-context parity is not implemented.
-- uGDS batch/async APIs are not used.
-- Resident tensor caching is not implemented.
-- Routed expert caching is not implemented.
-- Tensor names and shapes have not been checked against the complete real Kimi K2.6 safetensor headers.
-- Tokenizer behavior has not been validated against the official tokenizer output.
-- MLA math has not been numerically compared against a known-good Kimi forward pass.
-- Only greedy argmax sampling is implemented.
-- Only `<|im_end|>` EOS handling is implemented; full stop-token/chat-template handling is not implemented.
-- Routed expert INT4 execution has not been target-compiled or numerically validated against the real checkpoint.
-- No power reporting is implemented.
-- `predicted_tps` is currently `0`.
-
-## Required For Full Forward Pass
-
-1. Build and boot the target environment:
-   - Linux bare metal
-   - NVIDIA open kernel driver supported by uGDS
-   - CUDA toolkit with `nvcc`
-   - uGDS kernel module loaded
-   - target NVMe unbound from kernel `nvme` driver and bound to `ugds_drv`
-   - `/dev/ugds_drv0` present
-
-2. Complete model materialization:
-   - Download all 64 Kimi K2.6 safetensor shards.
-   - Run `scripts/model_fetch.py kimi-k2.6 materialize`.
-   - Confirm `manifest.blok`, `runtime-index.blok`, and `tokenizer.blok` exist.
-
-3. Generate `BLOK_UGDS_MAP`:
-   - One line per safetensor shard:
-     ```text
-     /absolute/path/model-00001-of-00064.safetensors <byte_offset_on_/dev/ugds_drv0>
-     ```
-   - Offsets must point to the shard bytes on the uGDS block device.
-   - Offsets and read sizes must satisfy uGDS alignment requirements.
-
-4. Compile on target:
-   ```sh
-   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-   cmake --build build
-   cargo build --release
-   ```
-
-5. First runtime smoke:
-   ```sh
-   BLOK_UGDS_DEVICE=/dev/ugds_drv0 \
-   BLOK_UGDS_MAP=/path/to/ugds-map.txt \
-   BLOK_KIMI_EXEC_BIN=build/blok-kimi-exec \
-   target/release/blok generate --model /path/to/manifest.blok --prompt "hello" --tokens 1
-   ```
-
-6. Fix compile/runtime issues from real tensor names and shapes:
-   - Confirm exact embedding, final norm, LM head names.
-   - Confirm MLA projection shapes.
-   - Confirm routed expert slot names.
-   - Confirm router bias/correction tensor handling.
-
-7. Add missing model behavior:
-   - Full stop-token handling beyond `<|im_end|>`.
-   - Correct tokenizer special-token handling.
-   - Optional non-greedy sampling after greedy works.
-
-8. Validate numerics:
-   - Compare tokenization against official tokenizer.
-   - Compare YaRN/MLA attention intermediates against official implementation.
-   - Compare one-token logits or selected token against a known-good Kimi run.
-   - Then run `end_goal_prompt.py`.
-
-## Current Risk
-
-The code is structurally complete enough to attempt a target-box compile and first token run. It is not proven correct. The most likely first failures are CUDA compile errors, tensor slot/name mismatches, tokenizer mismatch, and MLA shape mistakes.
-
-## Next Implementation Pass
-
-Do this on the target Linux/CUDA/uGDS box:
-
-1. Build uGDS driver/library and `blok-kimi-exec`.
-2. Generate `BLOK_UGDS_MAP`.
-3. Run one-token generation.
-4. Patch exact tensor-name/shape issues from real errors.
-5. Validate routed expert INT4 dequantized matvec against the real checkpoint.
-6. Validate tokenizer and one-token logits.
-7. Run `end_goal_prompt.py`.
+1. Build uGDS and executor on the target box.
+2. Generate model shard map and non-overlapping KV scratch range.
+3. Run one-token smoke.
+4. Patch real tensor shape/name/runtime issues.
+5. Add tokenizer, first-logit, MLA, YaRN, and INT4 parity checks.
