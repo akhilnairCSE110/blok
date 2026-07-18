@@ -2,12 +2,12 @@
 
 ## Exact Target Hardware
 
-- GPU: NVIDIA RTX 5060 Ti, GB206, `sm_120`.
+- GPU: NVIDIA RTX 5060 Ti 16GB, Blackwell, CUDA capability 12.0 / `sm_120`.
 - CPU: AMD Ryzen 9 5950X.
 - RAM: 48 GB.
 - Primary uGDS storage: Samsung 990 EVO Plus 1TB NVMe, PCIe 4.0 x4 / 5.0 x2.
 - Non-uGDS storage: Kingston SA400S37240G 240GB SATA SSD; Seagate ST2000DM008-2FR102 2TB SATA HDD.
-- Motherboard: MSI MAG X870 Tomahawk.
+- Motherboard/chipset: unknown AM4 platform. The old MSI MAG X870 Tomahawk note was stale: X870 is AM5 and does not support Ryzen 9 5950X.
 - OS: Ubuntu/Linux bare metal for the target run. Windows host state is not sufficient for uGDS.
 
 ## Required Software

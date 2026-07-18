@@ -2,7 +2,7 @@
 
 Not direct targets. Use only for architectural context.
 
-- NVIDIA Hopper/Blackwell: TMA/WGMMA, Tensor Core, FP8/FP4, NVLink, multi-die context. Blok target is RTX 5060 Ti GB206 `sm_120`, so check compatibility.
+- NVIDIA Hopper/Blackwell: TMA/WGMMA, Tensor Core, FP8/FP4, NVLink, multi-die context. Blok target is RTX 5060 Ti `sm_120`, so check compatibility.
   - https://docs.nvidia.com/cuda/hopper-tuning-guide
   - https://developer.nvidia.com/blackwell
 - AMD MI300X/ROCm: large-HBM and ROCm context, not this target box.

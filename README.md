@@ -4,12 +4,12 @@ Experimental, text-only, Kimi K2.6-specific native inference runtime. It is not 
 
 ## Target
 
-- GPU: NVIDIA RTX 5060 Ti, GB206, `sm_120`.
+- GPU: NVIDIA RTX 5060 Ti 16GB, Blackwell, CUDA capability 12.0 / `sm_120`.
 - CPU: AMD Ryzen 9 5950X.
 - RAM: 48 GB.
 - Primary uGDS storage: Samsung 990 EVO Plus 1TB NVMe, PCIe 4.0 x4 / 5.0 x2.
 - Non-uGDS storage: Kingston SA400S37240G 240GB SATA SSD; Seagate ST2000DM008-2FR102 2TB SATA HDD.
-- Board: MSI MAG X870 Tomahawk.
+- Board/chipset: unknown AM4 platform; verify from firmware before target install.
 - OS/I/O: Ubuntu/Linux bare metal, uGDS-owned NVMe to registered CUDA buffers.
 
 ```sh
@@ -47,6 +47,7 @@ The native executor owns manifest parsing, uGDS payload movement, CUDA kernels, 
 ## Docs
 
 - [System requirements](docs/system-requirements.md)
+- [Target hardware](docs/target-hardware.md)
 - [Kimi over uGDS status](docs/kimi-forward-ugds-status.md)
 - [Forward contract](docs/specs/kimi_k2_forward.yaml)
 - [Research index](docs/research/papers.md)
