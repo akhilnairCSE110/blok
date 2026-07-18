@@ -26,7 +26,8 @@ The native executor owns manifest parsing, uGDS payload movement, CUDA kernels, 
 - `scripts/model_fetch.py kimi-k2.6 materialize`.
 - CUDA/CMake build producing `build/blok-kimi-exec`.
 - uGDS driver/library for the target kernel and NVIDIA open driver.
-- `BLOK_UGDS_DEVICE`, `BLOK_UGDS_MAP`, `BLOK_KV_UGDS_BASE`, optional `BLOK_KV_UGDS_BYTES`.
+- Extent-aware `BLOK_UGDS_MAP` from `scripts/plan_ugds_layout.py`.
+- `BLOK_UGDS_DEVICE`, `BLOK_KV_UGDS_BASE`, and `BLOK_KV_UGDS_BYTES`.
 
 ## Status
 
@@ -36,6 +37,7 @@ The native executor owns manifest parsing, uGDS payload movement, CUDA kernels, 
 | Text prefill/decode path | Wired, unverified |
 | Routed INT4 path | Wired, unverified |
 | uGDS execution | Wired, unproven |
+| Extent-aware uGDS model shard map | Implemented |
 | Tokenizer/chat-template, MLA/YaRN, logits parity | Missing |
 | Image/video, sampling, metrics | Not implemented |
 
@@ -56,3 +58,19 @@ The native executor owns manifest parsing, uGDS payload movement, CUDA kernels, 
 | 3 | Official parity | `just verify-l3` currently missing |
 | 4 | Target hardware | `just verify-l4` plus smoke |
 | 5 | Regression fixtures | `just verify-l5` currently missing |
+
+Generate the model-shard uGDS map on the target Linux box after materialization, while the model filesystem is still mounted:
+
+```sh
+BLOK_MODEL=/path/to/manifest.blok \
+BLOK_UGDS_DEVICE=/dev/ugds_drv0 \
+BLOK_KV_UGDS_BASE=<scratch_byte_offset> \
+BLOK_KV_UGDS_BYTES=<scratch_bytes> \
+BLOK_UGDS_MAP=/path/to/ugds-map.blok \
+BLOK_UGDS_ENV_OUTPUT=/path/to/ugds.env \
+just ugds-layout
+```
+
+If the model files live on a partition but `/dev/ugds_drv0` is bound to the whole NVMe namespace, set
+`BLOK_UGDS_PHYSICAL_OFFSET_ADD=<partition_start_bytes>` so FIEMAP physical offsets match the uGDS device.
+After the map is generated, unmount the model filesystem and bind the NVMe device to uGDS before running the smoke.

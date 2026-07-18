@@ -26,6 +26,8 @@ Implemented:
 - Manifest/runtime-index/tokenizer sidecars.
 - Rust launcher and JSON parser.
 - uGDS-only CUDA executor.
+- Extent-aware model shard map generation through Linux FIEMAP.
+- Executor reads tensor slices across mapped file extents instead of assuming contiguous shards.
 - Batch-1 greedy prefill/decode loop over 61 layers.
 - RMSNorm, RoPE, bf16 matvec, attention, router top-k, shared expert, routed INT4 expert, residual, LM head, argmax.
 - Kimi dense layer 0 and routed top-8 MoE layers 1-60.
@@ -34,7 +36,7 @@ Implemented:
 Not proven:
 
 - Target CUDA/uGDS compile and run.
-- `BLOK_UGDS_MAP` generation.
+- Target validation of generated `BLOK_UGDS_MAP`.
 - KV scratch placement safety.
 - Official tokenizer/chat-template parity.
 - MLA, RoPE/YaRN, first-token logits, and routed INT4 numerical parity.
@@ -58,7 +60,16 @@ target/release/blok generate --model /path/to/manifest.blok --prompt "hello" --t
 Next:
 
 1. Build uGDS and executor on the target box.
-2. Generate model shard map and non-overlapping KV scratch range.
+2. Generate the extent-aware model shard map and non-overlapping KV scratch range:
+   ```sh
+   BLOK_MODEL=/path/to/manifest.blok \
+   BLOK_UGDS_DEVICE=/dev/ugds_drv0 \
+   BLOK_KV_UGDS_BASE=<scratch_byte_offset> \
+   BLOK_KV_UGDS_BYTES=<scratch_bytes> \
+   BLOK_UGDS_MAP=/path/to/ugds-map.blok \
+   BLOK_UGDS_ENV_OUTPUT=/path/to/ugds.env \
+   just ugds-layout
+   ```
 3. Run one-token smoke.
 4. Patch real tensor shape/name/runtime issues.
 5. Add tokenizer, first-logit, MLA, YaRN, and INT4 parity checks.

@@ -42,6 +42,9 @@ hardware-check:
 model-contract:
     scripts/ci.sh model-contract
 
+ugds-layout:
+    scripts/ci.sh ugds-layout
+
 verify-l0:
     scripts/ci.sh verify-l0
 

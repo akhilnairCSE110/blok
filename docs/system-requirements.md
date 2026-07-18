@@ -19,6 +19,7 @@
 ## Storage Contract
 
 - Model shards must live on an NVMe region that can be mapped by uGDS.
-- Runtime reads use explicit shard-to-block offsets from `BLOK_UGDS_MAP`.
+- Runtime reads use explicit shard-to-block extents from `BLOK_UGDS_MAP`.
+- Generate `BLOK_UGDS_MAP` with FIEMAP while the model filesystem is mounted, then unmount and bind the NVMe device to uGDS before raw uGDS reads.
 - KV scratch uses a separate uGDS block-device region configured by `BLOK_KV_UGDS_BASE` and optionally bounded by `BLOK_KV_UGDS_BYTES`.
-- Root-mounted devices are allowed only as read-only sources, not as uGDS-owned write scratch.
+- Root-mounted devices are not valid uGDS raw-read or write-scratch targets.

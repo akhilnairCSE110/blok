@@ -203,6 +203,18 @@ model_contract() {
   scripts/check_kimi_contract.py "$BLOK_MODEL"
 }
 
+ugds_layout() {
+  if [ -z "${BLOK_MODEL:-}" ]; then
+    echo "skip: set BLOK_MODEL to manifest.blok or model dir"
+    return 0
+  fi
+  local args=("$BLOK_MODEL" --output "${BLOK_UGDS_MAP:-ugds-map.blok}")
+  [ -z "${BLOK_UGDS_ENV_OUTPUT:-}" ] || args+=(--env-output "$BLOK_UGDS_ENV_OUTPUT")
+  [ -z "${BLOK_UGDS_JSON_OUTPUT:-}" ] || args+=(--json-output "$BLOK_UGDS_JSON_OUTPUT")
+  [ -z "${BLOK_UGDS_PHYSICAL_OFFSET_ADD:-}" ] || args+=(--physical-offset-add "$BLOK_UGDS_PHYSICAL_OFFSET_ADD")
+  scripts/plan_ugds_layout.py "${args[@]}"
+}
+
 check_local() {
   fmt_check
 }
@@ -279,6 +291,7 @@ case "${1:-}" in
   deps) deps ;;
   hardware-check) hardware_check ;;
   model-contract) model_contract ;;
+  ugds-layout) ugds_layout ;;
   verify-l0) verify_l0 ;;
   verify-l1) verify_l1 ;;
   verify-l2) verify_l2 ;;
@@ -290,7 +303,7 @@ case "${1:-}" in
   deep-linux) deep_linux ;;
   release-linux) release_linux ;;
   *)
-    echo "usage: $0 {fmt|fmt-check|setup|cxx-linux|cxx-sanitize-linux|rust-linux|rust-deep-linux|cuda-deep-linux|deps|hardware-check|model-contract|verify-l0|verify-l1|verify-l2|verify-l3|verify-l4|verify-l5|check-local|check-linux|deep-linux|release-linux}" >&2
+    echo "usage: $0 {fmt|fmt-check|setup|cxx-linux|cxx-sanitize-linux|rust-linux|rust-deep-linux|cuda-deep-linux|deps|hardware-check|model-contract|ugds-layout|verify-l0|verify-l1|verify-l2|verify-l3|verify-l4|verify-l5|check-local|check-linux|deep-linux|release-linux}" >&2
     exit 2
     ;;
 esac

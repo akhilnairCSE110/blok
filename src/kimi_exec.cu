@@ -49,8 +49,15 @@ struct Generation {
   std::uint64_t tokens = 0;
 };
 
+struct FileExtent {
+  std::uint64_t logical = 0, bytes = 0, device = 0;
+};
+
 struct Io {
-  std::unordered_map<std::string, std::uint64_t> base;
+  std::unordered_map<std::string, std::uint64_t> legacy_base;
+  std::unordered_map<std::string, std::vector<FileExtent>> file_extents;
+  bool has_kv_scratch = false;
+  std::uint64_t kv_base = 0, kv_bytes = 0;
   int fd = -1;
   uGDSHandle_t fh = nullptr;
   Io() {
@@ -65,9 +72,31 @@ struct Io {
     ug(uGDSHandleRegister(&fh, &d), "uGDSHandleRegister");
     std::ifstream in(map);
     if (!in) die("open BLOK_UGDS_MAP failed");
-    std::string file;
-    std::uint64_t off;
-    while (in >> file >> off) base[file] = off;
+    std::string line;
+    while (std::getline(in, line)) {
+      if (line.empty() || line[0] == '#') continue;
+      std::istringstream ss(line);
+      std::string tag, file;
+      if (!(ss >> tag)) continue;
+      if (tag == "blok-ugds-map-v1" || tag == "device" || tag == "block_size") continue;
+      if (tag == "kv_scratch") {
+        if (!(ss >> kv_base >> kv_bytes)) die("bad BLOK_UGDS_MAP kv_scratch line");
+        has_kv_scratch = true;
+        continue;
+      }
+      if (tag == "file") {
+        FileExtent e;
+        if (!(ss >> file >> e.logical >> e.bytes >> e.device)) die("bad BLOK_UGDS_MAP file extent line");
+        if (e.bytes == 0 || e.device % 4096 != 0 || e.logical % 4096 != 0 || e.bytes % 4096 != 0)
+          die("BLOK_UGDS_MAP extents must be non-empty and 4096-byte aligned");
+        file_extents[file].push_back(e);
+      } else {
+        std::uint64_t off;
+        if (!(ss >> off)) die("bad legacy BLOK_UGDS_MAP line");
+        legacy_base[tag] = off;
+      }
+    }
+    if (file_extents.empty() && legacy_base.empty()) die("BLOK_UGDS_MAP contains no model file mappings");
   }
   ~Io() {
     if (fh) uGDSHandleDeregister(fh);
@@ -76,6 +105,35 @@ struct Io {
   }
   static void ug(uGDSError_t e, const char *m) {
     if (e.err != UGDS_SUCCESS) die(std::string(m) + ": " + uGDS_status_error(e.err));
+  }
+  void read_file_range(const std::string &file, std::uint64_t logical, std::uint64_t bytes, void *dst) {
+    if (bytes == 0) return;
+    if (logical % 4096 != 0 || bytes % 4096 != 0) die("uGDS reads must be 4096-byte aligned");
+    auto legacy = legacy_base.find(file);
+    if (legacy != legacy_base.end()) {
+      ssize_t n = uGDSRead(fh, dst, bytes, (off_t)(legacy->second + logical), 0);
+      if (n != (ssize_t)bytes) die("short legacy uGDS read");
+      return;
+    }
+    auto found = file_extents.find(file);
+    if (found == file_extents.end()) die("missing uGDS map entry: " + file);
+    std::uint64_t done = 0;
+    while (done < bytes) {
+      std::uint64_t at = logical + done;
+      const FileExtent *hit = nullptr;
+      for (const auto &e : found->second) {
+        if (at >= e.logical && at < e.logical + e.bytes) {
+          hit = &e;
+          break;
+        }
+      }
+      if (!hit) die("uGDS map does not cover requested file range: " + file);
+      std::uint64_t in_extent = at - hit->logical;
+      std::uint64_t chunk = std::min(bytes - done, hit->bytes - in_extent);
+      ssize_t n = uGDSRead(fh, dst, chunk, (off_t)(hit->device + in_extent), (off_t)done);
+      if (n != (ssize_t)chunk) die("short extent uGDS read");
+      done += chunk;
+    }
   }
 };
 
@@ -151,7 +209,9 @@ struct KvCache {
     if (lock_fd < 0 || flock(lock_fd, LOCK_EX | LOCK_NB) != 0) die("KV uGDS region is already reserved: " + lock_path);
     if (const char *cap = std::getenv("BLOK_KV_UGDS_BYTES")) {
       if (LAYERS * (k_layer_bytes + v_layer_bytes) > u64(cap, "BLOK_KV_UGDS_BYTES")) die("BLOK_KV_UGDS_BYTES is too small for requested KV schedule");
+      if (io.has_kv_scratch && u64(cap, "BLOK_KV_UGDS_BYTES") != io.kv_bytes) die("BLOK_KV_UGDS_BYTES does not match BLOK_UGDS_MAP kv_scratch");
     }
+    if (io.has_kv_scratch && ugds_base != io.kv_base) die("BLOK_KV_UGDS_BASE does not match BLOK_UGDS_MAP kv_scratch");
     kt.make((std::uint64_t)tile * K_DIM); vt.make((std::uint64_t)tile * V_DIM); score.make((std::uint64_t)HEADS * tile);
     hmax.make(HEADS); hsum.make(HEADS);
   }
@@ -603,12 +663,9 @@ DeviceTensor load_tensor(Io &io, const Tensor &t) {
   d.bytes = t.bytes;
   d.skip = t.data - t.off;
   ck(cudaMalloc(&d.base, t.bytes), "cudaMalloc tensor");
-  auto it = io.base.find(t.file);
-  if (it == io.base.end()) die("missing uGDS map entry: " + t.file);
   Io::ug(uGDSBufRegister(d.base, t.bytes, 0), "uGDSBufRegister");
-  ssize_t n = uGDSRead(io.fh, d.base, t.bytes, (off_t)(it->second + t.off), 0);
+  io.read_file_range(t.file, t.off, t.bytes, d.base);
   Io::ug(uGDSBufDeregister(d.base), "uGDSBufDeregister");
-  if (n != (ssize_t)t.bytes) die("short uGDS read");
   return d;
 }
 
@@ -620,12 +677,9 @@ void load_tensor_slice_into(Io &io, const Tensor &t, std::uint64_t byte_start, s
   if (aligned < t.off || aligned + bytes > t.off + t.bytes) die("aligned tensor slice escapes materialized read range: " + t.name);
   if (bytes > MAX_IO_BYTES) die("refusing oversized tensor slice read: " + t.name);
   d.reserve(bytes);
-  auto it = io.base.find(t.file);
-  if (it == io.base.end()) die("missing uGDS map entry: " + t.file);
   Io::ug(uGDSBufRegister(d.base, bytes, 0), "uGDSBufRegister slice");
-  ssize_t n = uGDSRead(io.fh, d.base, bytes, (off_t)(it->second + aligned), 0);
+  io.read_file_range(t.file, aligned, bytes, d.base);
   Io::ug(uGDSBufDeregister(d.base), "uGDSBufDeregister slice");
-  if (n != (ssize_t)bytes) die("short uGDS slice read");
 }
 
 DeviceTensor load_tensor_slice(Io &io, const Tensor &t, std::uint64_t byte_start, std::uint64_t byte_len) {
