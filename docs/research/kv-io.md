@@ -1,6 +1,6 @@
 # KV Cache And Storage I/O
 
-Blok's product path is uGDS from Samsung 9100 Pro NVMe into registered CUDA buffers.
+Blok's product path is uGDS from the Samsung 990 EVO Plus NVMe into registered CUDA buffers.
 
 ## Direct Storage
 

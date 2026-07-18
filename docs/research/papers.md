@@ -3,7 +3,7 @@
 This directory tracks papers, systems, and kernel libraries relevant to Blok's target:
 
 ```text
-RTX 5060 Ti GB206 sm_120 + Ryzen 9 5950X + Samsung 9100 Pro PCIe 5.0 x4 + uGDS
+RTX 5060 Ti GB206 sm_120 + Ryzen 9 5950X + Samsung 990 EVO Plus 1TB NVMe + uGDS
 ```
 
 The references are design context, not proof that an optimization is already implemented. Hopper, Blackwell, AMD, wafer-scale, and distributed-system ideas must be translated carefully before applying them to the RTX 5060 Ti target.
