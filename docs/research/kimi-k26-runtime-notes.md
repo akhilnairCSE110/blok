@@ -59,3 +59,15 @@ Reference DeepSeek/Kimi implementation: https://huggingface.co/moonshotai/Kimi-K
 - FIEMAP returns logical, physical, length, and flags in bytes.
 - Extents with unknown, delayed, encoded, inline, tail, unwritten, merged, or unaligned flags are not valid for direct raw uGDS reads.
 - Generate the map while the filesystem is mounted, then unmount and bind the NVMe namespace to uGDS before raw reads. Raw block access through FIEMAP extents while the filesystem remains mounted is explicitly unsafe.
+
+## Actual Target Storage
+
+- User-reported primary NVMe: Samsung 990 EVO Plus 1TB.
+- Samsung 990 EVO Plus specs: https://www.samsung.com.cn/memory-storage/nvme-ssd/990-evo-plus-1tb-nvme-pcie-gen-4-mz-v9S1T0BW/
+- Relevant Samsung specs: PCIe 4.0 x4 / 5.0 x2 NVMe 2.0, M.2 2280, 1TB, up to 7,150 MB/s sequential read and 6,300 MB/s sequential write, TLC, HMB.
+- User-reported secondary SSD: Kingston SA400S37240G 240GB.
+- Kingston SA400S37240G reference: https://smarthdd.com/database/KINGSTON-SA400S37240G/03200001/
+- Relevant Kingston constraint: SATA SSD, not an NVMe/uGDS target.
+- User-reported HDD: Seagate ST2000DM008-2FR102 2TB.
+- Seagate desktop HDD family reference: https://www.seagate.com/gb/en/support/internal-hard-drives/desktop-hard-drives/desktop-hdd/
+- Relevant Seagate constraint: SATA HDD, not an NVMe/uGDS target.

@@ -6,7 +6,9 @@ Experimental, text-only, Kimi K2.6-specific native inference runtime. It is not 
 
 - GPU: NVIDIA RTX 5060 Ti, GB206, `sm_120`.
 - CPU: AMD Ryzen 9 5950X.
-- Storage: Samsung 9100 Pro NVMe, PCIe 5.0 x4.
+- RAM: 48 GB.
+- Primary uGDS storage: Samsung 990 EVO Plus 1TB NVMe, PCIe 4.0 x4 / 5.0 x2.
+- Non-uGDS storage: Kingston SA400S37240G 240GB SATA SSD; Seagate ST2000DM008-2FR102 2TB SATA HDD.
 - Board: MSI MAG X870 Tomahawk.
 - OS/I/O: Ubuntu/Linux bare metal, uGDS-owned NVMe to registered CUDA buffers.
 
@@ -23,6 +25,7 @@ The native executor owns manifest parsing, uGDS payload movement, CUDA kernels, 
 ## Required State
 
 - Complete `moonshotai/Kimi-K2.6` download.
+- Store materialized model shards and KV scratch on the Samsung 990 EVO Plus NVMe; do not use the SATA SSD/HDD for uGDS.
 - `scripts/model_fetch.py kimi-k2.6 materialize`.
 - CUDA/CMake build producing `build/blok-kimi-exec`.
 - uGDS driver/library for the target kernel and NVIDIA open driver.

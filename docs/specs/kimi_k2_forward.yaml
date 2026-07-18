@@ -7,7 +7,12 @@ model:
 target_hardware:
   gpu: { vendor: NVIDIA, model: RTX 5060 Ti, silicon: GB206, sm: 120 }
   cpu: { vendor: AMD, model: Ryzen 9 5950X }
-  storage: { vendor: Samsung, model: 9100 Pro, interface: PCIe 5.0 x4 NVMe }
+  ram_gb: 48
+  storage:
+    ugds_primary: { vendor: Samsung, model: 990 EVO Plus, capacity: 1TB, interface: PCIe 4.0 x4 / 5.0 x2 NVMe }
+    excluded:
+      - { vendor: Kingston, model: SA400S37240G, capacity: 240GB, interface: SATA SSD }
+      - { vendor: Seagate, model: ST2000DM008-2FR102, capacity: 2TB, interface: SATA HDD }
   motherboard: { vendor: MSI, model: MAG X870 Tomahawk }
 
 config:
@@ -32,7 +37,7 @@ config:
     theta: 50000
     yarn_scaling_factor: 64
     original_max_position_embeddings: 4096
-    status: not_implemented
+    status: wired_unverified
 
 ugds:
   required: true
