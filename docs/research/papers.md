@@ -14,6 +14,7 @@ The references are design context, not proof that an optimization is already imp
 - [GEMM And Low Precision](gemm-low-precision.md)
 - [Kernel Libraries And DSLs](kernels-dsls.md)
 - [KV Cache And Storage I/O](kv-io.md)
+- [Kimi K2.6 Runtime Notes](kimi-k26-runtime-notes.md)
 - [MoE And Runtime Systems](moe-runtime.md)
 - [Hardware Scaling Context](hardware-scaling.md)
 

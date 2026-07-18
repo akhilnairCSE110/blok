@@ -38,7 +38,7 @@ The native executor owns manifest parsing, uGDS payload movement, CUDA kernels, 
 | Routed INT4 path | Wired, unverified |
 | uGDS execution | Wired, unproven |
 | Extent-aware uGDS model shard map | Implemented |
-| Tokenizer/chat-template, MLA/YaRN, logits parity | Missing |
+| Tokenizer/chat-template, MLA/YaRN, logits parity | Wired, parity missing |
 | Image/video, sampling, metrics | Not implemented |
 
 ## Docs

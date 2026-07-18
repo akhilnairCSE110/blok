@@ -203,6 +203,20 @@ model_contract() {
   scripts/check_kimi_contract.py "$BLOK_MODEL"
 }
 
+smoke_generate() {
+  if [ -z "${BLOK_MODEL:-}" ]; then
+    echo "skip: set BLOK_MODEL to manifest.blok or model dir"
+    return 0
+  fi
+  local bin="${BLOK_BIN:-target/release/blok}"
+  [ -x "$bin" ] || bin="target/debug/blok"
+  [ -x "$bin" ] || {
+    echo "missing: build blok with cargo build --release"
+    return 1
+  }
+  "$bin" generate --model "$BLOK_MODEL" --prompt "${BLOK_SMOKE_PROMPT:-hello}" --tokens "${BLOK_SMOKE_TOKENS:-1}"
+}
+
 ugds_layout() {
   if [ -z "${BLOK_MODEL:-}" ]; then
     echo "skip: set BLOK_MODEL to manifest.blok or model dir"
@@ -238,6 +252,7 @@ verify_l3() {
 
 verify_l4() {
   hardware_check
+  smoke_generate
 }
 
 verify_l5() {

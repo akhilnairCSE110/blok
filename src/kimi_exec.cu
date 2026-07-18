@@ -56,6 +56,7 @@ struct FileExtent {
 struct Io {
   std::unordered_map<std::string, std::uint64_t> legacy_base;
   std::unordered_map<std::string, std::vector<FileExtent>> file_extents;
+  std::string map_device;
   bool has_kv_scratch = false;
   std::uint64_t kv_base = 0, kv_bytes = 0;
   int fd = -1;
@@ -78,7 +79,11 @@ struct Io {
       std::istringstream ss(line);
       std::string tag, file;
       if (!(ss >> tag)) continue;
-      if (tag == "blok-ugds-map-v1" || tag == "device" || tag == "block_size") continue;
+      if (tag == "blok-ugds-map-v1" || tag == "block_size") continue;
+      if (tag == "device") {
+        if (!(ss >> map_device)) die("bad BLOK_UGDS_MAP device line");
+        continue;
+      }
       if (tag == "kv_scratch") {
         if (!(ss >> kv_base >> kv_bytes)) die("bad BLOK_UGDS_MAP kv_scratch line");
         has_kv_scratch = true;
@@ -97,6 +102,7 @@ struct Io {
       }
     }
     if (file_extents.empty() && legacy_base.empty()) die("BLOK_UGDS_MAP contains no model file mappings");
+    if (!map_device.empty() && map_device != dev) die("BLOK_UGDS_DEVICE does not match BLOK_UGDS_MAP device");
   }
   ~Io() {
     if (fh) uGDSHandleDeregister(fh);
@@ -189,6 +195,8 @@ constexpr int Q_RANK = 1536, KV_RANK = 512, KV_A = 576, EXPERTS = 384, TOPK = 8,
 constexpr int I4_GROUP = 32, I4_PER_WORD = 8, QK_HEAD = QK_NOPE + QK_ROPE, K_DIM = HEADS * QK_HEAD, V_DIM = HEADS * V_HEAD;
 constexpr int HEAD_TILE = 256, EXPERT_TILE = 64, HIDDEN_TILE = 64, KV_TILE = 64;
 constexpr float RMS_EPS = 1.0e-5f, ROPE_THETA = 50000.0f, ROUTED_SCALE = 2.827f;
+constexpr float YARN_FACTOR = 64.0f, YARN_BETA_FAST = 32.0f, YARN_BETA_SLOW = 1.0f;
+constexpr float YARN_ORIGINAL_CTX = 4096.0f, YARN_MSCALE_ALL_DIM = 1.0f;
 constexpr std::uint32_t EOS_IM_END = 163586;
 
 std::uint64_t u64(const char *s, const char *n);
@@ -338,17 +346,42 @@ __global__ void matvec_i4_f32_scale_k(const std::uint32_t *w, const float *scale
   if (threadIdx.x == 0 && r < rows) y[r] = s[0];
 }
 
-__global__ void rope_k(float *q, float *k, int pos, int heads, int stride, int rotary) {
+__device__ float yarn_correction_dim(float rotations, float dim) {
+  return dim * logf(YARN_ORIGINAL_CTX / (rotations * 2.0f * CUDART_PI_F)) / (2.0f * logf(ROPE_THETA));
+}
+
+__device__ float yarn_ramp(float low, float high, float at) {
+  if (low == high) high += 0.001f;
+  return fminf(1.0f, fmaxf(0.0f, (at - low) / (high - low)));
+}
+
+__device__ float yarn_inv_freq(int pair, int rotary) {
+  float dim = (float)rotary;
+  float freq_extra = powf(ROPE_THETA, -2.0f * (float)pair / dim);
+  float freq_inter = freq_extra / YARN_FACTOR;
+  float low = floorf(yarn_correction_dim(YARN_BETA_FAST, dim));
+  float high = ceilf(yarn_correction_dim(YARN_BETA_SLOW, dim));
+  low = fmaxf(low, 0.0f);
+  high = fminf(high, dim - 1.0f);
+  float inv_freq_mask = 1.0f - yarn_ramp(low, high, (float)pair);
+  return freq_inter * (1.0f - inv_freq_mask) + freq_extra * inv_freq_mask;
+}
+
+__global__ void rope_k(const float *q, const float *k, float *qr, float *kr, int pos, int heads, int stride, int rotary) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  int pairs = heads * rotary / 2;
-  if (i >= pairs) return;
-  int h = i / (rotary / 2), p = i % (rotary / 2), base = h * stride + p * 2;
-  float freq = powf(ROPE_THETA, -2.0f * p / rotary), c = cosf(pos * freq), s = sinf(pos * freq);
-  float q0 = q[base], q1 = q[base + 1], k0 = k[base], k1 = k[base + 1];
-  q[base] = q0 * c - q1 * s;
-  q[base + 1] = q0 * s + q1 * c;
-  k[base] = k0 * c - k1 * s;
-  k[base + 1] = k0 * s + k1 * c;
+  int total = heads * stride, rotary_pairs = heads * rotary / 2;
+  if (i < total) {
+    qr[i] = q[i];
+    kr[i] = k[i];
+  }
+  if (i >= rotary_pairs) return;
+  int half = rotary / 2, h = i / half, p = i % half, base = h * stride + QK_NOPE;
+  float freq = yarn_inv_freq(p, rotary), c = cosf(pos * freq), s = sinf(pos * freq);
+  float q0 = q[base + p * 2], q1 = q[base + p * 2 + 1], k0 = k[base + p * 2], k1 = k[base + p * 2 + 1];
+  qr[base + p] = q0 * c - q1 * s;
+  qr[base + half + p] = q1 * c + q0 * s;
+  kr[base + p] = k0 * c - k1 * s;
+  kr[base + half + p] = k1 * c + k0 * s;
 }
 
 __global__ void k_rope_fill_k(float *k, const float *rope) {
@@ -381,7 +414,7 @@ __global__ void router_topk_k(const float *score, const float *select_score, std
   float sum = 0;
   for (int k = 0; k < TOPK; ++k) {
     int id = 0;
-    float best = -1;
+    float best = -CUDART_INF_F;
     for (int i = 0; i < EXPERTS; ++i) if (s[i] > best) best = s[i], id = i;
     expert[k] = (std::uint16_t)id; weight[k] = score[id]; sum += score[id]; s[id] = -1;
   }
@@ -412,7 +445,8 @@ __global__ void attn_tile_score_k(const float *q, const float *k, float *score, 
     __syncthreads();
   }
   if (!threadIdx.x) {
-    score[h * n + t] = s[0] * rsqrtf((float)QK_HEAD);
+    float mscale = 0.1f * YARN_MSCALE_ALL_DIM * logf(YARN_FACTOR) + 1.0f;
+    score[h * n + t] = s[0] * rsqrtf((float)QK_HEAD) * mscale * mscale;
   }
 }
 
@@ -602,22 +636,16 @@ RuntimeIndex runtime_index(const std::string &manifest) {
   return out;
 }
 
-const Tensor *find(const std::vector<Tensor> &ts, const std::string &role, const std::string &part = "") {
-  for (const auto &t : ts)
-    if (t.role == role && (part.empty() || t.name.find(part) != std::string::npos)) return &t;
-  return nullptr;
-}
-
 bool has_layer_slot(const std::vector<Tensor> &ts, int layer, const std::string &slot) {
   for (const auto &t : ts)
     if (t.layer == layer && t.slot.find(slot) != std::string::npos) return true;
   return false;
 }
 
-const Tensor &need(const std::vector<Tensor> &ts, const std::string &part) {
-  auto *t = find(ts, "resident", part);
-  if (!t) die("missing tensor: " + part);
-  return *t;
+const Tensor &need_resident_name(const std::vector<Tensor> &ts, const std::string &suffix) {
+  for (const auto &t : ts)
+    if (t.role == "resident" && t.name.ends_with(suffix)) return t;
+  die("missing resident tensor: " + suffix);
 }
 
 const Tensor &need(const std::vector<Tensor> &ts, int layer, const std::string &slot, int expert = -1) {
@@ -802,9 +830,9 @@ void validate_forward_contract(const RuntimeIndex &rt) {
       validate_i4_pair(need_routed_weight(ts, i, "down_proj", e), need_routed_scale(ts, i, "down_proj", e), HIDDEN, MOE);
     }
   }
-  if (!find(ts, "resident", "embed_tokens")) die("missing token embedding");
-  if (!find(ts, "resident", "norm.weight")) die("missing final norm");
-  if (!find(ts, "resident", "lm_head")) die("missing lm_head");
+  need_resident_name(ts, ".embed_tokens.weight");
+  need_resident_name(ts, ".norm.weight");
+  need_resident_name(ts, ".lm_head.weight");
 }
 
 std::string json(const std::string &s) {
@@ -835,16 +863,18 @@ Generation generate(Io &io, const RuntimeIndex &rt, const Args &a) {
   auto tokz = tokenizer(rt.tokenizer_blok);
   auto input = encode(tokz, a.prompt), made = std::vector<std::uint32_t>{};
   if (input.empty()) die("tokenizer produced no prompt tokens");
-  const Tensor &emb = need(rt.tensors, "embed_tokens");
-  auto final_norm = load_tensor(io, need(rt.tensors, "norm.weight"));
-  const Tensor &head = need(rt.tensors, "lm_head");
+  const Tensor &emb = need_resident_name(rt.tensors, ".embed_tokens.weight");
+  auto final_norm = load_tensor(io, need_resident_name(rt.tensors, ".norm.weight"));
+  const Tensor &head = need_resident_name(rt.tensors, ".lm_head.weight");
   std::uint32_t *did = nullptr;
   std::uint16_t *dex = nullptr;
   ck(cudaMalloc(&did, sizeof(std::uint32_t)), "cudaMalloc sample");
   ck(cudaMalloc(&dex, TOPK * sizeof(std::uint16_t)), "cudaMalloc experts");
-  Buf x, n, qa, q, kva, kv, k, v, av, router, route_select, ew, gate, up, mid, down, logits;
+  Buf x, n, qa, q, q_rot, kva, kv, k, k_rot, v, av, router, route_select, ew, gate, up, mid, down, logits;
   x.make(HIDDEN); n.make(HIDDEN); qa.make(Q_RANK); q.make(HEADS * (QK_NOPE + QK_ROPE));
+  q_rot.make(HEADS * (QK_NOPE + QK_ROPE));
   kva.make(KV_A); kv.make(HEADS * (QK_NOPE + V_HEAD)); k.make(HEADS * (QK_NOPE + QK_ROPE));
+  k_rot.make(HEADS * (QK_NOPE + QK_ROPE));
   v.make(HEADS * V_HEAD); av.make(HEADS * V_HEAD);
   router.make(EXPERTS); route_select.make(EXPERTS); ew.make(TOPK);
   gate.make(SHARED); up.make(SHARED); mid.make(SHARED); down.make(HIDDEN); logits.make(HEAD_TILE);
@@ -870,9 +900,9 @@ Generation generate(Io &io, const RuntimeIndex &rt, const Args &a) {
       ck(cudaMemcpy(k.p, kv.p, HEADS * QK_NOPE * sizeof(float), cudaMemcpyDeviceToDevice), "cudaMemcpy k nope");
       k_rope_fill_k<<<(HEADS * QK_ROPE + 255) / 256, 256>>>(k.p, kva.p + KV_RANK);
       ck(cudaMemcpy(v.p, kv.p + HEADS * QK_NOPE, HEADS * V_HEAD * sizeof(float), cudaMemcpyDeviceToDevice), "cudaMemcpy v");
-      rope_k<<<(HEADS * QK_ROPE / 2 + 255) / 256, 256>>>(q.p, k.p, pos, HEADS, QK_NOPE + QK_ROPE, QK_ROPE);
-      kv_cache.store(l, pos, k.p, v.p);
-      tiled_attention(kv_cache, l, pos + 1, KV_TILE, q.p, av.p);
+      rope_k<<<(HEADS * (QK_NOPE + QK_ROPE) + 255) / 256, 256>>>(q.p, k.p, q_rot.p, k_rot.p, pos, HEADS, QK_NOPE + QK_ROPE, QK_ROPE);
+      kv_cache.store(l, pos, k_rot.p, v.p);
+      tiled_attention(kv_cache, l, pos + 1, KV_TILE, q_rot.p, av.p);
       matvec_bf16_all_rows(io, ow, av.p, down.p, HIDDEN, HEADS * V_HEAD, HIDDEN_TILE);
       add_k<<<(HIDDEN + 255) / 256, 256>>>(x.p, down.p, HIDDEN);
       auto ln1 = load_tensor(io, need(rt.tensors, l, "post_attention_layernorm"));

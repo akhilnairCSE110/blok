@@ -30,6 +30,11 @@ def one(ts, layer, role, suffix, expert=None):
     if len(found) != 1: die(f"expected one tensor for layer {layer}: {suffix}, got {len(found)}")
     return found[0]
 
+def any_one(ts, layer, role, suffixes):
+    found = [t for t in ts if t[2] == layer and t[1] == role and any(t[0].endswith(s) for s in suffixes)]
+    if len(found) != 1: die(f"expected one tensor for layer {layer}: {suffixes}, got {len(found)}")
+    return found[0]
+
 def expect(t, dtype, shp):
     if t[5] != dtype or t[6] != shp: die(f"bad {t[0]}: {t[5]} {t[6]}, expected {dtype} {shp}")
 
@@ -37,8 +42,9 @@ def main():
     if len(sys.argv) != 2: die("usage: check_kimi_contract.py <manifest-or-model-dir>")
     ts = load(runtime_path(sys.argv[1]))
     for l in range(LAYERS):
-        for s in ("q_a_proj", "q_a_layernorm", "q_b_proj", "kv_a_proj", "kv_a_layernorm", "kv_b_proj", "o_proj"):
+        for s in ("q_a_proj", "q_a_layernorm", "q_b_proj", "kv_a_layernorm", "kv_b_proj", "o_proj"):
             one(ts, l, "attention_resident", f".{s}.weight")
+        any_one(ts, l, "attention_resident", (".kv_a_proj.weight", ".kv_a_proj_with_mqa.weight"))
         one(ts, l, "resident", ".input_layernorm.weight")
         one(ts, l, "resident", ".post_attention_layernorm.weight")
     for s in ("gate_proj", "up_proj"): expect(one(ts, 0, "dense_ffn_rowcol", f".mlp.{s}.weight"), "bf16", (SHARED, HIDDEN))
