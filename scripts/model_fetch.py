@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-import json, os, re, shutil, struct, subprocess, sys, time
+import base64, json, os, re, shutil, struct, subprocess, sys, time
 from pathlib import Path
 
-MODELS = {"kimi-k2.6": ("moonshotai/Kimi-K2.6", "7eb5002f6aadc958aed6a9177b7ed26bb94011bb", 595421860056, 64)}
-ATTN = ("q_proj", "k_proj", "v_proj", "o_proj", "q_a_proj", "q_b_proj", "kv_a_proj", "kv_b_proj")
+MODELS = {"kimi-k2.6": ("moonshotai/Kimi-K2.6", "7eb5002f6aadc958aed6a9177b7ed26bb94011bb", 595148192736, 64)}
 UP, DOWN = ("up_proj", "gate_proj", "w1", "w3"), ("down_proj", "w2")
 DTYPE = {"BF16": "bf16", "F16": "f16", "F32": "f32", "I32": "i32", "I8": "i8", "U8": "u8"}
 
@@ -19,10 +18,11 @@ def align_down(n, a): return n // a * a
 def ctx(model):
     if model not in MODELS: die(f"unknown model: {model}")
     repo, rev, size, shards = MODELS[model]
-    home = Path(os.getenv("BLOK_HOME", Path(__file__).resolve().parents[3] / ".blok"))
+    home = Path(os.getenv("BLOK_HOME", Path.home() / ".blok"))
     root = Path(os.getenv("BLOK_MODEL_ROOT", home / "models")) / repo
+    meta = Path(os.getenv("BLOK_META_ROOT", home / "metadata")) / repo
     return {"model": model, "repo": repo, "revision": rev, "expected_bytes": size, "expected_safetensors": shards,
-            "local_dir": root / "source/hf" / rev, "meta_dir": root / "blok", "cache_dir": home / "hf-cache",
+            "local_dir": root / "source/hf" / rev, "meta_dir": meta, "cache_dir": home / "hf-cache",
             "hf": os.getenv("BLOK_HF_BIN", "hf")}
 
 def files(c):
@@ -33,10 +33,13 @@ def files(c):
 def status(c):
     fs = files(c)
     got = sum(p.stat().st_size for p in fs)
-    shards = sum(p.name.endswith(".safetensors") for p in fs)
+    shards = sorted(p for p in fs if re.fullmatch(r"model-\d{5}-of-\d{6}\.safetensors", p.name))
+    expected = [f"model-{i:05d}-of-{c['expected_safetensors']:06d}.safetensors" for i in range(1, c["expected_safetensors"] + 1)]
+    index = c["local_dir"] / "model.safetensors.index.json"
+    indexed_bytes = json.loads(index.read_text()).get("metadata", {}).get("total_size") if index.is_file() else None
     return {k: str(v) if k.endswith("_dir") else v for k, v in c.items() if k not in ("hf", "meta_dir")} | {
-        "downloaded_bytes": got, "safetensors": shards,
-        "complete": got >= c["expected_bytes"] and shards >= c["expected_safetensors"],
+        "downloaded_bytes": got, "indexed_weight_bytes": indexed_bytes, "safetensors": len(shards),
+        "complete": [p.name for p in shards] == expected and indexed_bytes == c["expected_bytes"],
     }
 
 def partial(c):
@@ -79,7 +82,7 @@ def role(name):
         return "router"
     if "shared_experts" in name: return "shared_expert_resident"
     if re.search(r"\.experts?\.\d+\.", name): return "routed_expert"
-    if any(x in name for x in ATTN): return "attention_resident"
+    if ".self_attn." in name: return "attention_resident"
     if any(x in name for x in UP + DOWN): return "dense_ffn_rowcol"
     return "resident"
 
@@ -88,8 +91,26 @@ def runtime_slot(name):
     layer = int(m.group(1)) if m else -1
     m = re.search(r"\.experts?\.(\d+)\.", name)
     expert = int(m.group(1)) if m else -1
-    leaf = name.rsplit(".", 1)[0].rsplit(".", 1)[-1] if name.endswith(".weight") else name.rsplit(".", 1)[-1]
+    suffix = name.rsplit(".", 1)[-1]
+    leaf = name.rsplit(".", 2)[-2] if suffix in ("weight", "weight_packed", "weight_scale", "weight_shape") else suffix
     return layer, expert, leaf
+
+def tokenizer(c):
+    vocab_file = c["local_dir"] / "tiktoken.model"
+    config_file = c["local_dir"] / "tokenizer_config.json"
+    if not vocab_file.is_file() or not config_file.is_file():
+        raise SystemExit("pinned checkpoint requires tiktoken.model and tokenizer_config.json")
+    tokens = {}
+    for line in vocab_file.read_bytes().splitlines():
+        encoded, rank = line.split()
+        tokens[int(rank)] = base64.b64decode(encoded)
+    added = json.loads(config_file.read_text()).get("added_tokens_decoder", {})
+    special = {int(i): meta["content"].encode() for i, meta in added.items()}
+    if sorted(tokens) != list(range(163584)) or set(tokens) & set(special):
+        raise SystemExit("unexpected Kimi tokenizer rank contract")
+    rows = [f"tok {i} {value.hex()}" for i, value in sorted(tokens.items())]
+    rows += [f"special {i} {value.hex()}" for i, value in sorted(special.items())]
+    return "blok-tokenizer-v2\n" + "\n".join(rows) + "\n"
 
 def tensors(c):
     out = []
@@ -98,6 +119,7 @@ def tensors(c):
             n = struct.unpack("<Q", f.read(8))[0]; header = json.loads(f.read(n)); base = 8 + n
         for name, meta in header.items():
             if name == "__metadata__": continue
+            if not name.startswith("language_model."): continue
             if meta["dtype"] not in DTYPE: continue
             start, end = meta["data_offsets"]
             out.append((name, role(name), DTYPE[meta["dtype"]], "x".join(map(str, meta["shape"])), str(path), base + start, end - start))
@@ -115,16 +137,9 @@ def materialize(c):
     c["meta_dir"].mkdir(parents=True, exist_ok=True)
     lines = ["blok-manifest-v1", "architecture=hybrid", "layout=sidecar"]
     runtime = ["blok-runtime-index-v1"]
-    tok = c["local_dir"] / "tokenizer.json"
-    if tok.is_file():
-        tj = json.loads(tok.read_text())
-        if tj.get("model", {}).get("type") != "BPE": raise SystemExit("only tokenizer.json BPE model is supported")
-        tb = c["meta_dir"] / "tokenizer.blok"
-        vocab, merges = tj["model"]["vocab"], tj["model"].get("merges", [])
-        rows = [f"tok {i} {s.encode().hex()}" for s, i in vocab.items()]
-        rows += [f"merge {i} " + " ".join(x.encode().hex() for x in (m.split() if isinstance(m, str) else m)) for i, m in enumerate(merges)]
-        tb.write_text("blok-tokenizer-v1\n" + "\n".join(rows) + "\n")
-        runtime.append(f"tokenizer_blok {tb}")
+    tb = c["meta_dir"] / "tokenizer.blok"
+    tb.write_text(tokenizer(c))
+    runtime.append(f"tokenizer_blok {tb}")
     index, alignment = [], 4096
     for name, r, dtype, shape, file, start, size in tensors(c):
         off, end = align_down(start, alignment), align(start + size, alignment)

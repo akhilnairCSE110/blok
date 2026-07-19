@@ -9,12 +9,16 @@ if [ "$(uname -s)" != Linux ]; then
 fi
 
 require lscpu
-lscpu | grep -qi amd || { echo "missing: AMD CPU"; exit 1; }
+lscpu | grep -qi 'Ryzen 9 5950X' || { echo "wrong CPU: expected Ryzen 9 5950X"; exit 1; }
 require nvidia-smi
-nvidia-smi -L | grep -qi nvidia || { echo "missing: NVIDIA GPU"; exit 1; }
+gpu="$(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader)"
+grep -qi 'RTX 5060 Ti.*, 12\.0' <<<"$gpu" || { echo "wrong GPU: $gpu"; exit 1; }
 require nvcc
-nvcc --version >/dev/null
+cuda="$(nvcc --version | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' | head -1)"
+test "$(printf '%s\n' 12.8 "$cuda" | sort -V | head -1)" = 12.8 || { echo "CUDA 12.8+ required, found $cuda"; exit 1; }
+require modinfo
+modinfo -F license nvidia | grep -Eqi 'MIT|GPL' || { echo "NVIDIA open kernel modules are required"; exit 1; }
 require lsblk
-lsblk -d -o NAME,MODEL,TRAN | grep -Eiq 'samsung|evo|nvme' || { echo "missing: Samsung EVO/NVMe SSD"; exit 1; }
+lsblk -d -o MODEL,TRAN | grep -Eiq 'Samsung.*990 EVO Plus.*nvme' || { echo "missing: Samsung 990 EVO Plus NVMe"; exit 1; }
 test -e "${BLOK_UGDS_DEVICE:-/dev/ugds_drv0}" || { echo "missing: ${BLOK_UGDS_DEVICE:-/dev/ugds_drv0}"; exit 1; }
-echo "ok: AMD CPU, NVIDIA GPU, NVMe/Samsung SSD, CUDA, and uGDS device detected"
+echo "ok: exact CPU/GPU/NVMe, CUDA $cuda, open NVIDIA driver, and uGDS device"

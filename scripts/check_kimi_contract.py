@@ -2,7 +2,8 @@
 import sys
 from pathlib import Path
 
-LAYERS, EXPERTS, HIDDEN, MOE, SHARED = 61, 384, 7168, 2048, 18432
+LAYERS, EXPERTS, HIDDEN, DENSE, MOE = 61, 384, 7168, 18432, 2048
+Q_RANK, KV_RANK, HEADS, QK_HEAD, V_HEAD, VOCAB = 1536, 512, 64, 192, 128, 163840
 
 def die(msg): raise SystemExit(msg)
 def shape(s): return tuple(map(int, s.split("x")))
@@ -23,6 +24,7 @@ def load(path):
         _, name, role, layer, expert, slot, dtype, shp, *_ = line.split()
         ts.append((name, role, int(layer), int(expert), slot, dtype, shape(shp)))
     if not tokenizer or not tokenizer.is_file(): die("missing tokenizer.blok")
+    if tokenizer.open().readline().strip() != "blok-tokenizer-v2": die("bad tokenizer.blok schema")
     return ts
 
 def one(ts, layer, role, suffix, expert=None):
@@ -38,28 +40,38 @@ def any_one(ts, layer, role, suffixes):
 def expect(t, dtype, shp):
     if t[5] != dtype or t[6] != shp: die(f"bad {t[0]}: {t[5]} {t[6]}, expected {dtype} {shp}")
 
+def expect_float(t, shp):
+    if t[5] not in ("bf16", "f32") or t[6] != shp: die(f"bad {t[0]}: {t[5]} {t[6]}, expected bf16/f32 {shp}")
+
 def main():
     if len(sys.argv) != 2: die("usage: check_kimi_contract.py <manifest-or-model-dir>")
     ts = load(runtime_path(sys.argv[1]))
     for l in range(LAYERS):
-        for s in ("q_a_proj", "q_a_layernorm", "q_b_proj", "kv_a_layernorm", "kv_b_proj", "o_proj"):
-            one(ts, l, "attention_resident", f".{s}.weight")
-        any_one(ts, l, "attention_resident", (".kv_a_proj.weight", ".kv_a_proj_with_mqa.weight"))
-        one(ts, l, "resident", ".input_layernorm.weight")
-        one(ts, l, "resident", ".post_attention_layernorm.weight")
-    for s in ("gate_proj", "up_proj"): expect(one(ts, 0, "dense_ffn_rowcol", f".mlp.{s}.weight"), "bf16", (SHARED, HIDDEN))
-    expect(one(ts, 0, "dense_ffn_rowcol", ".mlp.down_proj.weight"), "bf16", (HIDDEN, SHARED))
+        expect(one(ts, l, "attention_resident", ".q_a_proj.weight"), "bf16", (Q_RANK, HIDDEN))
+        expect(one(ts, l, "attention_resident", ".q_a_layernorm.weight"), "bf16", (Q_RANK,))
+        expect(one(ts, l, "attention_resident", ".q_b_proj.weight"), "bf16", (HEADS * QK_HEAD, Q_RANK))
+        expect(any_one(ts, l, "attention_resident", (".kv_a_proj.weight", ".kv_a_proj_with_mqa.weight")), "bf16", (KV_RANK + 64, HIDDEN))
+        expect(one(ts, l, "attention_resident", ".kv_a_layernorm.weight"), "bf16", (KV_RANK,))
+        expect(one(ts, l, "attention_resident", ".kv_b_proj.weight"), "bf16", (HEADS * (128 + V_HEAD), KV_RANK))
+        expect(one(ts, l, "attention_resident", ".o_proj.weight"), "bf16", (HIDDEN, HEADS * V_HEAD))
+        expect(one(ts, l, "resident", ".input_layernorm.weight"), "bf16", (HIDDEN,))
+        expect(one(ts, l, "resident", ".post_attention_layernorm.weight"), "bf16", (HIDDEN,))
+    for s in ("gate_proj", "up_proj"): expect(one(ts, 0, "dense_ffn_rowcol", f".mlp.{s}.weight"), "bf16", (DENSE, HIDDEN))
+    expect(one(ts, 0, "dense_ffn_rowcol", ".mlp.down_proj.weight"), "bf16", (HIDDEN, DENSE))
     for l in range(1, LAYERS):
-        one(ts, l, "router", ".mlp.gate.weight")
-        one(ts, l, "router", ".mlp.gate.e_score_correction_bias")
-        for s in ("gate_proj", "up_proj"): expect(one(ts, l, "shared_expert_resident", f".shared_experts.{s}.weight"), "bf16", (SHARED, HIDDEN))
-        expect(one(ts, l, "shared_expert_resident", ".shared_experts.down_proj.weight"), "bf16", (HIDDEN, SHARED))
+        expect(one(ts, l, "router", ".mlp.gate.weight"), "bf16", (EXPERTS, HIDDEN))
+        expect_float(one(ts, l, "router", ".mlp.gate.e_score_correction_bias"), (EXPERTS,))
+        for s in ("gate_proj", "up_proj"): expect(one(ts, l, "shared_expert_resident", f".shared_experts.{s}.weight"), "bf16", (MOE, HIDDEN))
+        expect(one(ts, l, "shared_expert_resident", ".shared_experts.down_proj.weight"), "bf16", (HIDDEN, MOE))
         for e in range(EXPERTS):
             for s in ("gate_proj", "up_proj"):
-                expect(one(ts, l, "routed_expert", f".experts.{e}.{s}.weight", e), "i32", (MOE, HIDDEN // 8))
+                expect(one(ts, l, "routed_expert", f".experts.{e}.{s}.weight_packed", e), "i32", (MOE, HIDDEN // 8))
                 expect(one(ts, l, "routed_expert", f".experts.{e}.{s}.weight_scale", e), "bf16", (MOE, HIDDEN // 32))
-            expect(one(ts, l, "routed_expert", f".experts.{e}.down_proj.weight", e), "i32", (HIDDEN, MOE // 8))
+            expect(one(ts, l, "routed_expert", f".experts.{e}.down_proj.weight_packed", e), "i32", (HIDDEN, MOE // 8))
             expect(one(ts, l, "routed_expert", f".experts.{e}.down_proj.weight_scale", e), "bf16", (HIDDEN, MOE // 32))
+    expect(one(ts, -1, "resident", ".embed_tokens.weight"), "bf16", (VOCAB, HIDDEN))
+    expect(one(ts, -1, "resident", ".norm.weight"), "bf16", (HIDDEN,))
+    expect(one(ts, -1, "resident", ".lm_head.weight"), "bf16", (VOCAB, HIDDEN))
     print("ok: Kimi runtime-index tensor contract")
 
 if __name__ == "__main__": main()

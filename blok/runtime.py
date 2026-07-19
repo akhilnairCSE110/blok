@@ -41,6 +41,19 @@ KIMI_K26_TEXT = {
     "vocab_size": 163840,
 }
 
+KIMI_PATTERN = "|".join(
+    [
+        r"[\p{Han}]+",
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+        r"\p{N}{1,3}",
+        r" ?[^\s\p{L}\p{N}]+[\r\n]*",
+        r"\s*[\r\n]+",
+        r"\s+(?!\S)",
+        r"\s+",
+    ]
+)
+
 
 @dataclass(frozen=True)
 class TextValue:
@@ -90,7 +103,7 @@ class KimiThread:
         check_ready(model_dir)
         manifest = ensure_manifest(model_dir)
         started = time.perf_counter()
-        report = run_native_generate(model_dir, manifest, self.prompt, self.max_tokens)
+        report = run_native_generate(manifest, self.prompt, self.max_tokens, self.max_time)
         elapsed = max(time.perf_counter() - started, 1.0e-9)
         text = normalize_answer(report["text"])
         tokens = float(report["tokens"])
@@ -141,11 +154,11 @@ def new_thread(
 
 def resolve_model_dir(model_dir: Path) -> Path:
     if str(model_dir) in {"<kimi k2 model directory", "<kimi k2 model directory>"}:
-        env = os.getenv("BLOK_KIMI_MODEL_DIR")
+        env = os.getenv("BLOK_KIMI_MODEL_DIR") or os.getenv("BLOK_MODEL")
         if env:
             model_dir = Path(env)
         else:
-            home = Path(os.getenv("BLOK_HOME", Path(__file__).resolve().parents[3] / ".blok"))
+            home = Path(os.getenv("BLOK_HOME", Path.home() / ".blok"))
             model_dir = (
                 home
                 / "models"
@@ -156,6 +169,8 @@ def resolve_model_dir(model_dir: Path) -> Path:
                 / "7eb5002f6aadc958aed6a9177b7ed26bb94011bb"
             )
     model_dir = model_dir.expanduser().resolve()
+    if model_dir.is_file():
+        model_dir = model_dir.parent
     if not model_dir.is_dir():
         raise BlokRuntimeError(f"model directory does not exist: {model_dir}")
     return model_dir
@@ -184,16 +199,19 @@ def check_ready(model_dir: str | os.PathLike[str]) -> None:
             validate_kimi_config(model_dir)
         except BlokRuntimeError as error:
             issues.append(str(error))
-    else:
-        issues.append(f"missing config.json: {model_dir / 'config.json'}")
-    for name in ("tokenizer.json", "tokenizer_config.json"):
-        require_file(model_dir / name, issues)
+        for name in ("tiktoken.model", "tokenizer_config.json"):
+            require_file(model_dir / name, issues)
+        try:
+            ensure_complete_model(model_dir)
+        except BlokRuntimeError as error:
+            issues.append(str(error))
     try:
-        ensure_complete_model(model_dir)
+        sidecars = ensure_manifest(model_dir).parent
     except BlokRuntimeError as error:
         issues.append(str(error))
+        sidecars = model_dir
     for name in ("manifest.blok", "runtime-index.blok", "tokenizer.blok"):
-        require_file(model_dir / "blok" / name, issues, "; run scripts/model_fetch.py kimi-k2.6 materialize")
+        require_file(sidecars / name, issues, "; run scripts/model_fetch.py kimi-k2.6 materialize")
     if not _blok_bin().is_file():
         issues.append("native blok binary is missing; run cargo build --release")
     if not Path(os.getenv("BLOK_KIMI_EXEC_BIN", "build/blok-kimi-exec")).is_file():
@@ -229,9 +247,14 @@ def ensure_complete_model(model_dir: Path) -> None:
 
 
 def ensure_manifest(model_dir: Path) -> Path:
+    env = os.getenv("BLOK_MODEL")
     candidates = [
+        Path(env).expanduser().resolve() if env else model_dir / "manifest.blok",
         model_dir / "blok" / "manifest.blok",
-        model_dir.parents[2] / "blok" / "manifest.blok",
+        Path(os.getenv("BLOK_META_ROOT", Path.home() / ".blok" / "metadata"))
+        / "moonshotai"
+        / "Kimi-K2.6"
+        / "manifest.blok",
         model_dir / "manifest.blok",
     ]
     for path in candidates:
@@ -240,32 +263,60 @@ def ensure_manifest(model_dir: Path) -> Path:
     raise BlokRuntimeError("missing manifest.blok; run scripts/model_fetch.py kimi-k2.6 materialize")
 
 
-def run_native_generate(model_dir: Path, manifest: Path, prompt: str, max_tokens: int) -> dict:
+def run_native_generate(manifest: Path, prompt: str, max_tokens: int, max_time: float | None = None) -> dict:
     exe = _blok_bin()
     if not exe.is_file():
         raise BlokRuntimeError("native blok binary is missing; run cargo build --release")
-    proc = subprocess.run(
-        [
-            str(exe),
-            "generate",
-            "--model",
-            str(manifest),
-            "--prompt",
-            prompt,
-            "--tokens",
-            str(max_tokens),
-        ],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                str(exe),
+                "generate",
+                "--model",
+                str(manifest),
+                "--prompt",
+                prompt,
+                "--prompt-tokens",
+                ",".join(map(str, encode_kimi_prompt(manifest.parent / "tokenizer.blok", prompt))),
+                "--tokens",
+                str(max_tokens),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=max_time,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise BlokRuntimeError(f"generation exceeded {max_time:g} seconds") from error
     if proc.returncode != 0:
         raise BlokRuntimeError(proc.stderr.strip() or proc.stdout.strip())
     report = json.loads(proc.stdout)
     if report.get("status") != "ok" or "text" not in report:
         raise BlokRuntimeError(f"native generation did not emit text: {proc.stdout.strip()}")
     return report
+
+
+def encode_kimi_prompt(tokenizer_path: Path, prompt: str) -> list[int]:
+    try:
+        import tiktoken
+    except ImportError as error:
+        raise BlokRuntimeError("tiktoken is required; run python3 -m pip install -r requirements.txt") from error
+    ranks, special = {}, {}
+    for line in tokenizer_path.read_text().splitlines()[1:]:
+        kind, token_id, encoded = line.split()
+        value = bytes.fromhex(encoded)
+        if kind == "tok":
+            ranks[value] = int(token_id)
+        elif kind == "special":
+            special[value.decode()] = int(token_id)
+    encoding = tiktoken.Encoding("kimi-k2.6", pat_str=KIMI_PATTERN, mergeable_ranks=ranks, special_tokens=special)
+    formatted = (
+        "<|im_user|>user<|im_middle|>"
+        + prompt
+        + "<|im_end|><|im_assistant|>assistant<|im_middle|><think></think>"
+    )
+    return encoding.encode(formatted, allowed_special="all")
 
 
 def _blok_bin() -> Path:

@@ -1,8 +1,16 @@
 model:
   hf_repo: moonshotai/Kimi-K2.6
+  revision: 7eb5002f6aadc958aed6a9177b7ed26bb94011bb
   class: DeepseekV3ForCausalLM
   scope: text_only_native_runtime
-  status: experimental_not_numerically_validated
+  status: target_execution_and_logit_parity_pending
+  checkpoint:
+    shards: 64
+    indexed_weight_bytes: 595148192736
+    tensor_index: model.safetensors.index.json
+    tokenizer_source: tiktoken.model
+    tokenizer_config: tokenizer_config.json
+    quantization: { format: pack-quantized, type: int, bits: 4, group_size: 32, symmetric: true }
 
 target_hardware:
   gpu: { vendor: NVIDIA, model: RTX 5060 Ti, vram_gb: 16, cuda_capability: 12.0, sm: 120 }
@@ -19,6 +27,7 @@ config:
   layers: 61
   first_k_dense_replace: 1
   hidden_size: 7168
+  dense_intermediate_size: 18432
   attention_heads: 64
   q_lora_rank: 1536
   kv_lora_rank: 512
@@ -28,8 +37,9 @@ config:
   routed_experts: 384
   experts_per_token: 8
   moe_intermediate_size: 2048
-  shared_intermediate_size: 18432
+  shared_intermediate_size: 2048
   vocab_size: 163840
+  max_position_embeddings: 262144
   rms_norm_eps: 1.0e-05
   routed_scaling_factor: 2.827
   token_ids: { bos: 163584, eos_im_end: 163586, pad: 163839, unk: 163838 }
@@ -45,13 +55,41 @@ ugds:
   device_env: BLOK_UGDS_DEVICE
   kv_scratch_base_env: BLOK_KV_UGDS_BASE
   kv_scratch_bytes_env: BLOK_KV_UGDS_BYTES
-  rule: model shard ranges and KV scratch range must not overlap
+  metadata_rule: manifest, runtime index, tokenizer sidecar, binaries, and map stay on the mounted system disk
+  payload_rule: model shards may be on the filesystem that is unmounted before its NVMe controller is bound to uGDS
+  scratch_rule: KV scratch is a dedicated raw partition or unallocated tail outside every filesystem; free filesystem blocks are unsafe
+  overlap_rule: model shard extents and KV scratch must not overlap
+  current_kv:
+    layout: expanded_fp32_key_and_value
+    bytes_per_token_all_layers: 4997120
+    purpose: correctness-first short-context V0
+    limitation: replace with latent MLA cache before long-context claims
 
 tensor_contract:
   runtime_index_check: scripts/check_kimi_contract.py
   required_sidecars: [manifest.blok, runtime-index.blok, tokenizer.blok]
+  text_prefix: language_model.
+  excluded_payloads: [vision_tower, mm_projector]
+  attention_bf16_shapes:
+    q_a_proj: [1536, 7168]
+    q_a_layernorm: [1536]
+    q_b_proj: [12288, 1536]
+    kv_a_proj_with_mqa: [576, 7168]
+    kv_a_layernorm: [512]
+    kv_b_proj: [16384, 512]
+    o_proj: [7168, 8192]
+  dense_bf16_shapes:
+    gate_proj: [18432, 7168]
+    up_proj: [18432, 7168]
+    down_proj: [7168, 18432]
+  shared_expert_bf16_shapes:
+    gate_proj: [2048, 7168]
+    up_proj: [2048, 7168]
+    down_proj: [7168, 2048]
   routed_expert_i4:
     format: packed_symmetric_i32
+    checkpoint_weight_suffix: weight_packed
+    checkpoint_scale_suffix: weight_scale
     group_size: 32
     decode: q = ((word >> (4 * lane)) & 0xF) - 8
     shapes:
@@ -63,11 +101,13 @@ verification:
   l0_static: just verify-l0
   l1_model_contract: BLOK_MODEL=/path/to/manifest.blok just verify-l1
   l2_cuda_build: just verify-l2
-  l3_official_parity: missing
+  tokenizer_chat_template: scripts/check_kimi_tokenizer.py
+  target_prepare: scripts/target_v0.sh prepare
+  target_quality_smoke: scripts/target_v0.sh run
+  l3_official_logit_parity: missing
   l4_target_hardware: just verify-l4 plus one-token smoke
   l5_regression: missing
   required_next:
-    - official token ids after chat template
     - first-token top-k logits
     - layer attention/MLA trace
     - routed expert dequant/matvec trace

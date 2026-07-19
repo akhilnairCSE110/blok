@@ -1,1 +1,2 @@
 huggingface_hub[cli,hf_xet]>=0.36
+tiktoken==0.12.0

@@ -19,6 +19,9 @@ brew install \
   shfmt \
   typos-cli || true
 
+python3 -m venv .venv
+.venv/bin/python -m pip install --requirement requirements.txt
+
 if ! command -v rustup >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 fi

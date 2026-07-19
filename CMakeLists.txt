@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 project(blok LANGUAGES CXX CUDA)
+find_package(CUDAToolkit 12.8 REQUIRED)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,5 +23,5 @@ else()
   endif()
 endif()
 target_compile_options(blok-kimi-exec PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math;-Xptxas=-O3,-v>
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Wpedantic,-Werror;--Werror=all-warnings;-Xptxas=-O3,-v>
   $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic;-Werror>)

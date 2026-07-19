@@ -38,6 +38,7 @@ where
 struct Generate {
     model: PathBuf,
     prompt: String,
+    prompt_tokens: Option<String>,
     tokens: u64,
 }
 
@@ -47,6 +48,7 @@ where
 {
     let mut model = None;
     let mut prompt = None;
+    let mut prompt_tokens = None;
     let mut tokens = None;
     let mut args = args.into_iter();
     while let Some(flag) = args.next().and_then(|s| s.into_string().ok()) {
@@ -56,6 +58,7 @@ where
         match flag.as_str() {
             "--model" => model = Some(PathBuf::from(value)),
             "--prompt" => prompt = Some(value.to_string_lossy().into_owned()),
+            "--prompt-tokens" => prompt_tokens = Some(value.to_string_lossy().into_owned()),
             "--tokens" => tokens = Some(parse_u64(&value.to_string_lossy(), "--tokens")?),
             other => return Err(Error::Cli(format!("unknown generate flag: {other}"))),
         }
@@ -63,6 +66,7 @@ where
     Ok(Generate {
         model: model.ok_or_else(|| Error::Cli("--model is required".to_owned()))?,
         prompt: prompt.ok_or_else(|| Error::Cli("--prompt is required".to_owned()))?,
+        prompt_tokens,
         tokens: tokens.ok_or_else(|| Error::Cli("--tokens is required".to_owned()))?,
     })
 }
@@ -85,6 +89,7 @@ fn generate<W: Write>(g: Generate, out: &mut W) -> Result<()> {
         manifest: &manifest,
         manifest_path: &manifest_path,
         prompt: &g.prompt,
+        prompt_tokens: g.prompt_tokens.as_deref(),
         max_tokens: g.tokens,
     })?;
     writeln!(

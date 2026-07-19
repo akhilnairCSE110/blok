@@ -15,8 +15,12 @@ sudo apt-get install -y \
   ninja-build \
   pipx \
   pkg-config \
+  python3-venv \
   shellcheck \
   shfmt
+
+python3 -m venv .venv
+.venv/bin/python -m pip install --requirement requirements.txt
 
 if ! command -v rustup >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y

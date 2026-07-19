@@ -8,6 +8,7 @@ pub struct KimiNativeRequest<'a> {
     pub manifest: &'a Manifest,
     pub manifest_path: &'a Path,
     pub prompt: &'a str,
+    pub prompt_tokens: Option<&'a str>,
     pub max_tokens: u64,
 }
 
@@ -29,19 +30,21 @@ fn run_executor(request: &KimiNativeRequest<'_>) -> Result<KimiNativeResponse> {
     if !bin.is_file() {
         return Err(Error::Capability("blok_kimi_exec_binary_required"));
     }
-    let output = Command::new(&bin)
-        .args([
-            "--manifest",
-            &request.manifest_path.display().to_string(),
-            "--prompt",
-            request.prompt,
-            "--tokens",
-            &request.max_tokens.to_string(),
-            "--router-top-k",
-            &KIMI_EXPERTS_PER_TOKEN.to_string(),
-        ])
-        .stderr(Stdio::piped())
-        .output()?;
+    let mut command = Command::new(&bin);
+    command.args([
+        "--manifest",
+        &request.manifest_path.display().to_string(),
+        "--prompt",
+        request.prompt,
+        "--tokens",
+        &request.max_tokens.to_string(),
+        "--router-top-k",
+        &KIMI_EXPERTS_PER_TOKEN.to_string(),
+    ]);
+    if let Some(tokens) = request.prompt_tokens {
+        command.args(["--prompt-tokens", tokens]);
+    }
+    let output = command.stderr(Stdio::piped()).output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return Err(Error::Native(if stderr.is_empty() {
