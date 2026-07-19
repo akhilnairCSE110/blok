@@ -1,80 +1,54 @@
 # Blok
 
-Experimental, text-only, Kimi K2.6-specific native inference runtime. It is not yet numerically validated or target-proven.
+Minimal text-only inference for the pinned `moonshotai/Kimi-K2.6` revision `7eb5002f6aadc958aed6a9177b7ed26bb94011bb` on an RTX 5060 Ti. Python performs the exact Kimi chat-template/tokenizer work; one CUDA executable performs all 61 transformer layers, greedy decoding, and direct uGDS model/KV I/O.
+
+## Implementation rule
+
+Apply Musk's five-step algorithm in order:
+
+1. Challenge every requirement and identify its owner.
+2. Delete every part or process not required for a full Kimi forward pass.
+3. Simplify and optimize only what survives.
+4. Shorten the test and execution cycle.
+5. Automate only after the path is correct.
+
+The requirement is one public, reference-correct Kimi text-generation path. Languages, wrappers, duplicate indexes, fallback tokenizers, and generic tooling are not requirements; every surviving line must serve the forward pass. Sources: [Starbase interview](https://www.youtube.com/watch?v=t705r8ICkRw) and [transcript/excerpt](https://www.startuparchive.org/p/elon-musk-explains-his-5-step-algorithm-for-running-companies-1eae).
+
+Forward semantics are pinned to Kimi's [configuration](https://huggingface.co/moonshotai/Kimi-K2.6/blob/7eb5002f6aadc958aed6a9177b7ed26bb94011bb/config.json), [reference implementation](https://huggingface.co/moonshotai/Kimi-K2.6/blob/7eb5002f6aadc958aed6a9177b7ed26bb94011bb/modeling_deepseek.py), and the [INT4 packing format](https://github.com/vllm-project/compressed-tensors/blob/main/src/compressed_tensors/compressors/quantized_compressors/pack_quantized.py).
 
 ## Target
 
-- GPU: NVIDIA RTX 5060 Ti 16GB, Blackwell, CUDA capability 12.0 / `sm_120`.
-- CPU: AMD Ryzen 9 5950X.
-- RAM: 48 GB.
-- Primary uGDS storage: Samsung 990 EVO Plus 1TB NVMe, PCIe 4.0 x4 / 5.0 x2.
-- Non-uGDS storage: Kingston SA400S37240G 240GB SATA SSD; Seagate ST2000DM008-2FR102 2TB SATA HDD.
-- Board/chipset: unknown AM4 platform; verify from firmware before target install.
-- OS/I/O: Ubuntu/Linux bare metal, uGDS-owned NVMe to registered CUDA buffers.
+- Ubuntu/Linux, Ryzen 9 5950X, 48 GB RAM
+- RTX 5060 Ti 16 GB (`sm_120`), CUDA 12.8+, NVIDIA open modules
+- Samsung 990 EVO Plus 1 TB bound to uGDS
+- Model payload on the detachable NVMe filesystem
+- Metadata, repository, binaries, and `ugds.env` on the system filesystem
+- Dedicated 4 KiB-aligned raw KV range outside every filesystem and model extent
+
+## Run
 
 ```sh
-python3 end_goal_prompt.py
+git submodule update --init --recursive
+scripts/bootstrap_linux.sh
+
+export BLOK_MODEL_ROOT=/mnt/kimi-models
+export BLOK_META_ROOT="$HOME/.blok/metadata"
+export BLOK_UGDS_DEVICE=/dev/ugds_drv0
+export BLOK_UGDS_MAP="$PWD/ugds-map.blok"
+export BLOK_UGDS_ENV_OUTPUT="$PWD/ugds.env"
+export BLOK_KV_UGDS_BASE=<reserved-raw-byte-offset>
+export BLOK_KV_UGDS_BYTES=<reserved-raw-byte-count>
+export BLOK_UGDS_PHYSICAL_OFFSET_ADD=<partition-start-or-zero>
+
+scripts/model_fetch.py kimi-k2.6 fetch
+scripts/target_v0.sh prepare
 ```
 
-```text
-blok.runtime -> target/{debug,release}/blok generate -> build/blok-kimi-exec
-```
-
-The native executor owns manifest parsing, uGDS payload movement, CUDA kernels, and token emission. vLLM/Transformers are not product-path dependencies.
-
-## Required State
-
-- Complete `moonshotai/Kimi-K2.6` download.
-- Store materialized model shards and KV scratch on the Samsung 990 EVO Plus NVMe; do not use the SATA SSD/HDD for uGDS.
-- `scripts/model_fetch.py kimi-k2.6 materialize`.
-- CUDA/CMake build producing `build/blok-kimi-exec`.
-- uGDS driver/library for the target kernel and NVIDIA open driver.
-- Extent-aware `BLOK_UGDS_MAP` from `scripts/plan_ugds_layout.py`.
-- `BLOK_UGDS_DEVICE`, `BLOK_KV_UGDS_BASE`, and `BLOK_KV_UGDS_BYTES`.
-
-## Status
-
-| Capability | Status |
-|---|---|
-| Safetensor materialization/index | Implemented |
-| Text prefill/decode path | Wired, unverified |
-| Routed INT4 path | Wired, unverified |
-| uGDS execution | Wired, unproven |
-| Extent-aware uGDS model shard map | Implemented |
-| Tokenizer/chat-template, MLA/YaRN, logits parity | Wired, parity missing |
-| Image/video, sampling, metrics | Not implemented |
-
-## Docs
-
-- [System requirements](docs/system-requirements.md)
-- [Target hardware](docs/target-hardware.md)
-- [Kimi over uGDS status](docs/kimi-forward-ugds-status.md)
-- [Forward contract](docs/specs/kimi_k2_forward.yaml)
-- [Research index](docs/research/papers.md)
-
-## Verification
-
-| Level | Gate | Command |
-|---|---|---|
-| 0 | Static | `just verify-l0` |
-| 1 | Model contract | `BLOK_MODEL=/path/to/manifest.blok just verify-l1` |
-| 2 | CUDA build | `just verify-l2` |
-| 3 | Official parity | `just verify-l3` currently missing |
-| 4 | Target hardware | `just verify-l4` plus smoke |
-| 5 | Regression fixtures | `just verify-l5` currently missing |
-
-Generate the model-shard uGDS map on the target Linux box after materialization, while the model filesystem is still mounted:
+After `prepare`, bind only the verified, now-unmounted model NVMe controller and run the complete public-path smoke:
 
 ```sh
-BLOK_MODEL=/path/to/manifest.blok \
-BLOK_UGDS_DEVICE=/dev/ugds_drv0 \
-BLOK_KV_UGDS_BASE=<scratch_byte_offset> \
-BLOK_KV_UGDS_BYTES=<scratch_bytes> \
-BLOK_UGDS_MAP=/path/to/ugds-map.blok \
-BLOK_UGDS_ENV_OUTPUT=/path/to/ugds.env \
-just ugds-layout
+sub_dir/uGDS/scripts/env_switch.sh ugds <verified-pci-slot>
+scripts/target_v0.sh run
 ```
 
-If the model files live on a partition but `/dev/ugds_drv0` is bound to the whole NVMe namespace, set
-`BLOK_UGDS_PHYSICAL_OFFSET_ADD=<partition_start_bytes>` so FIEMAP physical offsets match the uGDS device.
-After the map is generated, unmount the model filesystem and bind the NVMe device to uGDS before running the smoke.
+Success is `{"status": "ok", "text": "paris"}`. Never use filesystem free space for raw KV writes, and regenerate the uGDS map after any shard movement or rewrite.

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-import base64, json, os, re, shutil, struct, subprocess, sys, time
+import base64, json, os, re, struct, subprocess, sys
 from pathlib import Path
 
 MODELS = {"kimi-k2.6": ("moonshotai/Kimi-K2.6", "7eb5002f6aadc958aed6a9177b7ed26bb94011bb", 595148192736, 64)}
 UP, DOWN = ("up_proj", "gate_proj", "w1", "w3"), ("down_proj", "w2")
-DTYPE = {"BF16": "bf16", "F16": "f16", "F32": "f32", "I32": "i32", "I8": "i8", "U8": "u8"}
+DTYPE = {"BF16": "bf16", "I32": "i32"}
 
 def die(msg=None):
     if msg: print(msg, file=sys.stderr)
-    print(f"usage: {Path(sys.argv[0]).name} kimi-k2.6 {{status|state|fetch|detach|layout|materialize}}", file=sys.stderr)
+    print(f"usage: {Path(sys.argv[0]).name} kimi-k2.6 {{status|fetch|materialize}}", file=sys.stderr)
     raise SystemExit(64 if msg is None else 1)
 
 def js(x): return json.dumps(x, separators=(",", ":"))
@@ -19,11 +19,12 @@ def ctx(model):
     if model not in MODELS: die(f"unknown model: {model}")
     repo, rev, size, shards = MODELS[model]
     home = Path(os.getenv("BLOK_HOME", Path.home() / ".blok"))
+    local_hf = Path(__file__).parents[1] / ".venv/bin/hf"
     root = Path(os.getenv("BLOK_MODEL_ROOT", home / "models")) / repo
     meta = Path(os.getenv("BLOK_META_ROOT", home / "metadata")) / repo
     return {"model": model, "repo": repo, "revision": rev, "expected_bytes": size, "expected_safetensors": shards,
             "local_dir": root / "source/hf" / rev, "meta_dir": meta, "cache_dir": home / "hf-cache",
-            "hf": os.getenv("BLOK_HF_BIN", "hf")}
+            "hf": os.getenv("BLOK_HF_BIN", str(local_hf) if local_hf.is_file() else "hf")}
 
 def files(c):
     root = c["local_dir"]
@@ -42,22 +43,6 @@ def status(c):
         "complete": [p.name for p in shards] == expected and indexed_bytes == c["expected_bytes"],
     }
 
-def partial(c):
-    root = c["local_dir"] / ".cache/huggingface/download"
-    ps = list(root.rglob("*.incomplete")) if root.is_dir() else []
-    return {"partial_files": len(ps), "partial_bytes": sum(p.stat().st_size for p in ps)}
-
-def tree_bytes(c):
-    return sum(p.stat().st_size for p in c["local_dir"].rglob("*") if p.is_file()) if c["local_dir"].is_dir() else 0
-
-def state(c):
-    a = status(c) | partial(c) | {"tree_bytes": tree_bytes(c)}
-    time.sleep(int(os.getenv("BLOK_STATE_WAIT", "10")))
-    b = status(c) | partial(c) | {"tree_bytes": tree_bytes(c)}
-    b["tree_byte_delta"] = b["tree_bytes"] - a["tree_bytes"]
-    b["partial_byte_delta"] = b["partial_bytes"] - a["partial_bytes"]
-    return b
-
 def hf_env(c):
     env = os.environ.copy()
     token = env.pop("BLOK_HF_TOKEN", "")
@@ -74,8 +59,6 @@ def fetch(c):
     if token: cmd += ["--token", token]
     rc = subprocess.run(cmd, env=env).returncode
     if rc: raise SystemExit(rc)
-    c["meta_dir"].mkdir(parents=True, exist_ok=True)
-    (c["meta_dir"] / "fetch-status.json").write_text(js(status(c)) + "\n")
 
 def role(name):
     if name.endswith(".mlp.gate.weight") or name.endswith(".mlp.gate.e_score_correction_bias"):
@@ -92,7 +75,8 @@ def runtime_slot(name):
     m = re.search(r"\.experts?\.(\d+)\.", name)
     expert = int(m.group(1)) if m else -1
     suffix = name.rsplit(".", 1)[-1]
-    leaf = name.rsplit(".", 2)[-2] if suffix in ("weight", "weight_packed", "weight_scale", "weight_shape") else suffix
+    leaf = name.rsplit(".", 2)[-2] if suffix == "weight" else suffix
+    if suffix.startswith("weight_"): leaf = name.rsplit(".", 2)[-2] + "." + suffix
     return layer, expert, leaf
 
 def tokenizer(c):
@@ -106,7 +90,7 @@ def tokenizer(c):
         tokens[int(rank)] = base64.b64decode(encoded)
     added = json.loads(config_file.read_text()).get("added_tokens_decoder", {})
     special = {int(i): meta["content"].encode() for i, meta in added.items()}
-    if sorted(tokens) != list(range(163584)) or set(tokens) & set(special):
+    if sorted(tokens) != list(range(163584)) or sorted(special) != list(range(163584, 163840)):
         raise SystemExit("unexpected Kimi tokenizer rank contract")
     rows = [f"tok {i} {value.hex()}" for i, value in sorted(tokens.items())]
     rows += [f"special {i} {value.hex()}" for i, value in sorted(special.items())]
@@ -120,53 +104,33 @@ def tensors(c):
         for name, meta in header.items():
             if name == "__metadata__": continue
             if not name.startswith("language_model."): continue
+            if name.endswith(".weight_shape"): continue
             if meta["dtype"] not in DTYPE: continue
             start, end = meta["data_offsets"]
             out.append((name, role(name), DTYPE[meta["dtype"]], "x".join(map(str, meta["shape"])), str(path), base + start, end - start))
     return out
 
-def layout(c):
-    ts = tensors(c)
-    by_role = {}
-    for _, r, _, _, _, _, n in ts: by_role[r] = by_role.get(r, 0) + n
-    return {"model": c["model"], "source": str(c["local_dir"]), "layout": "sidecar", "tensors": len(ts), "bytes_by_role": by_role}
-
 def materialize(c):
     s = status(c)
     if not s["complete"]: raise SystemExit(f"incomplete download: {s['safetensors']}/{s['expected_safetensors']} shards")
+    if any(x.isspace() for x in str(c["local_dir"])): raise SystemExit("model path cannot contain whitespace")
     c["meta_dir"].mkdir(parents=True, exist_ok=True)
-    lines = ["blok-manifest-v1", "architecture=hybrid", "layout=sidecar"]
     runtime = ["blok-runtime-index-v1"]
     tb = c["meta_dir"] / "tokenizer.blok"
     tb.write_text(tokenizer(c))
-    runtime.append(f"tokenizer_blok {tb}")
-    index, alignment = [], 4096
+    alignment = 4096
     for name, r, dtype, shape, file, start, size in tensors(c):
         off, end = align_down(start, alignment), align(start + size, alignment)
-        lines.append(f"tensor {name} {r} {dtype} {shape} {off} {end - off} {alignment} {file}")
         layer, expert, slot = runtime_slot(name)
         runtime.append(f"tensor {name} {r} {layer} {expert} {slot} {dtype} {shape} {off} {end - off} {alignment} {start} {size} {file}")
-        index.append({"name": name, "role": r, "dtype": dtype, "shape": shape, "file": file, "offset": off, "bytes": end - off})
-    (c["meta_dir"] / "manifest.blok").write_text("\n".join(lines) + "\n")
     (c["meta_dir"] / "runtime-index.blok").write_text("\n".join(runtime) + "\n")
-    (c["meta_dir"] / "layout-index.json").write_text(js({"schema": "blok.layout.v1", "layout": "sidecar", "tensors": index}) + "\n")
-    return {"model": c["model"], "layout": "sidecar", "tensors": len(index), "manifest": str(c["meta_dir"] / "manifest.blok")}
-
-def detach(c):
-    c["meta_dir"].mkdir(parents=True, exist_ok=True)
-    log = open(c["meta_dir"] / "fetch.log", "ab")
-    p = subprocess.Popen([sys.executable, __file__, c["model"], "fetch"], stdout=log, stderr=log, start_new_session=True)
-    (c["meta_dir"] / "fetch.pid").write_text(f"{p.pid}\n")
-    return {"model": c["model"], "pid": p.pid, "log": str(c["meta_dir"] / "fetch.log")}
+    return {"model": c["model"], "tensors": len(runtime) - 1, "index": str(c["meta_dir"] / "runtime-index.blok")}
 
 def main():
     if len(sys.argv) != 3: die()
     c, mode = ctx(sys.argv[1]), sys.argv[2]
-    if mode in ("status", "plan"): print(js(status(c)))
-    elif mode == "state": print(js(state(c)))
+    if mode == "status": print(js(status(c)))
     elif mode == "fetch": fetch(c); print(js(status(c)))
-    elif mode == "detach": print(js(detach(c)))
-    elif mode == "layout": print(js(layout(c)))
     elif mode == "materialize": print(js(materialize(c)))
     else: die(f"unknown mode: {mode}")
 

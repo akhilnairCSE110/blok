@@ -1,0 +1,4 @@
+WRN 2026-07-18T22:47:14.355 ?.2549     server_start:197: Failed to start server: operation not permitted: /var/folders/nz/wgv0tf2d1s97zw1q3qnpn_t40000gn/T/nvim.akhil/LWt9Bs/nvim.2549.0
+WRN 2026-07-18T22:47:25.832 ?.2554     server_start:197: Failed to start server: operation not permitted: /var/folders/nz/wgv0tf2d1s97zw1q3qnpn_t40000gn/T/nvim.akhil/cdy0J3/nvim.2554.0
+WRN 2026-07-18T22:47:33.469 ui.2552    tui_stop:658: TUI: timed out waiting for DA1 response
+WRN 2026-07-18T22:47:49.039 ?.2635     server_start:197: Failed to start server: operation not permitted: /var/folders/nz/wgv0tf2d1s97zw1q3qnpn_t40000gn/T/nvim.akhil/OK7HnR/nvim.2635.0

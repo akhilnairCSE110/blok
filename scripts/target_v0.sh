@@ -8,7 +8,7 @@ revision=7eb5002f6aadc958aed6a9177b7ed26bb94011bb
 blok_home="${BLOK_HOME:-$HOME/.blok}"
 model_root="${BLOK_MODEL_ROOT:-$blok_home/models}/moonshotai/Kimi-K2.6"
 model_dir="$model_root/source/hf/$revision"
-manifest="${BLOK_META_ROOT:-$blok_home/metadata}/moonshotai/Kimi-K2.6/manifest.blok"
+index="${BLOK_META_ROOT:-$blok_home/metadata}/moonshotai/Kimi-K2.6/runtime-index.blok"
 env_file="${BLOK_UGDS_ENV_OUTPUT:-$repo_root/ugds.env}"
 
 require_linux() {
@@ -30,20 +30,20 @@ prepare() {
   require_linux
   require_source
   scripts/model_fetch.py kimi-k2.6 materialize
-  scripts/check_kimi_contract.py "$manifest"
-  .venv/bin/python scripts/check_kimi_tokenizer.py "$(dirname "$manifest")/tokenizer.blok"
-  test "$(stat -c %d "$model_dir")" != "$(stat -c %d "$(dirname "$manifest")")" || {
+  .venv/bin/python -m scripts.check_kimi_contract "$index"
+  test "$(stat -c %d "$model_dir")" != "$(stat -c %d "$(dirname "$index")")" || {
     echo "model payload and Blok metadata must be on different filesystems before uGDS unbind" >&2
     exit 1
   }
   test -n "${BLOK_KV_UGDS_BASE:-}" || { echo "set BLOK_KV_UGDS_BASE" >&2; exit 1; }
   test -n "${BLOK_KV_UGDS_BYTES:-}" || { echo "set BLOK_KV_UGDS_BYTES" >&2; exit 1; }
-  BLOK_MODEL="$manifest" BLOK_UGDS_ENV_OUTPUT="$env_file" scripts/ci.sh ugds-layout
+  layout_args=("$index" --output "${BLOK_UGDS_MAP:?set BLOK_UGDS_MAP}" --env-output "$env_file")
+  test -z "${BLOK_UGDS_PHYSICAL_OFFSET_ADD:-}" || layout_args+=(--physical-offset-add "$BLOK_UGDS_PHYSICAL_OFFSET_ADD")
+  .venv/bin/python scripts/plan_ugds_layout.py "${layout_args[@]}"
   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
   cmake --build build --target blok-kimi-exec
-  cargo build --release --locked
   make -C sub_dir/uGDS/drv
-  echo "prepared: $manifest"
+  echo "prepared: $index"
   echo "next: unmount the model filesystem, bind its NVMe controller to uGDS, then run: scripts/target_v0.sh run"
 }
 
@@ -54,11 +54,10 @@ run() {
   # shellcheck source=/dev/null
   source "$env_file"
   export BLOK_KIMI_EXEC_BIN="$repo_root/build/blok-kimi-exec"
-  export BLOK_BIN="$repo_root/target/release/blok"
-  export BLOK_MODEL="$manifest"
+  export BLOK_MODEL="$index"
   scripts/check_hardware.sh
-  scripts/check_kimi_contract.py "$manifest"
-  .venv/bin/python scripts/smoke_kimi.py "$manifest"
+  .venv/bin/python -m scripts.check_kimi_contract "$index"
+  .venv/bin/python -m scripts.smoke_kimi "$index"
 }
 
 case "${1:-}" in

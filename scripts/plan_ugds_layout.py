@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import fcntl
-import json
 import os
 import struct
 import sys
@@ -56,12 +55,9 @@ def parse_u64(value: str, name: str) -> int:
 
 def runtime_path(arg: str) -> Path:
     p = Path(arg).expanduser().resolve()
-    if p.is_file():
-        p = p.parent
-    for q in (p / "runtime-index.blok", p / "blok" / "runtime-index.blok", p / "meta" / "runtime-index.blok"):
-        if q.is_file():
-            return q
-    die(f"missing runtime-index.blok under {arg}")
+    if p.is_dir(): p /= "runtime-index.blok"
+    if p.is_file() and p.name == "runtime-index.blok": return p
+    die(f"missing runtime-index.blok: {p}")
 
 
 def read_required_ranges(path: Path, block_size: int) -> dict[Path, list[tuple[int, int]]]:
@@ -70,9 +66,9 @@ def read_required_ranges(path: Path, block_size: int) -> dict[Path, list[tuple[i
         if not line.startswith("tensor "):
             continue
         parts = line.split()
-        if len(parts) < 15:
+        if len(parts) != 14:
             die(f"bad tensor line in {path}: {line}")
-        off, size, file_name = int(parts[8]), int(parts[9]), parts[14]
+        off, size, file_name = int(parts[8]), int(parts[9]), parts[13]
         start, end = align_down(off, block_size), align_up(off + size, block_size)
         by_file.setdefault(Path(file_name).expanduser().resolve(), []).append((start, end))
     if not by_file:
@@ -162,11 +158,11 @@ def validate_no_overlap(model_extents: list[tuple[str, int, int]], kv_base: int,
             die(f"KV scratch overlaps model extent for {file}: device {device}:{device + length}")
 
 
-def write_map(path: Path, device: str, block_size: int, kv_base: int, kv_bytes: int, mappings: dict[Path, list[tuple[int, int, int]]]) -> None:
+def write_map(path: Path, device: str, kv_base: int, kv_bytes: int, mappings: dict[Path, list[tuple[int, int, int]]]) -> None:
     lines = [
         "blok-ugds-map-v1",
         f"device {device}",
-        f"block_size {block_size}",
+        "block_size 4096",
         f"kv_scratch {kv_base} {kv_bytes}",
     ]
     for file in sorted(mappings):
@@ -198,30 +194,26 @@ def main() -> None:
             "Run this while the model filesystem is mounted, then unmount and bind the NVMe device to uGDS before raw reads."
         )
     )
-    parser.add_argument("model", help="manifest.blok, runtime-index.blok, or model directory")
+    parser.add_argument("model", help="runtime-index.blok or metadata directory")
     parser.add_argument("--output", default=os.getenv("BLOK_UGDS_MAP", "ugds-map.blok"))
     parser.add_argument("--env-output", default=None, help="optional shell exports file")
-    parser.add_argument("--json-output", default=None, help="optional machine-readable plan")
     parser.add_argument("--device", default=os.getenv("BLOK_UGDS_DEVICE", "/dev/ugds_drv0"))
     parser.add_argument("--kv-base", default=os.getenv("BLOK_KV_UGDS_BASE"))
     parser.add_argument("--kv-bytes", default=os.getenv("BLOK_KV_UGDS_BYTES"))
     parser.add_argument("--physical-offset-add", default="0", help="bytes to add to FIEMAP physical offsets, e.g. partition start")
-    parser.add_argument("--block-size", type=int, default=4096)
     parser.add_argument("--max-extents", type=int, default=262144)
     args = parser.parse_args()
 
     if args.kv_base is None or args.kv_bytes is None:
         die("set --kv-base and --kv-bytes, or BLOK_KV_UGDS_BASE and BLOK_KV_UGDS_BYTES")
-    if args.block_size <= 0 or args.block_size & (args.block_size - 1):
-        die("--block-size must be a positive power of two")
     kv_base = parse_u64(args.kv_base, "--kv-base")
     kv_bytes = parse_u64(args.kv_bytes, "--kv-bytes")
     physical_offset_add = parse_u64(args.physical_offset_add, "--physical-offset-add")
-    if kv_base % args.block_size or kv_bytes % args.block_size:
+    if kv_base % 4096 or kv_bytes % 4096:
         die("KV scratch base and bytes must be block aligned")
 
     rt = runtime_path(args.model)
-    required = read_required_ranges(rt, args.block_size)
+    required = read_required_ranges(rt, 4096)
     mappings: dict[Path, list[tuple[int, int, int]]] = {}
     model_extents: list[tuple[str, int, int]] = []
     for file, ranges in required.items():
@@ -230,27 +222,15 @@ def main() -> None:
         extents = fiemap(file, args.max_extents)
         if not extents:
             die(f"FIEMAP returned no extents for {file}")
-        mapped = intersect_extents(file, ranges, extents, physical_offset_add, args.block_size)
+        mapped = intersect_extents(file, ranges, extents, physical_offset_add, 4096)
         mappings[file] = mapped
         model_extents.extend((str(file), device, length) for _, length, device in mapped)
 
     validate_no_overlap(model_extents, kv_base, kv_bytes)
     out = Path(args.output).expanduser().resolve()
-    write_map(out, args.device, args.block_size, kv_base, kv_bytes, mappings)
+    write_map(out, args.device, kv_base, kv_bytes, mappings)
     if args.env_output:
         write_env(Path(args.env_output).expanduser().resolve(), args.device, out, kv_base, kv_bytes)
-    if args.json_output:
-        plan = {
-            "schema": "blok.ugds.layout.v1",
-            "runtime_index": str(rt),
-            "map": str(out),
-            "device": args.device,
-            "block_size": args.block_size,
-            "kv_scratch": {"base": kv_base, "bytes": kv_bytes},
-            "model_extent_count": len(model_extents),
-            "model_bytes": sum(length for _, _, length in model_extents),
-        }
-        Path(args.json_output).expanduser().resolve().write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n")
     print(f"ok: wrote {out} with {len(model_extents)} extents")
 
 

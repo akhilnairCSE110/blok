@@ -9,19 +9,8 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_ARCHITECTURES 120)
 
 add_executable(blok-kimi-exec src/kimi_exec.cu)
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sub_dir/uGDS/CMakeLists.txt")
-  add_subdirectory(sub_dir/uGDS EXCLUDE_FROM_ALL)
-  target_link_libraries(blok-kimi-exec PRIVATE ugds)
-  target_compile_definitions(blok-kimi-exec PRIVATE BLOK_HAVE_UGDS=1)
-else()
-  find_path(UGDS_INCLUDE_DIR ugds.h)
-  find_library(UGDS_LIBRARY ugds)
-  if(UGDS_INCLUDE_DIR AND UGDS_LIBRARY)
-    target_include_directories(blok-kimi-exec PRIVATE ${UGDS_INCLUDE_DIR})
-    target_link_libraries(blok-kimi-exec PRIVATE ${UGDS_LIBRARY})
-    target_compile_definitions(blok-kimi-exec PRIVATE BLOK_HAVE_UGDS=1)
-  endif()
-endif()
+add_subdirectory(sub_dir/uGDS EXCLUDE_FROM_ALL)
+target_link_libraries(blok-kimi-exec PRIVATE ugds)
 target_compile_options(blok-kimi-exec PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Wpedantic,-Werror;--Werror=all-warnings;-Xptxas=-O3,-v>
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Wpedantic,-Werror;-Xptxas=-O3,-v>
   $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic;-Werror>)

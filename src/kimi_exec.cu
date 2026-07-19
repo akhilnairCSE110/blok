@@ -10,20 +10,16 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
-#ifdef BLOK_HAVE_UGDS
 #include <ugds.h>
-#else
-#error "blok-kimi-exec requires uGDS; host-bounced fallback paths are intentionally disabled"
-#endif
 
 void ck(cudaError_t e, const char *m);
 [[noreturn]] void die(const std::string &m);
@@ -35,18 +31,16 @@ struct Tensor {
 };
 
 struct Args {
-  std::string manifest, prompt, prompt_tokens;
-  std::uint64_t tokens = 0, topk = 8;
+  std::string index, prompt_tokens;
+  std::uint64_t tokens = 0;
 };
 
 struct RuntimeIndex {
-  std::string tokenizer_blok;
-  std::vector<Tensor> tensors;
+  std::unordered_map<std::string, Tensor> tensors;
 };
 
 struct Generation {
-  std::string text;
-  std::uint64_t tokens = 0;
+  std::vector<std::uint32_t> ids;
 };
 
 struct FileExtent {
@@ -54,7 +48,6 @@ struct FileExtent {
 };
 
 struct Io {
-  std::unordered_map<std::string, std::uint64_t> legacy_base;
   std::unordered_map<std::string, std::vector<FileExtent>> file_extents;
   std::string map_device;
   bool has_kv_scratch = false;
@@ -74,12 +67,18 @@ struct Io {
     std::ifstream in(map);
     if (!in) die("open BLOK_UGDS_MAP failed");
     std::string line;
+    bool header = false;
     while (std::getline(in, line)) {
       if (line.empty() || line[0] == '#') continue;
       std::istringstream ss(line);
       std::string tag, file;
       if (!(ss >> tag)) continue;
-      if (tag == "blok-ugds-map-v1" || tag == "block_size") continue;
+      if (tag == "blok-ugds-map-v1") { header = true; continue; }
+      if (tag == "block_size") {
+        std::uint64_t size;
+        if (!(ss >> size) || size != 4096) die("BLOK_UGDS_MAP block size must be 4096");
+        continue;
+      }
       if (tag == "device") {
         if (!(ss >> map_device)) die("bad BLOK_UGDS_MAP device line");
         continue;
@@ -95,14 +94,12 @@ struct Io {
         if (e.bytes == 0 || e.device % 4096 != 0 || e.logical % 4096 != 0 || e.bytes % 4096 != 0)
           die("BLOK_UGDS_MAP extents must be non-empty and 4096-byte aligned");
         file_extents[file].push_back(e);
-      } else {
-        std::uint64_t off;
-        if (!(ss >> off)) die("bad legacy BLOK_UGDS_MAP line");
-        legacy_base[tag] = off;
-      }
+      } else die("unknown BLOK_UGDS_MAP line: " + tag);
     }
-    if (file_extents.empty() && legacy_base.empty()) die("BLOK_UGDS_MAP contains no model file mappings");
-    if (!map_device.empty() && map_device != dev) die("BLOK_UGDS_DEVICE does not match BLOK_UGDS_MAP device");
+    if (!header || map_device.empty() || !has_kv_scratch || file_extents.empty())
+      die("BLOK_UGDS_MAP is incomplete");
+    if (!kv_bytes || kv_base % 4096 || kv_bytes % 4096) die("BLOK_UGDS_MAP has invalid KV scratch");
+    if (map_device != dev) die("BLOK_UGDS_DEVICE does not match BLOK_UGDS_MAP device");
   }
   ~Io() {
     if (fh) uGDSHandleDeregister(fh);
@@ -115,12 +112,6 @@ struct Io {
   void read_file_range(const std::string &file, std::uint64_t logical, std::uint64_t bytes, void *dst) {
     if (bytes == 0) return;
     if (logical % 4096 != 0 || bytes % 4096 != 0) die("uGDS reads must be 4096-byte aligned");
-    auto legacy = legacy_base.find(file);
-    if (legacy != legacy_base.end()) {
-      ssize_t n = uGDSRead(fh, dst, bytes, (off_t)(legacy->second + logical), 0);
-      if (n != (ssize_t)bytes) die("short legacy uGDS read");
-      return;
-    }
     auto found = file_extents.find(file);
     if (found == file_extents.end()) die("missing uGDS map entry: " + file);
     std::uint64_t done = 0;
@@ -141,12 +132,6 @@ struct Io {
       done += chunk;
     }
   }
-};
-
-struct Tokenizer {
-  std::unordered_map<std::string, std::uint32_t> ids;
-  std::unordered_map<std::string, std::uint32_t> special;
-  std::unordered_map<std::uint32_t, std::string> text;
 };
 
 struct DeviceTensor {
@@ -171,7 +156,6 @@ struct DeviceTensor {
     bytes = n;
   }
   __nv_bfloat16 *bf16() const { return reinterpret_cast<__nv_bfloat16 *>(static_cast<char *>(base) + skip); }
-  float *f32() const { return reinterpret_cast<float *>(static_cast<char *>(base) + skip); }
   std::uint32_t *u32() const { return reinterpret_cast<std::uint32_t *>(static_cast<char *>(base) + skip); }
 };
 
@@ -193,6 +177,7 @@ constexpr int LAYERS = 61, FIRST_DENSE = 1;
 constexpr int HIDDEN = 7168, HEADS = 64, QK_NOPE = 128, QK_ROPE = 64, V_HEAD = 128;
 constexpr int Q_RANK = 1536, KV_RANK = 512, KV_A = 576, EXPERTS = 384, TOPK = 8;
 constexpr int DENSE = 18432, MOE = 2048, SHARED = 2048, VOCAB = 163840;
+constexpr std::uint64_t MAX_CONTEXT = 262144;
 constexpr int I4_GROUP = 32, I4_PER_WORD = 8, QK_HEAD = QK_NOPE + QK_ROPE, K_DIM = HEADS * QK_HEAD, V_DIM = HEADS * V_HEAD;
 constexpr int HEAD_TILE = 256, EXPERT_TILE = 64, HIDDEN_TILE = 64, KV_TILE = 64;
 constexpr float RMS_EPS = 1.0e-5f, ROPE_THETA = 50000.0f, ROUTED_SCALE = 2.827f;
@@ -210,17 +195,15 @@ struct KvCache {
   Buf kt, vt, score, hmax, hsum;
   Io &io;
   KvCache(Io &io_ref, std::uint64_t seq, int tile) : k_layer_bytes(seq * K_DIM * sizeof(float)), v_layer_bytes(seq * V_DIM * sizeof(float)), io(io_ref) {
-    const char *base = std::getenv("BLOK_KV_UGDS_BASE");
-    if (!base) die("BLOK_KV_UGDS_BASE is required for uGDS-backed KV cache");
+    const char *base = std::getenv("BLOK_KV_UGDS_BASE"), *cap = std::getenv("BLOK_KV_UGDS_BYTES");
+    if (!base || !cap) die("BLOK_KV_UGDS_BASE and BLOK_KV_UGDS_BYTES are required");
     ugds_base = u64(base, "BLOK_KV_UGDS_BASE");
     std::string lock_path = std::string("/tmp/blok-kv-") + std::to_string(ugds_base) + ".lock";
     lock_fd = open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
     if (lock_fd < 0 || flock(lock_fd, LOCK_EX | LOCK_NB) != 0) die("KV uGDS region is already reserved: " + lock_path);
-    if (const char *cap = std::getenv("BLOK_KV_UGDS_BYTES")) {
-      if (LAYERS * (k_layer_bytes + v_layer_bytes) > u64(cap, "BLOK_KV_UGDS_BYTES")) die("BLOK_KV_UGDS_BYTES is too small for requested KV schedule");
-      if (io.has_kv_scratch && u64(cap, "BLOK_KV_UGDS_BYTES") != io.kv_bytes) die("BLOK_KV_UGDS_BYTES does not match BLOK_UGDS_MAP kv_scratch");
-    }
-    if (io.has_kv_scratch && ugds_base != io.kv_base) die("BLOK_KV_UGDS_BASE does not match BLOK_UGDS_MAP kv_scratch");
+    std::uint64_t capacity = u64(cap, "BLOK_KV_UGDS_BYTES");
+    if (LAYERS * (k_layer_bytes + v_layer_bytes) > capacity) die("BLOK_KV_UGDS_BYTES is too small for requested KV schedule");
+    if (capacity != io.kv_bytes || ugds_base != io.kv_base) die("KV environment does not match BLOK_UGDS_MAP");
     kt.make((std::uint64_t)tile * K_DIM); vt.make((std::uint64_t)tile * V_DIM); score.make((std::uint64_t)HEADS * tile);
     hmax.make(HEADS); hsum.make(HEADS);
   }
@@ -232,6 +215,7 @@ struct KvCache {
            (std::uint64_t)pos * (value ? V_DIM : K_DIM) * sizeof(float);
   }
   void store(int layer, int pos, const float *kp, const float *vp) {
+    ck(cudaDeviceSynchronize(), "sync before KV write");
     Io::ug(uGDSBufRegister(kp, K_DIM * sizeof(float), 0), "uGDSBufRegister KV K");
     ssize_t nk = uGDSWrite(io.fh, kp, K_DIM * sizeof(float), (off_t)off(layer, false, pos), 0);
     Io::ug(uGDSBufDeregister(kp), "uGDSBufDeregister KV K");
@@ -242,6 +226,7 @@ struct KvCache {
     if (nv != (ssize_t)(V_DIM * sizeof(float))) die("short uGDS KV V write");
   }
   void load_tile(int layer, bool value, int start, int n) {
+    ck(cudaDeviceSynchronize(), "sync before KV read");
     int dim = value ? V_DIM : K_DIM;
     float *dst = value ? vt.p : kt.p;
     std::uint64_t bytes = (std::uint64_t)n * dim * sizeof(float);
@@ -267,7 +252,7 @@ __global__ void add_k(float *a, const float *b, int n) {
 
 __global__ void silu_mul_k(const float *a, const float *b, float *y, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) y[i] = bf(a[i] * (1.0f / (1.0f + expf(-a[i]))) * b[i]);
+  if (i < n) y[i] = bf(bf(a[i] / (1.0f + expf(-a[i]))) * b[i]);
 }
 
 __global__ void rmsnorm_k(const float *x, const __nv_bfloat16 *w, float *y, int n) {
@@ -281,7 +266,7 @@ __global__ void rmsnorm_k(const float *x, const __nv_bfloat16 *w, float *y, int 
     __syncthreads();
   }
   float scale = rsqrtf(s[0] / n + RMS_EPS);
-  for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = bf(x[i] * scale * bf(w + i));
+  for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = bf(bf(x[i] * scale) * bf(w + i));
 }
 
 __global__ void matvec_bf16_k(const __nv_bfloat16 *w, const float *x, float *y, int rows, int cols) {
@@ -298,6 +283,20 @@ __global__ void matvec_bf16_k(const __nv_bfloat16 *w, const float *x, float *y, 
   if (threadIdx.x == 0 && r < rows) y[r] = bf(s[0]);
 }
 
+__global__ void matvec_bf16_f32_k(const __nv_bfloat16 *w, const float *x, float *y, int cols) {
+  __shared__ float s[256];
+  int r = blockIdx.x;
+  float v = 0;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) v += bf(w + (unsigned long long)r * cols + c) * x[c];
+  s[threadIdx.x] = v;
+  __syncthreads();
+  for (int d = 128; d; d >>= 1) {
+    if (threadIdx.x < d) s[threadIdx.x] += s[threadIdx.x + d];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) y[r] = s[0];
+}
+
 __global__ void matvec_i4_bf16_scale_k(const std::uint32_t *w, const __nv_bfloat16 *scale, const float *x, float *y, int rows, int cols) {
   __shared__ float s[256];
   int r = blockIdx.x;
@@ -310,32 +309,7 @@ __global__ void matvec_i4_bf16_scale_k(const std::uint32_t *w, const __nv_bfloat
       std::uint32_t word = w[(unsigned long long)r * packed_cols + g * (I4_GROUP / I4_PER_WORD) + p];
       for (int lane = 0; lane < I4_PER_WORD; ++lane) {
         int q = (int)((word >> (4 * lane)) & 0xf) - 8;
-        v += x[base + p * I4_PER_WORD + lane] * ((float)q * sc);
-      }
-    }
-  }
-  s[threadIdx.x] = v;
-  __syncthreads();
-  for (int d = 128; d; d >>= 1) {
-    if (threadIdx.x < d) s[threadIdx.x] += s[threadIdx.x + d];
-    __syncthreads();
-  }
-  if (threadIdx.x == 0 && r < rows) y[r] = bf(s[0]);
-}
-
-__global__ void matvec_i4_f32_scale_k(const std::uint32_t *w, const float *scale, const float *x, float *y, int rows, int cols) {
-  __shared__ float s[256];
-  int r = blockIdx.x;
-  float v = 0;
-  int groups = cols / I4_GROUP, packed_cols = cols / I4_PER_WORD;
-  for (int g = threadIdx.x; g < groups; g += blockDim.x) {
-    float sc = scale[(unsigned long long)r * groups + g];
-    int base = g * I4_GROUP;
-    for (int p = 0; p < I4_GROUP / I4_PER_WORD; ++p) {
-      std::uint32_t word = w[(unsigned long long)r * packed_cols + g * (I4_GROUP / I4_PER_WORD) + p];
-      for (int lane = 0; lane < I4_PER_WORD; ++lane) {
-        int q = (int)((word >> (4 * lane)) & 0xf) - 8;
-        v += x[base + p * I4_PER_WORD + lane] * ((float)q * sc);
+        v += x[base + p * I4_PER_WORD + lane] * bf((float)q * sc);
       }
     }
   }
@@ -374,12 +348,12 @@ __global__ void rope_k(const float *q, const float *k, float *qr, float *kr, int
   int rotary_pairs = heads * rotary / 2;
   if (i >= rotary_pairs) return;
   int half = rotary / 2, h = i / half, p = i % half, base = h * stride + QK_NOPE;
-  float freq = yarn_inv_freq(p, rotary), c = cosf(pos * freq), s = sinf(pos * freq);
+  float freq = yarn_inv_freq(p, rotary), c = bf(cosf(pos * freq)), s = bf(sinf(pos * freq));
   float q0 = q[base + p * 2], q1 = q[base + p * 2 + 1], k0 = k[base + p * 2], k1 = k[base + p * 2 + 1];
-  qr[base + p] = q0 * c - q1 * s;
-  qr[base + half + p] = q1 * c + q0 * s;
-  kr[base + p] = k0 * c - k1 * s;
-  kr[base + half + p] = k1 * c + k0 * s;
+  qr[base + p] = bf(bf(q0 * c) - bf(q1 * s));
+  qr[base + half + p] = bf(bf(q1 * c) + bf(q0 * s));
+  kr[base + p] = bf(bf(k0 * c) - bf(k1 * s));
+  kr[base + half + p] = bf(bf(k1 * c) + bf(k0 * s));
 }
 
 __global__ void k_rope_fill_k(float *k, const float *rope) {
@@ -400,14 +374,9 @@ __global__ void add_bf16_k(float *x, const __nv_bfloat16 *b, int n) {
   if (i < n) x[i] += bf(b + i);
 }
 
-__global__ void add_f32_k(float *x, const float *b, int n) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) x[i] += b[i];
-}
-
 __global__ void sigmoid_k(float *x, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) x[i] = bf(1.0f / (1.0f + expf(-x[i])));
+  if (i < n) x[i] = 1.0f / (1.0f + expf(-x[i]));
 }
 
 __global__ void router_topk_k(const float *score, const float *select_score, std::uint16_t *expert, float *weight) {
@@ -422,14 +391,19 @@ __global__ void router_topk_k(const float *score, const float *select_score, std
     int id = 0;
     float best = -CUDART_INF_F;
     for (int i = 0; i < EXPERTS; ++i) if (s[i] > best) best = s[i], id = i;
-    expert[k] = (std::uint16_t)id; weight[k] = score[id]; sum += score[id]; s[id] = -1;
+    expert[k] = (std::uint16_t)id; weight[k] = score[id]; sum += score[id]; s[id] = -CUDART_INF_F;
   }
-  for (int k = 0; k < TOPK; ++k) weight[k] = weight[k] / sum * ROUTED_SCALE;
+  for (int k = 0; k < TOPK; ++k) weight[k] = weight[k] / (sum + 1.0e-20f) * ROUTED_SCALE;
 }
 
 __global__ void expert_accum_k(const float *y, const float *w, int slot, float *out, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) out[i] = bf(out[i] + y[i] * w[slot]);
+  if (i < n) out[i] += y[i] * w[slot];
+}
+
+__global__ void round_bf16_k(float *x, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) x[i] = bf(x[i]);
 }
 
 __global__ void fill_k(float *x, float v, int n) {
@@ -470,22 +444,34 @@ __global__ void attn_tile_max_k(const float *score, float *mx, int n) {
   if (!threadIdx.x) mx[h] = fmaxf(mx[h], s[0]);
 }
 
-__global__ void attn_tile_accum_k(const float *score, const float *v, const float *mx, float *sum, float *out, int n) {
-  int h = blockIdx.x, d = blockIdx.y * blockDim.x + threadIdx.x;
-  if (d >= V_HEAD) return;
-  float acc = 0, s = 0, m = mx[h];
-  for (int t = 0; t < n; ++t) {
-    float p = expf(score[h * n + t] - m);
-    acc += p * v[(unsigned long long)t * V_DIM + h * V_HEAD + d];
-    if (d == 0) s += p;
+__global__ void attn_tile_sum_k(const float *score, const float *mx, float *sum, int n) {
+  __shared__ float s[256];
+  int h = blockIdx.x;
+  float value = 0;
+  for (int t = threadIdx.x; t < n; t += blockDim.x) value += expf(score[h * n + t] - mx[h]);
+  s[threadIdx.x] = value;
+  __syncthreads();
+  for (int d = 128; d; d >>= 1) {
+    if (threadIdx.x < d) s[threadIdx.x] += s[threadIdx.x + d];
+    __syncthreads();
   }
-  out[h * V_HEAD + d] += acc;
-  if (d == 0) atomicAdd(sum + h, s);
+  if (!threadIdx.x) sum[h] += s[0];
 }
 
-__global__ void attn_finish_k(float *out, const float *sum) {
+__global__ void attn_tile_accum_k(const float *score, const float *v, const float *mx, const float *sum, float *out, int n) {
+  int h = blockIdx.x, d = blockIdx.y * blockDim.x + threadIdx.x;
+  if (d >= V_HEAD) return;
+  float acc = 0, m = mx[h];
+  for (int t = 0; t < n; ++t) {
+    float p = bf(expf(score[h * n + t] - m) / sum[h]);
+    acc += p * v[(unsigned long long)t * V_DIM + h * V_HEAD + d];
+  }
+  out[h * V_HEAD + d] += acc;
+}
+
+__global__ void attn_finish_k(float *out) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < V_DIM) out[i] = bf(out[i] / sum[i / V_HEAD]);
+  if (i < V_DIM) out[i] = bf(out[i]);
 }
 
 __global__ void argmax_k(const float *x, std::uint32_t *id, int n) {
@@ -543,89 +529,18 @@ int shape_dim(const Tensor &t, int dim) {
   }
 }
 
-std::string hex(const std::string &s) {
-  std::string o;
-  for (std::size_t i = 0; i + 1 < s.size(); i += 2) o.push_back((char)std::strtoul(s.substr(i, 2).c_str(), nullptr, 16));
-  return o;
-}
-
 Args args(int argc, char **argv) {
   Args a;
   for (int i = 1; i < argc; i += 2) {
-    if (i + 1 >= argc) die("usage: blok-kimi-exec --manifest m --prompt p --tokens n --router-top-k 8");
+    if (i + 1 >= argc) die("usage: blok-kimi-exec --index runtime-index.blok --prompt-tokens ids --tokens n");
     std::string f = argv[i];
-    if (f == "--manifest") a.manifest = argv[i + 1];
-    else if (f == "--prompt") a.prompt = argv[i + 1];
+    if (f == "--index") a.index = argv[i + 1];
     else if (f == "--prompt-tokens") a.prompt_tokens = argv[i + 1];
     else if (f == "--tokens") a.tokens = u64(argv[i + 1], "tokens");
-    else if (f == "--router-top-k") a.topk = u64(argv[i + 1], "router-top-k");
     else die("unknown flag: " + f);
   }
-  if (a.manifest.empty() || (a.prompt.empty() && a.prompt_tokens.empty()) || a.tokens == 0 || a.topk != TOPK) die("bad args");
+  if (a.index.empty() || a.prompt_tokens.empty() || a.tokens == 0) die("bad args");
   return a;
-}
-
-Tokenizer tokenizer(const std::string &path) {
-  std::ifstream in(path);
-  if (!in) die("open tokenizer.blok failed: " + path);
-  Tokenizer t;
-  std::string tag, a, b;
-  in >> tag;
-  if (tag != "blok-tokenizer-v2") die("bad tokenizer.blok");
-  while (in >> tag >> a >> b) {
-    auto s = hex(b);
-    auto id = (std::uint32_t)std::stoul(a);
-    if (tag == "tok") t.ids[s] = id;
-    else if (tag == "special") t.special[s] = id;
-    else die("bad tokenizer.blok row");
-    t.text[id] = s;
-  }
-  if (t.ids.size() != 163584 || t.special.empty()) die("incomplete tokenizer");
-  return t;
-}
-
-void encode_bpe(const Tokenizer &t, const std::string &s, std::vector<std::uint32_t> &out) {
-  std::vector<std::string> pieces;
-  for (unsigned char c : s) pieces.emplace_back(1, (char)c);
-  for (;;) {
-    int at = -1;
-    std::uint32_t rank = UINT32_MAX;
-    for (int i = 0; i + 1 < (int)pieces.size(); ++i) {
-      auto m = t.ids.find(pieces[i] + pieces[i + 1]);
-      if (m != t.ids.end() && m->second < rank) rank = m->second, at = i;
-    }
-    if (at < 0) break;
-    pieces[at] += pieces[at + 1];
-    pieces.erase(pieces.begin() + at + 1);
-  }
-  for (auto &p : pieces) {
-    auto it = t.ids.find(p);
-    if (it == t.ids.end()) die("prompt contains token missing from tokenizer vocab");
-    out.push_back(it->second);
-  }
-}
-
-std::vector<std::uint32_t> encode(const Tokenizer &t, const std::string &s) {
-  std::vector<std::uint32_t> out;
-  std::size_t start = 0;
-  while (start < s.size()) {
-    std::size_t found = s.size();
-    const std::pair<const std::string, std::uint32_t> *special = nullptr;
-    for (const auto &entry : t.special) {
-      auto at = s.find(entry.first, start);
-      if (at < found) found = at, special = &entry;
-    }
-    encode_bpe(t, s.substr(start, found - start), out);
-    if (!special) break;
-    out.push_back(special->second);
-    start = found + special->first.size();
-  }
-  return out;
-}
-
-std::string chat_prompt(const std::string &prompt) {
-  return "<|im_user|>user<|im_middle|>" + prompt +
-         "<|im_end|><|im_assistant|>assistant<|im_middle|><think></think>";
 }
 
 std::vector<std::uint32_t> token_ids(const std::string &text) {
@@ -641,91 +556,57 @@ std::vector<std::uint32_t> token_ids(const std::string &text) {
   return out;
 }
 
-std::string decode(const Tokenizer &t, const std::vector<std::uint32_t> &ids) {
-  std::string out;
-  for (auto id : ids) {
-    auto it = t.text.find(id);
-    if (it == t.text.end()) die("sampled token missing from tokenizer vocab");
-    out += it->second;
-  }
-  return out;
-}
-
-RuntimeIndex runtime_index(const std::string &manifest) {
-  std::filesystem::path path = std::filesystem::path(manifest).parent_path() / "runtime-index.blok";
+RuntimeIndex runtime_index(const std::string &path) {
   std::ifstream in(path);
   if (!in) die("missing runtime-index.blok; run scripts/model_fetch.py kimi-k2.6 materialize");
   RuntimeIndex out;
   std::string line;
+  if (!std::getline(in, line) || line != "blok-runtime-index-v1") die("bad runtime index header");
   while (std::getline(in, line)) {
-    if (line.starts_with("tokenizer_blok ")) {
-      out.tokenizer_blok = line.substr(15);
-      continue;
-    }
-    if (!line.starts_with("tensor ")) continue;
+    if (!line.starts_with("tensor ")) die("bad runtime index line");
     std::istringstream ss(line);
     std::string tag, layer, expert;
     Tensor t;
-    ss >> tag >> t.name >> t.role >> layer >> expert >> t.slot >> t.dtype >> t.shape >> t.off >>
-        t.bytes >> t.align >> t.data >> t.data_bytes >> t.file;
+    if (!(ss >> tag >> t.name >> t.role >> layer >> expert >> t.slot >> t.dtype >> t.shape >> t.off >>
+          t.bytes >> t.align >> t.data >> t.data_bytes >> t.file)) die("incomplete runtime tensor line");
+    std::string extra;
+    if (ss >> extra) die("runtime tensor path cannot contain whitespace");
     t.layer = i32(layer, "layer");
     t.expert = i32(expert, "expert");
-    if (!t.file.empty()) out.tensors.push_back(t);
+    std::string key = layer + ":" + expert + ":" + t.role + ":" + t.slot;
+    if (!t.file.empty() && !out.tensors.emplace(key, std::move(t)).second) die("duplicate runtime tensor key: " + key);
   }
   if (out.tensors.empty()) die("runtime index has no file-backed tensors");
-  if (out.tokenizer_blok.empty() || !std::filesystem::is_regular_file(out.tokenizer_blok)) die("tokenizer.blok missing from runtime index");
   return out;
 }
 
-bool has_layer_slot(const std::vector<Tensor> &ts, int layer, const std::string &slot) {
-  for (const auto &t : ts)
-    if (t.layer == layer && t.slot.find(slot) != std::string::npos) return true;
-  return false;
+const Tensor &need(const RuntimeIndex &rt, int layer, const std::string &role, const std::string &slot, int expert = -1) {
+  std::string key = std::to_string(layer) + ":" + std::to_string(expert) + ":" + role + ":" + slot;
+  auto found = rt.tensors.find(key);
+  if (found == rt.tensors.end()) die("missing runtime tensor: " + key);
+  return found->second;
 }
 
-const Tensor &need_resident_name(const std::vector<Tensor> &ts, const std::string &suffix) {
-  for (const auto &t : ts)
-    if (t.role == "resident" && t.name.ends_with(suffix)) return t;
-  die("missing resident tensor: " + suffix);
-}
-
-const Tensor &need(const std::vector<Tensor> &ts, int layer, const std::string &slot, int expert = -1) {
-  for (const auto &t : ts)
-    if (t.layer == layer && t.slot.find(slot) != std::string::npos && t.name.ends_with(".weight") &&
-        (expert < 0 ? t.expert < 0 : t.expert == expert))
-      return t;
-  die("missing layer tensor: " + std::to_string(layer) + " " + slot);
-}
-
-const Tensor &need_role(const std::vector<Tensor> &ts, int layer, const std::string &role, const std::string &slot) {
-  for (const auto &t : ts)
-    if (t.layer == layer && t.role == role && t.expert < 0 && t.slot.find(slot) != std::string::npos) return t;
-  die("missing layer tensor: " + std::to_string(layer) + " " + role + " " + slot);
-}
-
-const Tensor &need_routed_weight(const std::vector<Tensor> &ts, int layer, const std::string &proj, int expert) {
-  std::string suffix = ".mlp.experts." + std::to_string(expert) + "." + proj + ".weight_packed";
-  for (const auto &t : ts)
-    if (t.layer == layer && t.role == "routed_expert" && t.expert == expert && t.name.ends_with(suffix)) return t;
-  die("missing routed expert weight: " + std::to_string(layer) + " " + proj + " expert " + std::to_string(expert));
-}
-
-const Tensor &need_routed_scale(const std::vector<Tensor> &ts, int layer, const std::string &proj, int expert) {
-  std::string suffix = ".mlp.experts." + std::to_string(expert) + "." + proj + ".weight_scale";
-  for (const auto &t : ts)
-    if (t.layer == layer && t.role == "routed_expert" && t.expert == expert && t.name.ends_with(suffix)) return t;
-  die("missing routed expert scale: " + std::to_string(layer) + " " + proj + " expert " + std::to_string(expert));
+const Tensor &bf16(const RuntimeIndex &rt, int layer, const std::string &role, const std::string &slot,
+                   int rows, int cols = 0, int expert = -1) {
+  const Tensor &t = need(rt, layer, role, slot, expert);
+  std::string shape = std::to_string(rows) + (cols ? "x" + std::to_string(cols) : "");
+  std::uint64_t bytes = (std::uint64_t)rows * (cols ? cols : 1) * sizeof(__nv_bfloat16);
+  if (t.dtype != "bf16" || t.shape != shape || t.data_bytes != bytes) die("bad bf16 tensor contract: " + t.name);
+  return t;
 }
 
 void validate_i4_pair(const Tensor &w, const Tensor &scale, int rows, int cols) {
   if (w.dtype != "i32") die("routed expert weight must be packed i32: " + w.name);
-  if (scale.dtype != "bf16" && scale.dtype != "f32") die("routed expert scale must be bf16 or f32: " + scale.name);
-  if (shape_dim(w, 0) != rows || shape_dim(w, 1) != cols / I4_PER_WORD) die("bad routed expert packed shape: " + w.name);
-  if (shape_dim(scale, 0) != rows || shape_dim(scale, 1) != cols / I4_GROUP) die("bad routed expert scale shape: " + scale.name);
+  if (scale.dtype != "bf16") die("routed expert scale must be bf16: " + scale.name);
+  if (w.shape != std::to_string(rows) + "x" + std::to_string(cols / I4_PER_WORD) ||
+      w.data_bytes != (std::uint64_t)rows * cols / I4_PER_WORD * sizeof(std::uint32_t)) die("bad routed expert packed shape: " + w.name);
+  if (scale.shape != std::to_string(rows) + "x" + std::to_string(cols / I4_GROUP) ||
+      scale.data_bytes != (std::uint64_t)rows * cols / I4_GROUP * sizeof(__nv_bfloat16)) die("bad routed expert scale shape: " + scale.name);
 }
 
 DeviceTensor load_tensor(Io &io, const Tensor &t) {
-  if (t.dtype != "bf16" && t.dtype != "f32" && t.dtype != "i32") die("only bf16, f32, and i32 tensors are executable");
+  if (t.dtype != "bf16" && t.dtype != "i32") die("only bf16 and i32 tensors are executable");
   if (t.data < t.off || t.data + t.data_bytes > t.off + t.bytes) die("tensor data range escapes aligned read");
   if (t.bytes > MAX_IO_BYTES) die("refusing oversized tensor read; use a tiled loader for " + t.name);
   DeviceTensor d;
@@ -759,7 +640,7 @@ DeviceTensor load_tensor_slice(Io &io, const Tensor &t, std::uint64_t byte_start
 
 int dtype_bytes(const Tensor &t) {
   if (t.dtype == "bf16") return sizeof(__nv_bfloat16);
-  if (t.dtype == "f32" || t.dtype == "i32") return 4;
+  if (t.dtype == "i32") return 4;
   die("unsupported sliced dtype: " + t.dtype);
 }
 
@@ -776,6 +657,14 @@ void embed_token(Io &io, const Tensor &emb, std::uint32_t id, float *x) {
 void matvec_bf16_rows(Io &io, const Tensor &w, const float *x, float *y, int row, int rows, int cols) {
   auto tile = load_rows(io, w, row, rows, cols * dtype_bytes(w));
   matvec_bf16_k<<<rows, 256>>>(tile.bf16(), x, y + row, rows, cols);
+}
+
+void matvec_bf16_f32_rows(Io &io, const Tensor &w, const float *x, float *y, int rows, int cols) {
+  for (int row = 0; row < rows; row += EXPERT_TILE) {
+    int n = std::min(EXPERT_TILE, rows - row);
+    auto tile = load_rows(io, w, row, n, cols * dtype_bytes(w));
+    matvec_bf16_f32_k<<<n, 256>>>(tile.bf16(), x, y + row, cols);
+  }
 }
 
 void matvec_bf16_all_rows(Io &io, const Tensor &w, const float *x, float *y, int rows, int cols, int tile_rows) {
@@ -796,9 +685,8 @@ void bf16_mlp(Io &io, const Tensor &gw, const Tensor &uw, const Tensor &dw, cons
   }
 }
 
-void matvec_i4_slice(const Tensor &smeta, const DeviceTensor &w, const DeviceTensor &scale, const float *x, float *y, int rows, int cols) {
-  if (smeta.dtype == "f32") matvec_i4_f32_scale_k<<<rows, 256>>>(w.u32(), scale.f32(), x, y, rows, cols);
-  else matvec_i4_bf16_scale_k<<<rows, 256>>>(w.u32(), scale.bf16(), x, y, rows, cols);
+void matvec_i4_slice(const DeviceTensor &w, const DeviceTensor &scale, const float *x, float *y, int rows, int cols) {
+  matvec_i4_bf16_scale_k<<<rows, 256>>>(w.u32(), scale.bf16(), x, y, rows, cols);
 }
 
 void tiled_attention(KvCache &kv, int layer, int seq, int tile, const float *q, float *out) {
@@ -815,10 +703,16 @@ void tiled_attention(KvCache &kv, int layer, int seq, int tile, const float *q, 
     int n = std::min(tile, seq - start);
     kv.load_tile(layer, false, start, n);
     attn_tile_score_k<<<dim3(HEADS, n), 256>>>(q, kv.kt.p, kv.score.p, n);
+    attn_tile_sum_k<<<HEADS, 256>>>(kv.score.p, kv.hmax.p, kv.hsum.p, n);
+  }
+  for (int start = 0; start < seq; start += tile) {
+    int n = std::min(tile, seq - start);
+    kv.load_tile(layer, false, start, n);
+    attn_tile_score_k<<<dim3(HEADS, n), 256>>>(q, kv.kt.p, kv.score.p, n);
     kv.load_tile(layer, true, start, n);
     attn_tile_accum_k<<<dim3(HEADS, (V_HEAD + 255) / 256), 256>>>(kv.score.p, kv.vt.p, kv.hmax.p, kv.hsum.p, out, n);
   }
-  attn_finish_k<<<(V_DIM + 255) / 256, 256>>>(out, kv.hsum.p);
+  attn_finish_k<<<(V_DIM + 255) / 256, 256>>>(out);
 }
 
 std::uint32_t sample_lm_head(Io &io, const Tensor &head, const float *x, float *logits, std::uint32_t *did) {
@@ -840,74 +734,57 @@ std::uint32_t sample_lm_head(Io &io, const Tensor &head, const float *x, float *
 }
 
 void validate_forward_contract(const RuntimeIndex &rt) {
-  const auto &ts = rt.tensors;
-  bool attn[LAYERS] = {}, router[LAYERS] = {};
-  const char *attn_slots[] = {"q_a_proj", "q_a_layernorm", "q_b_proj", "kv_a_proj", "kv_a_layernorm", "kv_b_proj", "o_proj"};
-  for (const auto &t : ts) {
+  for (const auto &[key, t] : rt.tensors) {
+    (void)key;
     if (t.slot.empty() || t.dtype.empty() || t.shape.empty()) die("runtime index has incomplete tensor metadata");
     if (t.layer >= LAYERS || t.expert >= EXPERTS) die("runtime index has out-of-range Kimi coordinates");
-    if (t.role == "attention_resident" && t.layer >= 0) attn[t.layer] = true;
-    if (t.role == "router" && t.layer >= 0) router[t.layer] = true;
+    if (t.align != 4096 || t.off % t.align || t.bytes % t.align || t.data < t.off ||
+        t.data_bytes > t.bytes || t.data - t.off > t.bytes - t.data_bytes)
+      die("runtime index has invalid tensor extent: " + t.name);
   }
   for (int i = 0; i < LAYERS; ++i) {
-    if (!attn[i]) die("missing layer attention tensors");
-    for (auto slot : attn_slots)
-      if (!has_layer_slot(ts, i, slot)) die("missing layer MLA projection tensor");
-    if (!has_layer_slot(ts, i, "input_layernorm")) die("missing layer input_layernorm");
-    if (!has_layer_slot(ts, i, "post_attention_layernorm")) die("missing layer post_attention_layernorm");
+    bf16(rt, i, "attention_resident", "q_a_proj", Q_RANK, HIDDEN);
+    bf16(rt, i, "attention_resident", "q_a_layernorm", Q_RANK);
+    bf16(rt, i, "attention_resident", "q_b_proj", K_DIM, Q_RANK);
+    bf16(rt, i, "attention_resident", "kv_a_proj_with_mqa", KV_A, HIDDEN);
+    bf16(rt, i, "attention_resident", "kv_a_layernorm", KV_RANK);
+    bf16(rt, i, "attention_resident", "kv_b_proj", HEADS * (QK_NOPE + V_HEAD), KV_RANK);
+    bf16(rt, i, "attention_resident", "o_proj", HIDDEN, V_DIM);
+    bf16(rt, i, "resident", "input_layernorm", HIDDEN);
+    bf16(rt, i, "resident", "post_attention_layernorm", HIDDEN);
     if (i < FIRST_DENSE) {
-      need(ts, i, "gate_proj"); need(ts, i, "up_proj"); need(ts, i, "down_proj");
+      bf16(rt, i, "dense_ffn_rowcol", "gate_proj", DENSE, HIDDEN);
+      bf16(rt, i, "dense_ffn_rowcol", "up_proj", DENSE, HIDDEN);
+      bf16(rt, i, "dense_ffn_rowcol", "down_proj", HIDDEN, DENSE);
       continue;
     }
-    if (!router[i]) die("missing layer router tensors");
-    need_role(ts, i, "router", "gate");
-    need_role(ts, i, "router", "e_score_correction_bias");
-    need_role(ts, i, "shared_expert_resident", "gate_proj");
-    need_role(ts, i, "shared_expert_resident", "up_proj");
-    need_role(ts, i, "shared_expert_resident", "down_proj");
+    bf16(rt, i, "router", "gate", EXPERTS, HIDDEN);
+    const Tensor &bias = need(rt, i, "router", "e_score_correction_bias");
+    if (bias.dtype != "bf16" || bias.shape != std::to_string(EXPERTS) ||
+        bias.data_bytes != EXPERTS * sizeof(__nv_bfloat16))
+      die("bad router correction bias: " + bias.name);
+    bf16(rt, i, "shared_expert_resident", "gate_proj", SHARED, HIDDEN);
+    bf16(rt, i, "shared_expert_resident", "up_proj", SHARED, HIDDEN);
+    bf16(rt, i, "shared_expert_resident", "down_proj", HIDDEN, SHARED);
     for (int e = 0; e < EXPERTS; ++e) {
-      validate_i4_pair(need_routed_weight(ts, i, "gate_proj", e), need_routed_scale(ts, i, "gate_proj", e), MOE, HIDDEN);
-      validate_i4_pair(need_routed_weight(ts, i, "up_proj", e), need_routed_scale(ts, i, "up_proj", e), MOE, HIDDEN);
-      validate_i4_pair(need_routed_weight(ts, i, "down_proj", e), need_routed_scale(ts, i, "down_proj", e), HIDDEN, MOE);
+      validate_i4_pair(need(rt, i, "routed_expert", "gate_proj.weight_packed", e), need(rt, i, "routed_expert", "gate_proj.weight_scale", e), MOE, HIDDEN);
+      validate_i4_pair(need(rt, i, "routed_expert", "up_proj.weight_packed", e), need(rt, i, "routed_expert", "up_proj.weight_scale", e), MOE, HIDDEN);
+      validate_i4_pair(need(rt, i, "routed_expert", "down_proj.weight_packed", e), need(rt, i, "routed_expert", "down_proj.weight_scale", e), HIDDEN, MOE);
     }
   }
-  need_resident_name(ts, ".embed_tokens.weight");
-  need_resident_name(ts, ".norm.weight");
-  need_resident_name(ts, ".lm_head.weight");
-}
-
-std::string json(const std::string &s) {
-  std::string o = "\"";
-  const char *hex = "0123456789abcdef";
-  for (unsigned char c : s) {
-    if (c == '"' || c == '\\') {
-      o += '\\';
-      o += static_cast<char>(c);
-    } else if (c == '\n') {
-      o += "\\n";
-    } else if (c == '\r') {
-      o += "\\r";
-    } else if (c == '\t') {
-      o += "\\t";
-    } else if (c < 0x20) {
-      o += "\\u00";
-      o += hex[c >> 4];
-      o += hex[c & 0xf];
-    } else {
-      o += static_cast<char>(c);
-    }
-  }
-  return o + "\"";
+  bf16(rt, -1, "resident", "embed_tokens", VOCAB, HIDDEN);
+  bf16(rt, -1, "resident", "norm", HIDDEN);
+  bf16(rt, -1, "resident", "lm_head", VOCAB, HIDDEN);
 }
 
 Generation generate(Io &io, const RuntimeIndex &rt, const Args &a) {
-  auto tokz = tokenizer(rt.tokenizer_blok);
-  auto input = a.prompt_tokens.empty() ? encode(tokz, chat_prompt(a.prompt)) : token_ids(a.prompt_tokens);
+  auto input = token_ids(a.prompt_tokens);
   auto made = std::vector<std::uint32_t>{};
   if (input.empty()) die("tokenizer produced no prompt tokens");
-  const Tensor &emb = need_resident_name(rt.tensors, ".embed_tokens.weight");
-  auto final_norm = load_tensor(io, need_resident_name(rt.tensors, ".norm.weight"));
-  const Tensor &head = need_resident_name(rt.tensors, ".lm_head.weight");
+  if (a.tokens > MAX_CONTEXT || input.size() > MAX_CONTEXT - a.tokens) die("requested sequence exceeds Kimi context");
+  const Tensor &emb = need(rt, -1, "resident", "embed_tokens");
+  auto final_norm = load_tensor(io, need(rt, -1, "resident", "norm"));
+  const Tensor &head = need(rt, -1, "resident", "lm_head");
   std::uint32_t *did = nullptr;
   std::uint16_t *dex = nullptr;
   ck(cudaMalloc(&did, sizeof(std::uint32_t)), "cudaMalloc sample");
@@ -920,18 +797,18 @@ Generation generate(Io &io, const RuntimeIndex &rt, const Args &a) {
   v.make(HEADS * V_HEAD); av.make(HEADS * V_HEAD);
   router.make(EXPERTS); route_select.make(EXPERTS); ew.make(TOPK);
   gate.make(DENSE); up.make(DENSE); mid.make(DENSE); down.make(HIDDEN); logits.make(HEAD_TILE);
-  KvCache kv_cache(io, input.size() + a.tokens + 1, KV_TILE);
+  KvCache kv_cache(io, input.size() + a.tokens, KV_TILE);
   auto run = [&](std::uint32_t id, int pos, bool sample) {
     embed_token(io, emb, id, x.p);
     for (int l = 0; l < LAYERS; ++l) {
-      auto ln0 = load_tensor(io, need(rt.tensors, l, "input_layernorm"));
-      const Tensor &qaw = need(rt.tensors, l, "q_a_proj");
-      auto qaln = load_tensor(io, need(rt.tensors, l, "q_a_layernorm"));
-      const Tensor &qbw = need(rt.tensors, l, "q_b_proj");
-      const Tensor &kvaw = need(rt.tensors, l, "kv_a_proj");
-      auto kvaln = load_tensor(io, need(rt.tensors, l, "kv_a_layernorm"));
-      const Tensor &kvbw = need(rt.tensors, l, "kv_b_proj");
-      const Tensor &ow = need(rt.tensors, l, "o_proj");
+      auto ln0 = load_tensor(io, need(rt, l, "resident", "input_layernorm"));
+      const Tensor &qaw = need(rt, l, "attention_resident", "q_a_proj");
+      auto qaln = load_tensor(io, need(rt, l, "attention_resident", "q_a_layernorm"));
+      const Tensor &qbw = need(rt, l, "attention_resident", "q_b_proj");
+      const Tensor &kvaw = need(rt, l, "attention_resident", "kv_a_proj_with_mqa");
+      auto kvaln = load_tensor(io, need(rt, l, "attention_resident", "kv_a_layernorm"));
+      const Tensor &kvbw = need(rt, l, "attention_resident", "kv_b_proj");
+      const Tensor &ow = need(rt, l, "attention_resident", "o_proj");
       rmsnorm_k<<<1, 256>>>(x.p, ln0.bf16(), n.p, HIDDEN);
       matvec_bf16_all_rows(io, qaw, n.p, qa.p, Q_RANK, HIDDEN, EXPERT_TILE);
       rmsnorm_k<<<1, 256>>>(qa.p, qaln.bf16(), qa.p, Q_RANK);
@@ -948,55 +825,53 @@ Generation generate(Io &io, const RuntimeIndex &rt, const Args &a) {
       tiled_attention(kv_cache, l, pos + 1, KV_TILE, q_rot.p, av.p);
       matvec_bf16_all_rows(io, ow, av.p, down.p, HIDDEN, HEADS * V_HEAD, HIDDEN_TILE);
       add_k<<<(HIDDEN + 255) / 256, 256>>>(x.p, down.p, HIDDEN);
-      auto ln1 = load_tensor(io, need(rt.tensors, l, "post_attention_layernorm"));
+      auto ln1 = load_tensor(io, need(rt, l, "resident", "post_attention_layernorm"));
       rmsnorm_k<<<1, 256>>>(x.p, ln1.bf16(), n.p, HIDDEN);
       ck(cudaMemset(down.p, 0, HIDDEN * sizeof(float)), "cudaMemset ffn");
       if (l < FIRST_DENSE) {
-        const Tensor &gw = need(rt.tensors, l, "gate_proj"), &uw = need(rt.tensors, l, "up_proj"), &dw = need(rt.tensors, l, "down_proj");
+        const Tensor &gw = need(rt, l, "dense_ffn_rowcol", "gate_proj"), &uw = need(rt, l, "dense_ffn_rowcol", "up_proj"),
+                     &dw = need(rt, l, "dense_ffn_rowcol", "down_proj");
         bf16_mlp(io, gw, uw, dw, n.p, down.p, gate.p, up.p, mid.p, av.p, shape_dim(gw, 0));
       } else {
-        const Tensor &rw = need_role(rt.tensors, l, "router", "gate");
-        auto rb = load_tensor(io, need_role(rt.tensors, l, "router", "e_score_correction_bias"));
-        matvec_bf16_all_rows(io, rw, n.p, router.p, EXPERTS, HIDDEN, EXPERT_TILE);
+        const Tensor &rw = need(rt, l, "router", "gate");
+        auto rb = load_tensor(io, need(rt, l, "router", "e_score_correction_bias"));
+        matvec_bf16_f32_rows(io, rw, n.p, router.p, EXPERTS, HIDDEN);
         sigmoid_k<<<(EXPERTS + 255) / 256, 256>>>(router.p, EXPERTS);
         ck(cudaMemcpy(route_select.p, router.p, EXPERTS * sizeof(float), cudaMemcpyDeviceToDevice), "cudaMemcpy router scores");
-        if (rb.dtype == "f32") add_f32_k<<<(EXPERTS + 255) / 256, 256>>>(route_select.p, rb.f32(), EXPERTS);
-        else add_bf16_k<<<(EXPERTS + 255) / 256, 256>>>(route_select.p, rb.bf16(), EXPERTS);
+        add_bf16_k<<<(EXPERTS + 255) / 256, 256>>>(route_select.p, rb.bf16(), EXPERTS);
         router_topk_k<<<1, EXPERTS>>>(router.p, route_select.p, dex, ew.p);
         std::uint16_t ex[TOPK];
         ck(cudaMemcpy(ex, dex, sizeof(ex), cudaMemcpyDeviceToHost), "cudaMemcpy experts");
-        int order[TOPK];
-        for (int i = 0; i < TOPK; ++i) order[i] = i;
-        std::sort(order, order + TOPK, [&](int a, int b) { return ex[a] < ex[b]; });
-        for (int i = 0; i < TOPK; ++i) {
-          int slot = order[i], expert = ex[slot];
-          const Tensor &gwm = need_routed_weight(rt.tensors, l, "gate_proj", expert);
-          const Tensor &gsm = need_routed_scale(rt.tensors, l, "gate_proj", expert);
-          const Tensor &uwm = need_routed_weight(rt.tensors, l, "up_proj", expert);
-          const Tensor &usm = need_routed_scale(rt.tensors, l, "up_proj", expert);
-          const Tensor &dwm = need_routed_weight(rt.tensors, l, "down_proj", expert);
-          const Tensor &dsm = need_routed_scale(rt.tensors, l, "down_proj", expert);
+        for (int slot = 0; slot < TOPK; ++slot) {
+          int expert = ex[slot];
+          const Tensor &gwm = need(rt, l, "routed_expert", "gate_proj.weight_packed", expert);
+          const Tensor &gsm = need(rt, l, "routed_expert", "gate_proj.weight_scale", expert);
+          const Tensor &uwm = need(rt, l, "routed_expert", "up_proj.weight_packed", expert);
+          const Tensor &usm = need(rt, l, "routed_expert", "up_proj.weight_scale", expert);
+          const Tensor &dwm = need(rt, l, "routed_expert", "down_proj.weight_packed", expert);
+          const Tensor &dsm = need(rt, l, "routed_expert", "down_proj.weight_scale", expert);
           for (int r = 0; r < MOE; r += EXPERT_TILE) {
             int rows = std::min(EXPERT_TILE, MOE - r);
             auto gw = load_rows(io, gwm, r, rows, HIDDEN / I4_PER_WORD * dtype_bytes(gwm));
             auto gs = load_rows(io, gsm, r, rows, HIDDEN / I4_GROUP * dtype_bytes(gsm));
             auto uw = load_rows(io, uwm, r, rows, HIDDEN / I4_PER_WORD * dtype_bytes(uwm));
             auto us = load_rows(io, usm, r, rows, HIDDEN / I4_GROUP * dtype_bytes(usm));
-            matvec_i4_slice(gsm, gw, gs, n.p, gate.p + r, rows, HIDDEN);
-            matvec_i4_slice(usm, uw, us, n.p, up.p + r, rows, HIDDEN);
+            matvec_i4_slice(gw, gs, n.p, gate.p + r, rows, HIDDEN);
+            matvec_i4_slice(uw, us, n.p, up.p + r, rows, HIDDEN);
             silu_mul_k<<<(rows + 255) / 256, 256>>>(gate.p + r, up.p + r, mid.p + r, rows);
           }
           for (int r = 0; r < HIDDEN; r += HIDDEN_TILE) {
             int rows = std::min(HIDDEN_TILE, HIDDEN - r);
             auto dw = load_rows(io, dwm, r, rows, MOE / I4_PER_WORD * dtype_bytes(dwm));
             auto ds = load_rows(io, dsm, r, rows, MOE / I4_GROUP * dtype_bytes(dsm));
-            matvec_i4_slice(dsm, dw, ds, mid.p, av.p + r, rows, MOE);
+            matvec_i4_slice(dw, ds, mid.p, av.p + r, rows, MOE);
             expert_accum_k<<<(rows + 255) / 256, 256>>>(av.p + r, ew.p, slot, down.p + r, rows);
           }
         }
-        const Tensor &sgw = need_role(rt.tensors, l, "shared_expert_resident", "gate_proj");
-        const Tensor &suw = need_role(rt.tensors, l, "shared_expert_resident", "up_proj");
-        const Tensor &sdw = need_role(rt.tensors, l, "shared_expert_resident", "down_proj");
+        round_bf16_k<<<(HIDDEN + 255) / 256, 256>>>(down.p, HIDDEN);
+        const Tensor &sgw = need(rt, l, "shared_expert_resident", "gate_proj");
+        const Tensor &suw = need(rt, l, "shared_expert_resident", "up_proj");
+        const Tensor &sdw = need(rt, l, "shared_expert_resident", "down_proj");
         bf16_mlp(io, sgw, suw, sdw, n.p, down.p, gate.p, up.p, mid.p, av.p, shape_dim(sgw, 0));
       }
       add_k<<<(HIDDEN + 255) / 256, 256>>>(x.p, down.p, HIDDEN);
@@ -1014,15 +889,16 @@ Generation generate(Io &io, const RuntimeIndex &rt, const Args &a) {
     if (i + 1 < a.tokens) next = run(next, (int)(input.size() + i), true);
   }
   cudaFree(did); cudaFree(dex);
-  return {decode(tokz, made), (std::uint64_t)made.size()};
+  return {std::move(made)};
 }
 
 int main(int argc, char **argv) {
   Args a = args(argc, argv);
-  auto rt = runtime_index(a.manifest);
+  auto rt = runtime_index(a.index);
   validate_forward_contract(rt);
   Io io;
   auto gen = generate(io, rt, a);
-  std::cout << "{\"protocol\":\"blok-kimi-exec-v1\",\"status\":\"ok\",\"io_mode\":\"ugds\",\"text\":" << json(gen.text)
-            << ",\"tokens\":" << gen.tokens << ",\"predicted_tps\":null,\"watts\":null}\n";
+  std::cout << "{\"status\":\"ok\",\"token_ids\":[";
+  for (std::size_t i = 0; i < gen.ids.size(); ++i) std::cout << (i ? "," : "") << gen.ids[i];
+  std::cout << "]}\n";
 }

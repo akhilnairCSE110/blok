@@ -2,76 +2,76 @@
 import sys
 from pathlib import Path
 
+from blok.runtime import encode_prompt
+
 LAYERS, EXPERTS, HIDDEN, DENSE, MOE = 61, 384, 7168, 18432, 2048
 Q_RANK, KV_RANK, HEADS, QK_HEAD, V_HEAD, VOCAB = 1536, 512, 64, 192, 128, 163840
 
-def die(msg): raise SystemExit(msg)
-def shape(s): return tuple(map(int, s.split("x")))
 
-def runtime_path(arg):
-    p = Path(arg)
-    if p.is_file(): p = p.parent
-    for q in (p / "runtime-index.blok", p / "blok" / "runtime-index.blok", p / "meta" / "runtime-index.blok"):
-        if q.is_file(): return q
-    die(f"missing runtime-index.blok under {arg}")
+def die(message):
+    raise SystemExit(message)
 
-def load(path):
-    ts = []
-    tokenizer = None
-    for line in path.read_text().splitlines():
-        if line.startswith("tokenizer_blok "): tokenizer = Path(line.split(maxsplit=1)[1])
-        if not line.startswith("tensor "): continue
-        _, name, role, layer, expert, slot, dtype, shp, *_ = line.split()
-        ts.append((name, role, int(layer), int(expert), slot, dtype, shape(shp)))
-    if not tokenizer or not tokenizer.is_file(): die("missing tokenizer.blok")
-    if tokenizer.open().readline().strip() != "blok-tokenizer-v2": die("bad tokenizer.blok schema")
-    return ts
 
-def one(ts, layer, role, suffix, expert=None):
-    found = [t for t in ts if t[2] == layer and t[1] == role and t[0].endswith(suffix) and (expert is None or t[3] == expert)]
-    if len(found) != 1: die(f"expected one tensor for layer {layer}: {suffix}, got {len(found)}")
-    return found[0]
+def load(arg):
+    path = Path(arg)
+    if path.is_dir(): path /= "runtime-index.blok"
+    if path.name != "runtime-index.blok" or not path.is_file(): die(f"missing runtime-index.blok: {path}")
+    lines, tensors = path.read_text().splitlines(), {}
+    if not lines or lines[0] != "blok-runtime-index-v1": die("bad runtime index header")
+    for line in lines[1:]:
+        if not line.startswith("tensor "): die("bad runtime index line")
+        parts = line.split()
+        if len(parts) != 14: die("bad runtime tensor line")
+        _, name, role, layer, expert, slot, dtype, shape, *_ = parts
+        key = int(layer), role, slot, int(expert)
+        if key in tensors: die(f"duplicate runtime tensor: {key}")
+        tensors[key] = name, dtype, tuple(map(int, shape.split("x"))), int(parts[12])
+    tokenizer = path.parent / "tokenizer.blok"
+    if not tokenizer.is_file() or tokenizer.open().readline().strip() != "blok-tokenizer-v2": die("missing or bad tokenizer.blok")
+    for prompt, expected in (("hello", [163587, 2482, 163601, 22931, 163586, 163588, 69702, 163601, 163606, 163607]),
+                             ("1234567890", [163587, 2482, 163601, 6694, 12972, 16242, 15, 163586, 163588, 69702, 163601, 163606, 163607])):
+        if encode_prompt(tokenizer, prompt) != expected: die(f"tokenizer mismatch for {prompt!r}")
+    return tensors
 
-def any_one(ts, layer, role, suffixes):
-    found = [t for t in ts if t[2] == layer and t[1] == role and any(t[0].endswith(s) for s in suffixes)]
-    if len(found) != 1: die(f"expected one tensor for layer {layer}: {suffixes}, got {len(found)}")
-    return found[0]
 
-def expect(t, dtype, shp):
-    if t[5] != dtype or t[6] != shp: die(f"bad {t[0]}: {t[5]} {t[6]}, expected {dtype} {shp}")
+def expect(tensors, layer, role, slot, dtype, shape, expert=-1):
+    key = layer, role, slot, expert
+    if key not in tensors: die(f"missing runtime tensor: {key}")
+    name, actual_dtype, actual_shape, actual_bytes = tensors[key]
+    elements = 1
+    for dim in shape: elements *= dim
+    if actual_dtype not in dtype.split("/") or actual_shape != shape or actual_bytes != elements * {"bf16": 2, "i32": 4}[actual_dtype]:
+        die(f"bad {name}: {actual_dtype} {actual_shape}, expected {dtype} {shape}")
 
-def expect_float(t, shp):
-    if t[5] not in ("bf16", "f32") or t[6] != shp: die(f"bad {t[0]}: {t[5]} {t[6]}, expected bf16/f32 {shp}")
 
 def main():
-    if len(sys.argv) != 2: die("usage: check_kimi_contract.py <manifest-or-model-dir>")
-    ts = load(runtime_path(sys.argv[1]))
-    for l in range(LAYERS):
-        expect(one(ts, l, "attention_resident", ".q_a_proj.weight"), "bf16", (Q_RANK, HIDDEN))
-        expect(one(ts, l, "attention_resident", ".q_a_layernorm.weight"), "bf16", (Q_RANK,))
-        expect(one(ts, l, "attention_resident", ".q_b_proj.weight"), "bf16", (HEADS * QK_HEAD, Q_RANK))
-        expect(any_one(ts, l, "attention_resident", (".kv_a_proj.weight", ".kv_a_proj_with_mqa.weight")), "bf16", (KV_RANK + 64, HIDDEN))
-        expect(one(ts, l, "attention_resident", ".kv_a_layernorm.weight"), "bf16", (KV_RANK,))
-        expect(one(ts, l, "attention_resident", ".kv_b_proj.weight"), "bf16", (HEADS * (128 + V_HEAD), KV_RANK))
-        expect(one(ts, l, "attention_resident", ".o_proj.weight"), "bf16", (HIDDEN, HEADS * V_HEAD))
-        expect(one(ts, l, "resident", ".input_layernorm.weight"), "bf16", (HIDDEN,))
-        expect(one(ts, l, "resident", ".post_attention_layernorm.weight"), "bf16", (HIDDEN,))
-    for s in ("gate_proj", "up_proj"): expect(one(ts, 0, "dense_ffn_rowcol", f".mlp.{s}.weight"), "bf16", (DENSE, HIDDEN))
-    expect(one(ts, 0, "dense_ffn_rowcol", ".mlp.down_proj.weight"), "bf16", (HIDDEN, DENSE))
-    for l in range(1, LAYERS):
-        expect(one(ts, l, "router", ".mlp.gate.weight"), "bf16", (EXPERTS, HIDDEN))
-        expect_float(one(ts, l, "router", ".mlp.gate.e_score_correction_bias"), (EXPERTS,))
-        for s in ("gate_proj", "up_proj"): expect(one(ts, l, "shared_expert_resident", f".shared_experts.{s}.weight"), "bf16", (MOE, HIDDEN))
-        expect(one(ts, l, "shared_expert_resident", ".shared_experts.down_proj.weight"), "bf16", (HIDDEN, MOE))
-        for e in range(EXPERTS):
-            for s in ("gate_proj", "up_proj"):
-                expect(one(ts, l, "routed_expert", f".experts.{e}.{s}.weight_packed", e), "i32", (MOE, HIDDEN // 8))
-                expect(one(ts, l, "routed_expert", f".experts.{e}.{s}.weight_scale", e), "bf16", (MOE, HIDDEN // 32))
-            expect(one(ts, l, "routed_expert", f".experts.{e}.down_proj.weight_packed", e), "i32", (HIDDEN, MOE // 8))
-            expect(one(ts, l, "routed_expert", f".experts.{e}.down_proj.weight_scale", e), "bf16", (HIDDEN, MOE // 32))
-    expect(one(ts, -1, "resident", ".embed_tokens.weight"), "bf16", (VOCAB, HIDDEN))
-    expect(one(ts, -1, "resident", ".norm.weight"), "bf16", (HIDDEN,))
-    expect(one(ts, -1, "resident", ".lm_head.weight"), "bf16", (VOCAB, HIDDEN))
-    print("ok: Kimi runtime-index tensor contract")
+    if len(sys.argv) != 2: die("usage: check_kimi_contract.py <runtime-index-or-directory>")
+    ts = load(sys.argv[1])
+    for layer in range(LAYERS):
+        for slot, shape in {
+            "q_a_proj": (Q_RANK, HIDDEN), "q_a_layernorm": (Q_RANK,), "q_b_proj": (HEADS * QK_HEAD, Q_RANK),
+            "kv_a_proj_with_mqa": (KV_RANK + 64, HIDDEN), "kv_a_layernorm": (KV_RANK,),
+            "kv_b_proj": (HEADS * (128 + V_HEAD), KV_RANK), "o_proj": (HIDDEN, HEADS * V_HEAD),
+        }.items(): expect(ts, layer, "attention_resident", slot, "bf16", shape)
+        expect(ts, layer, "resident", "input_layernorm", "bf16", (HIDDEN,))
+        expect(ts, layer, "resident", "post_attention_layernorm", "bf16", (HIDDEN,))
+    for slot in ("gate_proj", "up_proj"): expect(ts, 0, "dense_ffn_rowcol", slot, "bf16", (DENSE, HIDDEN))
+    expect(ts, 0, "dense_ffn_rowcol", "down_proj", "bf16", (HIDDEN, DENSE))
+    for layer in range(1, LAYERS):
+        expect(ts, layer, "router", "gate", "bf16", (EXPERTS, HIDDEN))
+        expect(ts, layer, "router", "e_score_correction_bias", "bf16", (EXPERTS,))
+        for slot in ("gate_proj", "up_proj"): expect(ts, layer, "shared_expert_resident", slot, "bf16", (MOE, HIDDEN))
+        expect(ts, layer, "shared_expert_resident", "down_proj", "bf16", (HIDDEN, MOE))
+        for expert in range(EXPERTS):
+            for slot in ("gate_proj", "up_proj"):
+                expect(ts, layer, "routed_expert", slot + ".weight_packed", "i32", (MOE, HIDDEN // 8), expert)
+                expect(ts, layer, "routed_expert", slot + ".weight_scale", "bf16", (MOE, HIDDEN // 32), expert)
+            expect(ts, layer, "routed_expert", "down_proj.weight_packed", "i32", (HIDDEN, MOE // 8), expert)
+            expect(ts, layer, "routed_expert", "down_proj.weight_scale", "bf16", (HIDDEN, MOE // 32), expert)
+    expect(ts, -1, "resident", "embed_tokens", "bf16", (VOCAB, HIDDEN))
+    expect(ts, -1, "resident", "norm", "bf16", (HIDDEN,))
+    expect(ts, -1, "resident", "lm_head", "bf16", (VOCAB, HIDDEN))
+    print("ok: Kimi runtime and tokenizer contract")
+
 
 if __name__ == "__main__": main()

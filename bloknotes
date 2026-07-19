@@ -1,0 +1,29 @@
+#!/bin/sh
+
+script=$0
+[ -L "$script" ] && script=$(readlink "$script")
+root=$(CDPATH= cd -- "$(dirname -- "$script")" && pwd)
+list=$(mktemp)
+trap 'rm -f "$list"' EXIT
+
+find "$root" -type f \( -iname '*.md' -o -iname '*.markdown' \) \
+  -not -path '*/.git/*' | sort >"$list"
+
+while :; do
+  printf '\033[2J\033[HMarkdown files in blok:\n\n'
+  awk -v root="$root/" '{ printf "%3d  %s\n", NR, substr($0, length(root) + 1) }' "$list"
+  printf '\nEdit number (q to quit): '
+  read -r choice || exit
+  [ "$choice" = q ] && exit
+  case $choice in ''|*[!0-9]*) continue ;; esac
+  note=$(sed -n "${choice}p" "$list")
+  [ -z "$note" ] && continue
+  nvim --clean \
+    -c 'set mouse=a laststatus=2' \
+    -c 'set statusline=Ctrl-S:\ save\ \ \ Esc:\ back%=%f' \
+    -c 'inoremap <silent> <C-s> <C-o>:write<CR>' \
+    -c 'nnoremap <silent> <C-s> :write<CR>' \
+    -c 'inoremap <silent> <Esc> <C-o>:quit<CR>' \
+    -c 'nnoremap <silent> <Esc> :quit<CR>' \
+    -c startinsert "$note"
+done
