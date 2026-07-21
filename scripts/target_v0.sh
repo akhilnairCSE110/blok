@@ -29,6 +29,7 @@ require_source() {
 prepare() {
   require_linux
   require_source
+  .venv/bin/python -m scripts.test_host
   scripts/model_fetch.py kimi-k2.6 materialize
   .venv/bin/python -m scripts.check_kimi_contract "$index"
   test "$(stat -c %d "$model_dir")" != "$(stat -c %d "$(dirname "$index")")" || {
