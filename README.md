@@ -52,3 +52,9 @@ scripts/target_v0.sh run
 ```
 
 Success is `{"status": "ok", "text": "paris"}`. Never use filesystem free space for raw KV writes, and regenerate the uGDS map after any shard movement or rewrite.
+
+## Architecture documents
+
+- [`docs/architecture/hardware-design-decisions.md`](docs/architecture/hardware-design-decisions.md): decision-by-decision chip and I/O specification, with equations and falsification tests.
+- [`docs/architecture/kimi-k2.6-on-target-hardware.md`](docs/architecture/kimi-k2.6-on-target-hardware.md): Kimi K2.6 execution derivation and current implementation audit.
+- [`docs/architecture/glm-5.2-on-target-hardware.md`](docs/architecture/glm-5.2-on-target-hardware.md): GLM-5.2 FP8 capacity proof and proposed executor.

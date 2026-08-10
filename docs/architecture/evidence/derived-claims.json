@@ -1,0 +1,128 @@
+{
+  "evidence_class": "deterministic derivation and source audit; not a hardware benchmark",
+  "glm_5_2_fp8": {
+    "all_expert_record_padding_bytes": 58982400,
+    "architecture": {
+      "experts_per_layer": 256,
+      "full_indexers": 21,
+      "hidden": 6144,
+      "layers": 78,
+      "moe_layers": 75,
+      "selected_per_token": 8
+    },
+    "attention_bytes_per_token": 12876998784,
+    "checkpoint_tensor_bytes": 755617140416,
+    "checkpoint_to_cold_step_ratio": "18.258945",
+    "cold_weight_bytes_per_sampled_token": 41383396416,
+    "expanded_kv_bytes_per_sequence_token": 5111808,
+    "expert_bf16_equivalent_bytes": 75497472,
+    "expert_compression_ratio": "1.999512",
+    "expert_record_bytes": 37757952,
+    "expert_record_padding_bytes": 3072,
+    "expert_record_stride_4k": 37761024,
+    "fixed_weight_bytes_per_token": 16825447488,
+    "index_key_bytes_per_sequence_token": 5376,
+    "indexer_weight_bytes": 200991168,
+    "kv_reduction_ratio": "56.888889",
+    "latent_kv_bytes_per_sequence_token": 89856,
+    "latent_plus_index_bytes_at_max_context": 99857989632,
+    "latent_plus_index_bytes_per_sequence_token": 95232,
+    "lm_head_bytes": 1903165440,
+    "model_plus_cache_bytes_at_max_context": 855475130048,
+    "routed_bank_bytes": 724952678400,
+    "routed_selection_reduction": "32",
+    "selected_routed_bytes_per_token": 22654771200,
+    "weight_flops_per_byte": "1.947533",
+    "weight_flops_per_token": 80595517440
+  },
+  "io": {
+    "commands_for_eight_glm_experts_at_prp_cap": 144,
+    "commands_for_eight_kimi_experts_at_prp_cap": 96,
+    "commands_per_glm_expert_at_fallback": 289,
+    "commands_per_glm_expert_at_prp_cap": 18,
+    "commands_per_kimi_expert_at_fallback": 189,
+    "commands_per_kimi_expert_at_prp_cap": 12,
+    "controller_page_bytes_assumption": 4096,
+    "evidence_class": "derived from uGDS source constants; target MDTS is unmeasured",
+    "glm_selected_expert_commands_at_fallback": 173400,
+    "glm_selected_expert_commands_at_prp_cap": 10800,
+    "queue_depth_for_7_15GBps_by_size_and_latency_us": {
+      "1048576": {
+        "10": 1,
+        "100": 1,
+        "5": 1,
+        "50": 1
+      },
+      "131072": {
+        "10": 1,
+        "100": 6,
+        "5": 1,
+        "50": 3
+      },
+      "2101248": {
+        "10": 1,
+        "100": 1,
+        "5": 1,
+        "50": 1
+      },
+      "4096": {
+        "10": 18,
+        "100": 175,
+        "5": 9,
+        "50": 88
+      },
+      "8192": {
+        "10": 9,
+        "100": 88,
+        "5": 5,
+        "50": 44
+      }
+    },
+    "single_prp_list_command_cap_bytes": 2101248,
+    "ugds_batch_application_entry_capacity": 128,
+    "ugds_batch_queue_depth_ceiling": 512,
+    "ugds_no_mdts_fallback_bytes": 131072,
+    "ugds_prp_list_pages": 64
+  },
+  "kimi_k2_6": {
+    "architecture": {
+      "experts_per_layer": 384,
+      "hidden": 7168,
+      "layers": 61,
+      "moe_layers": 60,
+      "selected_per_token": 8
+    },
+    "attention_and_norm_bytes_per_token": 12338888704,
+    "checkpoint_tensor_bytes": 595148192736,
+    "checkpoint_to_cold_step_ratio": "18.042197",
+    "cold_weight_bytes_per_sampled_token": 32986459136,
+    "current_application_model_reads_per_sampled_token": 217686,
+    "current_expert_application_reads_per_expert": 352,
+    "current_model_allocations_per_sampled_token": 217047,
+    "expanded_kv_bytes_at_max_context": 1309965025280,
+    "expanded_kv_bytes_per_sequence_token": 4997120,
+    "expert_bf16_equivalent_bytes": 88080384,
+    "expert_compression_ratio": "3.555556",
+    "expert_record_bytes": 24772608,
+    "fixed_weight_bytes_per_token": 18746782720,
+    "kv_reduction_ratio": "71.111111",
+    "latent_kv_bytes_at_max_context": 18421383168,
+    "latent_kv_bytes_per_sequence_token": 70272,
+    "lm_head_bytes": 2348810240,
+    "record_descriptors_per_cold_token": 480,
+    "routed_bank_bytes": 570760888320,
+    "routed_selection_reduction": "48",
+    "selected_routed_bytes_per_token": 11890851840,
+    "weight_flops_per_byte": "1.921156",
+    "weight_flops_per_token": 63372132352
+  },
+  "reproduce": "python3 -m scripts.derive_architecture_claims --check",
+  "schema": "blok-derived-architecture-evidence-v1",
+  "source_sha256": {
+    "blok/runtime.py": "d84783cc312980e57999b1cee0771939f381626e02a5731258eda3310f5f4fbc",
+    "scripts/model_fetch.py": "73c4f4666a9de0412cc31f202bdb24fca3bad319c6363f2528eca24075f77bf1",
+    "src/kimi_exec.cu": "1bcb74c5428c793508950e434857466519a6ac17c74596aabbe47afa9ed401c9",
+    "sub_dir/uGDS/src/ugds_batch.cpp": "0afc5da4155fc3bf4762b636d5122f2435a239248d147d22d1a4bc8cc6695c21",
+    "sub_dir/uGDS/src/ugds_internal.h": "42ec976f232db969b820235e5b0fb79092b33b4c8db93c23a051398e05d7bf4b"
+  }
+}
