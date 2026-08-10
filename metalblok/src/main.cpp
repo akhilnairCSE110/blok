@@ -109,6 +109,94 @@ static int probe_gguf(const char* path) {
                      by_type[i].bytes / 1e9,
                      100.0 * by_type[i].bytes / (double)total_bytes);
     }
+
+    // Derive the exact storage traffic of the implemented B=1 graph from
+    // tensor descriptors. Expert slices are equal-sized within each stacked
+    // 3-D tensor, so selected useful bytes do not depend on which eight IDs
+    // the router chooses. This is a byte ledger, not a latency prediction.
+    auto bytes_of = [&](const std::string& name) -> uint64_t {
+        const GgufTensor* t = g.find(name);
+        if (!t) {
+            std::fprintf(stderr, "probe_gguf byte ledger: missing %s\n", name.c_str());
+            std::abort();
+        }
+        return t->bytes;
+    };
+    const uint32_t n_layers = g.get_u32("deepseek2.block_count");
+    const uint32_t n_dense  = g.get_u32("deepseek2.leading_dense_block_count");
+    const uint32_t n_experts= g.get_u32("deepseek2.expert_count");
+    const uint32_t top_k    = g.get_u32("deepseek2.expert_used_count");
+    const uint32_t vocab    = g.get_u32("deepseek2.vocab_size");
+    uint64_t steady_bytes = bytes_of("token_embd.weight") / vocab
+                          + bytes_of("output.weight");
+    uint64_t all_expert_bytes = steady_bytes;
+    uint64_t cold_norm_bytes = bytes_of("output_norm.weight");
+    uint64_t cold_absorb_bytes = 0;
+    uint64_t steady_reads = 2; // embedding row + output head
+    uint64_t all_expert_reads = 2;
+    char name[96];
+    for (uint32_t L = 0; L < n_layers; ++L) {
+        for (const char* suffix : {"attn_q_a.weight", "attn_q_b.weight",
+                                   "attn_kv_a_mqa.weight", "attn_output.weight"}) {
+            std::snprintf(name, sizeof(name), "blk.%u.%s", L, suffix);
+            uint64_t b = bytes_of(name);
+            steady_bytes += b; all_expert_bytes += b;
+            ++steady_reads; ++all_expert_reads;
+        }
+        std::snprintf(name, sizeof(name), "blk.%u.attn_kv_b.weight", L);
+        cold_absorb_bytes += bytes_of(name);
+        for (const char* suffix : {"attn_norm.weight", "ffn_norm.weight",
+                                   "attn_q_a_norm.weight", "attn_kv_a_norm.weight"}) {
+            std::snprintf(name, sizeof(name), "blk.%u.%s", L, suffix);
+            cold_norm_bytes += bytes_of(name);
+        }
+        if (L < n_dense) {
+            for (const char* suffix : {"ffn_gate.weight", "ffn_up.weight",
+                                       "ffn_down.weight"}) {
+                std::snprintf(name, sizeof(name), "blk.%u.%s", L, suffix);
+                uint64_t b = bytes_of(name);
+                steady_bytes += b; all_expert_bytes += b;
+                ++steady_reads; ++all_expert_reads;
+            }
+        } else {
+            for (const char* suffix : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+                                       "ffn_down_shexp.weight", "ffn_gate_inp.weight",
+                                       "exp_probs_b.bias"}) {
+                std::snprintf(name, sizeof(name), "blk.%u.%s", L, suffix);
+                uint64_t b = bytes_of(name);
+                steady_bytes += b; all_expert_bytes += b;
+                ++steady_reads; ++all_expert_reads;
+            }
+            for (const char* suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight",
+                                       "ffn_down_exps.weight"}) {
+                std::snprintf(name, sizeof(name), "blk.%u.%s", L, suffix);
+                uint64_t bank = bytes_of(name);
+                steady_bytes += (bank / n_experts) * top_k;
+                all_expert_bytes += bank;
+                steady_reads += top_k;
+                all_expert_reads += n_experts;
+            }
+        }
+    }
+    std::fprintf(stdout,
+        "runtime_byte_ledger:\n"
+        "  steady_selected_useful=%llu (%.3f GB) reads=%llu\n"
+        "  steady_all_experts=%llu (%.3f GB) reads=%llu reduction=%.3fx\n"
+        "  cold_resident_norms=%llu (%.3f MB) reads=%u\n"
+        "  cold_absorbed_source=%llu (%.3f MB) reads=%u\n"
+        "  isolated_step_total_useful=%llu (%.3f GB) reads=%llu\n",
+        (unsigned long long)steady_bytes, steady_bytes / 1e9,
+        (unsigned long long)steady_reads,
+        (unsigned long long)all_expert_bytes, all_expert_bytes / 1e9,
+        (unsigned long long)all_expert_reads,
+        all_expert_bytes / (double)steady_bytes,
+        (unsigned long long)cold_norm_bytes, cold_norm_bytes / 1e6,
+        n_layers * 4 + 1,
+        (unsigned long long)cold_absorb_bytes, cold_absorb_bytes / 1e6,
+        n_layers,
+        (unsigned long long)(steady_bytes + cold_norm_bytes + cold_absorb_bytes),
+        (steady_bytes + cold_norm_bytes + cold_absorb_bytes) / 1e9,
+        (unsigned long long)(steady_reads + n_layers * 5 + 1));
     for (uint32_t type : {uint32_t(GGML_F32), uint32_t(GGML_Q4_K),
                           uint32_t(GGML_Q5_K), uint32_t(GGML_Q6_K),
                           uint32_t(GGML_IQ2_XXS), uint32_t(GGML_IQ1_S)}) {
