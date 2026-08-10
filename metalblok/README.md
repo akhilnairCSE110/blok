@@ -4,6 +4,18 @@ MetalBlok is a bounded, native Metal inference runtime for the local
 DeepSeek-R1 671B `UD-IQ1_S` GGUF checkpoint. Correctness and host safety are
 release gates; caching, overlap, and kernel tuning come afterward.
 
+## Architecture package
+
+- [`docs/METALBLOK_PAPER.md`](docs/METALBLOK_PAPER.md) gives the arXiv-style
+  mathematical argument, complete transformer/MoE/MLA forward pass, measured
+  results, limitations, and chip implications.
+- [`docs/TENSOR_HARDWARE_SPEC.md`](docs/TENSOR_HARDWARE_SPEC.md) is the
+  tensor-by-tensor normative hardware contract: shapes, addresses, block
+  decoders, kernels, buffer states, byte counts, and concrete decisions.
+- [`docs/EVIDENCE_AND_REPRODUCIBILITY.md`](docs/EVIDENCE_AND_REPRODUCIBILITY.md)
+  separates exact, derived, implemented, measured, and proposed claims and
+  supplies the reproduction commands and saved-log index.
+
 The initial code is derived from the adjacent Blade prototype. Imported code
 is treated as untrusted until it passes MetalBlok's real-model gates.
 
