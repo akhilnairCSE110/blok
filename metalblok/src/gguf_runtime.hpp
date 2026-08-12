@@ -165,6 +165,8 @@ public:
 
     const GgufConfig& cfg() const { return cfg_; }
     uint32_t          pos() const { return pos_; }
+    static constexpr uint32_t kPrefillBatch = 128;
+    static constexpr uint32_t prefill_batch_size() { return kPrefillBatch; }
 
 private:
     // -----------------------------------------------------------------------
@@ -176,6 +178,7 @@ private:
     void alloc_kv_cache_();
     void load_resident_norms_();
     void load_fixed_projections_();
+    void stage_layer_(uint32_t layer);
     void alloc_expert_slots_();
     void build_grids_();
 
@@ -214,9 +217,14 @@ private:
     // hidden / 256 IQ1_S blocks (28 blocks * 50 bytes = 1400 bytes for R1).
     // Reads payload via PreadRing, dequants on CPU into x_b.contents.
     void embed_lookup_(uint32_t tok);
+    void embed_lookup_into_(uint32_t tok, const MtlBuf& dst);
 
     // The forward graph for ONE token. Used by both prefill and step.
     void forward_one_(uint32_t tok);
+    void prefill_chunk_(const uint32_t* ids, uint32_t count);
+    void attention_batch_(uint32_t layer, uint32_t count);
+    void dense_batch_(uint32_t layer, uint32_t count);
+    void moe_batch_(uint32_t layer, uint32_t count);
     void mla_attn_(uint32_t L);
     void ffn_dense_(uint32_t L);
     void ffn_moe_(uint32_t L);
@@ -251,6 +259,8 @@ private:
     };
     std::vector<LayerResident> lw_;
     Projection output_projection_;
+    MtlBuf layer_stage_;
+    std::array<std::atomic<bool>, 9> layer_ready_{};
     static constexpr uint32_t kExpertSlots = 24;
     std::array<MtlBuf, kExpertSlots> expert_slots_{};
     std::array<std::atomic<bool>, kExpertSlots> expert_ready_{};
@@ -271,6 +281,12 @@ private:
     MtlBuf router_wts_;     // [K]     f32
     MtlBuf logits_;         // [V]     f16
     MtlBuf next_tok_;       // [1]     u32
+
+    // DeepSeek-R1 layer-major prefill tile. At 256 tokens nearly every
+    // expert selected by the tile is loaded once instead of once per token.
+    MtlBuf x_b_, xn_b_, qa_b_, qan_b_, qf_b_, qn_b_, qr_b_;
+    MtlBuf kva_b_, kvlat_b_, kvfull_b_, ofull_b_, attnout_b_;
+    MtlBuf fg_b_, fu_b_, fa_b_, fo_b_, rlog_b_, ridx_b_, rwts_b_, routed_b_;
 
     // KV cache + scores scratch.
     // Separate resources prevent Metal from making a multi-GB monolithic

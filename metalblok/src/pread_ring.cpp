@@ -22,8 +22,17 @@ bool PreadRing::open(const std::vector<std::string>& shard_paths) {
         return false;
     }
 
-    shards_.reserve(shard_paths.size());
-    for (const auto& p : shard_paths) {
+    logical_shards_ = shard_paths.size();
+    lane_cursor_.assign(logical_shards_, 0);
+    shards_.reserve(logical_shards_ * kLanesPerShard);
+    auto fail = [&] {
+        for (auto& lane : shards_) if (lane->fd >= 0) ::close(lane->fd);
+        shards_.clear();
+        lane_cursor_.clear();
+        logical_shards_ = 0;
+        return false;
+    };
+    for (const auto& p : shard_paths) for (size_t lane = 0; lane < kLanesPerShard; ++lane) {
         auto s = std::make_unique<Shard>();
         s->owner = this;
         s->path = p;
@@ -33,8 +42,7 @@ bool PreadRing::open(const std::vector<std::string>& shard_paths) {
             std::snprintf(buf, sizeof(buf),
                           "open(%s) failed: %s", p.c_str(), std::strerror(errno));
             last_error_ = buf;
-            shards_.clear();
-            return false;
+            return fail();
         }
         // Critical: defeat the unified buffer cache. Test D1-D4 in
         // IO_PROBE_FINDINGS.md proves this is the only safe mode on M5.
@@ -45,8 +53,8 @@ bool PreadRing::open(const std::vector<std::string>& shard_paths) {
                           p.c_str(), std::strerror(errno));
             last_error_ = buf;
             ::close(s->fd);
-            shards_.clear();
-            return false;
+            s->fd = -1;
+            return fail();
         }
         // Disable read-ahead; we already issue large reads ourselves and
         // read-ahead just inflates the inactive queue.
@@ -69,12 +77,15 @@ void PreadRing::close() {
     if (!running_ && shards_.empty()) return;
     for (auto& s : shards_) {
         s->stop.store(true, std::memory_order_release);
+        s->wake.notify_one();
     }
     for (auto& s : shards_) {
         if (s->worker.joinable()) s->worker.join();
         if (s->fd >= 0) { ::close(s->fd); s->fd = -1; }
     }
     shards_.clear();
+    lane_cursor_.clear();
+    logical_shards_ = 0;
     running_ = false;
 }
 
@@ -83,7 +94,12 @@ void PreadRing::submit(uint32_t shard_idx,
                        uint64_t nbytes,
                        void*    dst,
                        std::atomic<bool>* done) {
-    Shard* s = shards_[shard_idx].get();
+    if (shard_idx >= logical_shards_) {
+        std::fprintf(stderr, "pread_ring: invalid shard %u\n", shard_idx);
+        std::abort();
+    }
+    const uint32_t lane = lane_cursor_[shard_idx]++ % kLanesPerShard;
+    Shard* s = shards_[shard_idx * kLanesPerShard + lane].get();
     // Wait for a free slot. Single-producer => only this thread writes head,
     // so head doesn't need atomic load with synchronization.
     uint64_t head = s->head.load(std::memory_order_relaxed);
@@ -99,6 +115,7 @@ void PreadRing::submit(uint32_t shard_idx,
     r.dst    = dst;
     r.done   = done;
     s->head.store(head + 1, std::memory_order_release);
+    s->wake.notify_one();
 }
 
 void PreadRing::wait(const std::atomic<bool>* done) {
@@ -129,7 +146,11 @@ void PreadRing::worker_loop(Shard* s) {
         uint64_t head = s->head.load(std::memory_order_acquire);
         if (tail == head) {
             if (s->stop.load(std::memory_order_acquire)) return;
-            std::this_thread::yield();
+            std::unique_lock<std::mutex> lock(s->mutex);
+            s->wake.wait(lock, [&] {
+                return s->stop.load(std::memory_order_acquire) ||
+                       s->head.load(std::memory_order_acquire) != tail;
+            });
             continue;
         }
         Request r = s->ring[tail % kQueueCapacity];

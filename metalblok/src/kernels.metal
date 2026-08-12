@@ -1627,6 +1627,73 @@ kernel void expert_down_accum_iq1_s(
         y[row] += alpha * value;
 }
 
+// Blocked prefill variants. Assignments sharing one expert execute together,
+// so its quantized rows remain hot while independent prompt positions fill
+// the GPU. `tokens` indexes the layer-major activation tile; `slots` indexes
+// [token, top-k-rank] output records and preserves the reference sum order.
+kernel void expert_gate_up_swiglu_iq1_s_b(
+    device const uchar* Wg [[buffer(0)]],
+    device const uchar* Wu [[buffer(1)]],
+    device const float* x [[buffer(2)]],
+    device float* y [[buffer(3)]],
+    device const ulong* grid [[buffer(4)]],
+    constant uint* tokens [[buffer(5)]],
+    constant uint& H [[buffer(6)]],
+    constant uint& Fe [[buffer(7)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    constexpr uint tgs = 32;
+    const uint row = group.x, item = group.y;
+    const uint nblk = H / 256;
+    const size_t stride = (size_t)nblk * 50;
+    device const float* input = x + (size_t)tokens[item] * H;
+    threadgroup float scratch[32];
+    float gate = tg_reduce_sum(iq1s_partial(Wg + row * stride, input, grid,
+                                            nblk, tid, tgs), tid, tgs, scratch);
+    float up = tg_reduce_sum(iq1s_partial(Wu + row * stride, input, grid,
+                                          nblk, tid, tgs), tid, tgs, scratch);
+    if (tid == 0) y[(size_t)item * Fe + row] =
+        (gate / (1.0f + exp(-gate))) * up;
+}
+
+kernel void expert_down_iq1_s_b(
+    device const uchar* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    device const ulong* grid [[buffer(3)]],
+    constant uint* slots [[buffer(4)]],
+    constant uint& Fe [[buffer(5)]],
+    constant uint& H [[buffer(6)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    constexpr uint tgs = 32;
+    const uint row = group.x, item = group.y;
+    const uint nblk = Fe / 256;
+    device const uchar* Wrow = W + (size_t)row * nblk * 50;
+    device const float* input = x + (size_t)item * Fe;
+    threadgroup float scratch[32];
+    float value = tg_reduce_sum(iq1s_partial(Wrow, input, grid, nblk, tid, tgs),
+                                tid, tgs, scratch);
+    if (tid == 0)
+        y[(size_t)slots[item] * H + row] = value;
+}
+
+kernel void moe_residual_merge_f32(
+    device float* x [[buffer(0)]],
+    device const float* shared [[buffer(1)]],
+    device const float* routed [[buffer(2)]],
+    device const float* weights [[buffer(3)]],
+    constant uint& H [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]) {
+    const uint token = gid / H, d = gid - token * H;
+    float value = shared[gid];
+    const size_t base = (size_t)token * K * H + d;
+    for (uint rank = 0; rank < K; ++rank)
+        value += weights[token * K + rank] * routed[base + (size_t)rank * H];
+    x[gid] += value;
+}
+
 // ---------------------------------------------------------------------------
 // GGUF q5_K fused dequant-gemv.
 //

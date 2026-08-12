@@ -17,7 +17,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,6 +31,7 @@ public:
     // Per-shard outstanding request capacity. 64 lets the runtime overlap
     // many expert fetches without ever blocking on submit().
     static constexpr size_t kQueueCapacity = 64;
+    static constexpr size_t kLanesPerShard = 4;
 
     // Open one fd per shard (O_RDONLY, then fcntl F_NOCACHE=1, F_RDAHEAD=0)
     // and spawn one worker thread per shard. On any failure, no fds remain
@@ -57,7 +60,7 @@ public:
     Stats stats() const;
 
     const std::string& last_error() const { return last_error_; }
-    size_t             shard_count() const { return shards_.size(); }
+    size_t             shard_count() const { return logical_shards_; }
 
     PreadRing() = default;
     ~PreadRing();
@@ -82,12 +85,16 @@ private:
         std::atomic<uint64_t> head{0};
         std::atomic<uint64_t> tail{0};
         std::atomic<bool>     stop{false};
+        std::mutex            mutex;
+        std::condition_variable wake;
         std::thread           worker;
     };
 
     static void worker_loop(Shard* s);
 
     std::vector<std::unique_ptr<Shard>> shards_;
+    std::vector<uint32_t>                lane_cursor_;
+    size_t                               logical_shards_ = 0;
     std::string                         last_error_;
     bool                                running_ = false;
     std::atomic<uint64_t> stat_bytes_{0};

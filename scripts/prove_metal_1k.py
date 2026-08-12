@@ -74,7 +74,7 @@ def state_position(path: Path) -> int:
             stream.read(HEADER.size)
         )
     if (magic, version, layers, context, rank, rope) != (
-        b"MBLKSTAT", 2, 61, 2_048, 512, 64,
+        b"MBLKSTAT", 3, 61, 2_048, 512, 64,
     ) or token >= 129_280:
         raise RuntimeError("proof checkpoint header is invalid")
     return pos
@@ -84,6 +84,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=MODEL)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--resume-state", type=Path,
+                        help="resume output from a completed 1000-token prefill")
     args = parser.parse_args()
     if not BINARY.is_file():
         subprocess.run(["cmake", "-S", str(ROOT / "metalblok"), "-B", str(BINARY.parent)], check=True)
@@ -95,12 +97,16 @@ def main() -> int:
         return 0
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    state = ROOT / "metalblok/runs" / f"proof-1k-{stamp}.state"
+    state = args.resume_state or ROOT / "metalblok/runs" / f"proof-1k-{stamp}.state"
+    if args.resume_state and state_position(state) != TARGET:
+        raise RuntimeError("resume checkpoint must be the completed 1000-token prefill")
     output = ROOT / "metalblok/runs" / f"proof-1k-{stamp}.txt"
     command = [
         str(RUNNER), prompt, "-n", str(TARGET), "--context", "2048",
-        "--state", str(state), "--checkpoint-every", "256",
+        "--state", str(state), "--checkpoint-every", "256", "--temperature", "0",
     ]
+    if args.resume_state:
+        command.append("--continue-decode")
     with output.open("w", encoding="utf-8") as saved:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
         assert process.stdout is not None

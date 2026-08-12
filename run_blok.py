@@ -82,6 +82,8 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--context", type=int, default=16_384)
     parser.add_argument("--model", type=Path, default=Path(os.getenv("METALBLOK_MODEL", MODEL)))
     parser.add_argument("--state", type=Path, help="new or existing conversation checkpoint")
+    parser.add_argument("--continue-decode", action="store_true",
+                        help="continue the unfinished decode loop in --state")
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--seed", type=int, default=3407)
@@ -108,7 +110,10 @@ def run(args: argparse.Namespace) -> int:
     stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
     state = (args.state or Path("/tmp") / f"metalblok-{stamp}.state").expanduser().resolve()
     log_path = ROOT / "metalblok/runs" / f"run-{stamp}.log"
+    output_path = ROOT / "metalblok/runs" / f"run-{stamp}.txt"
     resume = state.exists()
+    if args.continue_decode and not resume:
+        raise Error("--continue-decode requires an existing --state checkpoint")
     if Path(f"{state}.partial").exists():
         raise Error(f"partial checkpoint needs inspection: {state}.partial")
     if resume:
@@ -127,31 +132,53 @@ def run(args: argparse.Namespace) -> int:
         "--checkpoint-every", str(args.checkpoint_every),
     ]
     if resume:
-        command.append("--resume-turn")
+        command.append("--continue-state" if args.continue_decode else "--resume-turn")
     env = os.environ.copy()
     if args.trace:
         env["METALBLOK_TRACE"] = "1"
     note(f"input={inputs} output_cap={args.max_output_tokens} context={args.context}")
     note(f"state={state}")
     note(f"diagnostics={log_path}")
+    note(f"output={output_path}")
 
-    with Path("/tmp/metalblok-run.lock").open("a+") as lock, log_path.open("ab", buffering=0) as log:
+    with (Path("/tmp/metalblok-run.lock").open("a+") as lock,
+          log_path.open("ab", buffering=0) as log,
+          output_path.open("wb", buffering=0) as output):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise Error("another MetalBlok run is active") from exc
-        process = subprocess.Popen(command, stdout=None, stderr=log, env=env)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=log, env=env)
+        assert process.stdout is not None
+        os.set_blocking(process.stdout.fileno(), False)
+
+        def drain_output() -> bool:
+            changed = False
+            while True:
+                try:
+                    chunk = os.read(process.stdout.fileno(), 65_536)
+                except BlockingIOError:
+                    break
+                if not chunk:
+                    break
+                output.write(chunk)
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.buffer.flush()
+                changed = True
+            return changed
+
         size = 0
         active = time.monotonic()
         try:
             while process.poll() is None:
                 current = os.fstat(log.fileno()).st_size
-                if current != size:
+                if current != size or drain_output():
                     size, active = current, time.monotonic()
                 elif time.monotonic() - active > args.stall_timeout:
                     process.terminate()
                     raise Error(f"native runtime made no logged progress for {args.stall_timeout}s")
                 time.sleep(0.25)
+            drain_output()
         except KeyboardInterrupt:
             process.terminate()
             process.wait(10)

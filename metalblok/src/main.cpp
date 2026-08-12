@@ -641,6 +641,7 @@ static void usage() {
 "      --context    <N>     KV capacity; default 64 for safe bring-up\n"
 "      --raw-prompt          bypass the DeepSeek-R1 user/assistant template\n"
 "      --tokenize-only       print formatted prompt token IDs and exit\n"
+"      --decode-ids  <csv>   decode comma-separated token IDs and exit\n"
 "      --state       <file>  exact per-token MLA KV checkpoint\n"
 "      --single-step-token N process one token, save --state, print next token\n"
 "      --continue-state      emit/extend generation already stored in --state\n"
@@ -685,6 +686,7 @@ int main(int argc, char** argv) {
     bool        validate_router_flag = false;
     bool        raw_prompt = false;
     bool        tokenize_only = false;
+    const char* decode_ids = nullptr;
     const char* state_path = nullptr;
     bool        single_step = false;
     uint32_t    single_step_token = 0;
@@ -720,6 +722,7 @@ int main(int argc, char** argv) {
         else if ( a == "--validate-router")                         validate_router_flag = true;
         else if ( a == "--raw-prompt")                              raw_prompt = true;
         else if ( a == "--tokenize-only")                            tokenize_only = true;
+        else if ( a == "--decode-ids" && i+1 < argc)                 decode_ids = argv[++i];
         else if ( a == "--state" && i+1 < argc)                      state_path = argv[++i];
         else if ( a == "--single-step-token" && i+1 < argc) {
             single_step = true;
@@ -752,7 +755,7 @@ int main(int argc, char** argv) {
     if (ginfo) return gguf_info(ginfo);
     if (probe_t_path && probe_t_name) return probe_tensor(probe_t_path, probe_t_name);
     if (vgemv_path && vgemv_name)     return validate_gemv(vgemv_path, vgemv_name, force);
-    if (!model_dir || !prompt) usage();
+    if (!model_dir || (!prompt && !decode_ids)) usage();
     if (n_predict <= 0) n_predict = 128;
     if (continue_state && resume_turn) {
         std::fprintf(stderr, "metalblok: choose one of --continue-state or --resume-turn\n");
@@ -803,6 +806,23 @@ int main(int argc, char** argv) {
             gmeta.open(mpath);
             Tokenizer tok;
             tok.load_from_gguf(gmeta);
+            if (decode_ids) {
+                std::vector<uint32_t> decoded;
+                const char* p = decode_ids;
+                while (*p) {
+                    char* end = nullptr;
+                    unsigned long id = std::strtoul(p, &end, 10);
+                    if (end == p || id >= gmeta.get_u32("deepseek2.vocab_size")) return 2;
+                    decoded.push_back(static_cast<uint32_t>(id));
+                    if (*end == ',') p = end + 1;
+                    else if (*end == '\0') p = end;
+                    else return 2;
+                }
+                const std::string text = tok.decode(decoded);
+                std::fwrite(text.data(), 1, text.size(), stdout);
+                std::putchar('\n');
+                return 0;
+            }
             std::string formatted_prompt = raw_prompt
                 ? std::string(prompt)
                 : std::string("<｜User｜>") + prompt +
@@ -915,10 +935,12 @@ int main(int argc, char** argv) {
                 reused = 0;
             }
             if (!continue_state) {
-                for (uint32_t i = reused; i < ids.size(); ++i) {
-                    next = rt.step(ids[i]);
-                    if (state_path && rt.pos() % checkpoint_every == 0 && !rt.save_state(state_path)) {
-                        std::fprintf(stderr, "metalblok: failed to save state: %s\n", state_path);
+                if (reused < ids.size()) {
+                    next = rt.prefill(ids.data() + reused,
+                                      static_cast<uint32_t>(ids.size() - reused));
+                    if (state_path && !rt.save_state(state_path)) {
+                        std::fprintf(stderr, "metalblok: failed to save prefill state: %s\n",
+                                     state_path);
                         return 5;
                     }
                 }

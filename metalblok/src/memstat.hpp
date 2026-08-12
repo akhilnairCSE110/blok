@@ -95,6 +95,7 @@ inline Snapshot snapshot() {
     }
 #endif
     if (s.available == 0) s.available = s.free;   // fallback
+    if (s.total && s.available > s.total) s.available = s.total;
     return s;
 }
 
