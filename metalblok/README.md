@@ -34,6 +34,8 @@ For persistent chat and interruption recovery, read the
 
 ## Architecture and evidence
 
+- [Complete V0 architecture](docs/V0_ARCHITECTURE.md): deep mathematical,
+  memory, NVMe, Metal, concurrency, KV, and performance rationale.
 - [V0 closeout](docs/V0_CLOSEOUT.md): implemented schedule, rejected
   optimizations, measured deltas, logging contract, and acceptance artifacts.
 - [Tensor/hardware specification](docs/TENSOR_HARDWARE_SPEC.md): normative
@@ -54,4 +56,3 @@ ctest --test-dir metalblok/build --output-on-failure
 The standard build runtime-compiles `kernels.metal`; an offline `.metallib` is
 optional. `--preflight` reads allocation metadata rather than model payload and
 must report `all_resident=true` before inference.
-

@@ -1,5 +1,9 @@
 # GLM-5.2 FP8 on a 16 GB Consumer GPU with NVMe-Resident Weights
 
+> **Proposed Linux port, not active V0.** This note is retained as future
+> CUDA/uGDS model research. It is neither implemented nor evidence about the
+> current [DeepSeek-R1 Apple-Metal V0](../../metalblok/docs/V0_ARCHITECTURE.md).
+
 ## A capacity proof, direct-storage execution specification, and extension of the Blok thesis to DSA and IndexShare
 
 **Status:** proposed Blok port; GLM execution is not implemented in this repository

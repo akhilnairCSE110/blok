@@ -12,7 +12,7 @@ endif()
 option(METALBLOK_OFFLINE_METALLIB "Compile an offline metallib with xcrun" OFF)
 option(METALBLOK_FAST_MATH "Enable fast-math only after correctness parity" OFF)
 
-add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter
+add_compile_options(-Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter
                     -fno-exceptions -fno-rtti -O2)
 if(METALBLOK_FAST_MATH)
   add_compile_options(-ffast-math)

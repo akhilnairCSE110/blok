@@ -1,5 +1,10 @@
 # Mathematical Foundations of Blok
 
+> **Legacy/future Linux research scope.** The proofs below support the separate
+> Kimi/GLM CUDA/uGDS design. They do not describe the active Metal execution
+> graph or its finite-precision K/V choice. See the
+> [MetalBlok V0 architecture](../../metalblok/docs/V0_ARCHITECTURE.md).
+
 ## From token tensors to exact MoE-selected storage reads
 
 **Date:** 2026-08-10

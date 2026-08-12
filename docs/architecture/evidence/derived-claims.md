@@ -1,5 +1,9 @@
 # Derived Architecture Evidence
 
+> **Legacy/future Linux evidence.** These deterministic Kimi/GLM calculations
+> support the CUDA/uGDS documents only. Active M5/DeepSeek measurements are in
+> the [MetalBlok evidence ledger](../../../metalblok/docs/EVIDENCE_AND_REPRODUCIBILITY.md).
+
 **Evidence class:** deterministic integer derivation and source audit. These values are not measured latency or bandwidth.
 
 Reproduce with:

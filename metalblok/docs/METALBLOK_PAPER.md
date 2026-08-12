@@ -216,4 +216,5 @@ gate.
 2. DeepSeek-AI, [*DeepSeek-V3 Technical Report*](https://arxiv.org/abs/2412.19437).
 3. DeepSeek-AI, [*DeepSeek-R1*](https://arxiv.org/abs/2501.12948).
 4. Apple, [Metal shared storage documentation](https://developer.apple.com/documentation/metal/mtlresourceoptions/storagemodeshared).
-
+5. Apple, [14-inch MacBook Pro (M5) technical specifications](https://support.apple.com/en-us/125405).
+6. Apple, [Metal Performance Primitives Programming Guide](https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf).

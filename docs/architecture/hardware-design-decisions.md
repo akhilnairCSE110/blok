@@ -1,5 +1,10 @@
 # Blok Hardware Design Decisions
 
+> **Legacy/future Linux research scope.** This document describes the separate
+> NVIDIA/CUDA/uGDS program; it is not the executing Apple V0 and its Kimi/GLM
+> numbers must not be attributed to MetalBlok. The active DeepSeek-R1/M5
+> architecture is [MetalBlok V0](../../metalblok/docs/V0_ARCHITECTURE.md).
+
 ## What is being built, why each choice exists, and how to test it
 
 **Date:** 2026-08-10

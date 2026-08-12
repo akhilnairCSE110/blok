@@ -55,9 +55,17 @@ The model's own router makes the dynamic part knowable. Virtual memory cannot
 make the capacity mismatch disappear; mapping the entire payload merely turns
 explicit scheduling into uncontrolled page faults and cache pollution.
 
+Apple's specification for this exact class of machine reports a 10-core GPU,
+24 GB as a supported unified-memory configuration, and 153 GB/s unified-memory
+bandwidth. Those are hardware ceilings, not application throughput. V0 logs
+about 3.2–4.6 GB/s for its file-read span and about 0.5 seconds of GPU work for
+13.588 GB of streamed model payload, so the measured critical boundary is the
+SSD/file schedule rather than the advertised unified-memory ceiling.
+
 ### 2.2 Unified memory
 
-`MTLStorageModeShared` is visible to the CPU and GPU. A weight read lands in
+[`MTLStorageModeShared`](https://developer.apple.com/documentation/metal/mtlstoragemode/shared)
+is visible to the CPU and GPU. A weight read lands in
 the same allocation later bound to the Metal encoder. There is no explicit
 host-to-discrete-VRAM copy:
 
@@ -91,10 +99,17 @@ The separate Apple Neural Engine is not a documented raw-Metal execution
 target. Moving an intermediate through Core ML would add framework conversion,
 synchronization, and shared-memory traffic at every layer boundary. V0 keeps
 the complete graph on the Metal command queue. Any future ANE split must show
-lower end-to-end time and identical tokens, including transfer costs. The same
-discipline applies to undocumented assumptions about M5 per-GPU-core neural
-accelerators: V0 relies only on behavior exposed by Metal and measured on the
-actual chip.
+lower end-to-end time and identical tokens, including transfer costs.
+
+Apple separately documents a GPU Neural Accelerator and a
+[Metal Performance Primitives path](https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf)
+for authoring kernels that use it on M5. The current GGUF IQ1_S/IQ2_XXS/K-quant
+decode is fused into custom MSL row reductions and does not claim that MPP
+tensor path. Repacking an exact weight family into a supported block-scaled
+tensor representation could make that a future compute experiment, but it
+must include repack/storage bytes and parity. With current GPU time already
+mostly hidden under a much longer SSD span, an unmeasured accelerator rewrite
+is lower leverage than removing model bytes or I/O stalls.
 
 ## 3. Frozen model geometry
 
@@ -467,6 +482,101 @@ command buffers. The router host-visibility boundary explains the MoE split;
 all other dependent kernels stay ordered inside encoders rather than paying a
 host round trip per operation.
 
+### 8.6 Exact relationship to [*LLM in a Flash*](https://arxiv.org/abs/2312.11514)
+
+MetalBlok shares that paper's governing inequality: when a checkpoint is
+larger than memory, inference time is controlled by the minimum model bytes
+that must cross the storage boundary, their physical request layout, and the
+reuse that fits without displacing required state. It adopts those ideas only
+where the checkpoint supplies an exact decision.
+
+DeepSeek's router gives a stronger predicate than predicting active neurons in
+a dense FFN. After exact top-8 selection, the remaining 248 routed experts have
+coefficient zero, so omitting their records cannot change arithmetic. This is
+the V0 form of conditional weight streaming. It is deterministic *after* the
+router boundary, not before it; the residual feeding the next router is not
+available early enough to justify speculative next-layer expert reads.
+
+The paper's row-column bundling intuition maps to an expert's gate, up, and
+down records: a selected expert requires all three. The current GGUF stores
+them as separate banks, so V0 performs three exact slices per expert. A future
+repack can place the three slices in one aligned record, reducing request and
+address-translation overhead without changing useful bytes. V0 does not claim
+that improvement before a repacked artifact exists.
+
+Its temporal windowing idea maps to an expert cache across decode positions.
+That cache is deliberately absent from the release default. The 24 GB machine
+must already preserve 8.203 GB of exact KV address space, the resident output
+head, two layer slabs, scratch, and macOS headroom. A cache policy is useful
+only if
+
+\[
+P(hit)\,B_{saved}/B_{NVMe} > t_{lookup}+t_{pressure}+t_{eviction},
+\]
+
+where `t_pressure` includes compression/swap consequences, not merely cache
+lookup time. The 2 GiB fixed-cache experiment demonstrated this constraint:
+it removed bytes but produced unsafe pressure for the long run. Thus V0
+implements exact sparsity and co-required overlap now, retains expert
+repacking and measured temporal reuse as the next evidence-driven steps, and
+does not turn a paper analogy into an unverified feature claim.
+
+### 8.7 Dependency graph: what is parallel, concurrent, or necessarily serial
+
+The decode schedule is a data-dependency graph, not a blanket request to
+“parallelize everything”:
+
+```text
+fixed(L) ready
+      |
+      +--> attention/L --> FFN norm --> router --> exact IDs/weights
+      |                                      |             |
+      |                                      |             +--> 24 urgent preads --+
+      |                                      +--> shared expert on GPU -------------+--> join
+      |                                                                                |
+      |                                                           routed experts rank 0..7
+      |                                                                                |
+      +== fixed(L+1) background prefetch overlaps the entire layer ====================+--> residual L
+                                                                                              |
+                                                                                         attention L+1
+```
+
+There are four distinct forms of parallel work:
+
+1. The reader has 12 workers, so independent shard ranges can be in flight at
+   once. Urgent and background queues determine priority, not arithmetic.
+2. Fixed layer `L+1` I/O overlaps GPU execution of layer `L` through the second
+   slab. It is legal because fixed addresses are unconditional.
+3. After routing, selected expert I/O overlaps shared-expert GPU execution.
+   Both depend on the router but not on one another.
+4. Inside Metal, GEMV output rows, 128 attention heads, score lanes, and
+   prefill expert assignments are data-parallel threadgroups.
+
+The following boundaries remain serial for correctness:
+
+- layer `L+1` consumes the final residual of layer `L`;
+- the router consumes the post-attention normalized residual;
+- expert file offsets are unknown until exact router completion is host-visible;
+- attention's max, exponential sum, and weighted-value passes form a stable
+  online-softmax dependency;
+- routed expert contributions accumulate in top-k rank order, matching the
+  accepted finite-precision path;
+- final sampling consumes all 129,280 completed logits.
+
+Query and KV projections are mathematically independent after the attention
+RMSNorm, but V0 leaves them in one ordered command stream. Splitting them would
+add command buffers and concurrent reads of the same activation while the
+measured GPU term is already much smaller than storage time. Likewise, eight
+decode experts could use eight activation/output arenas, but the added memory,
+parallel accumulation, and changed FP32 summation order conflict with the
+capacity/parity gates. Prefill obtains safe expert parallelism differently: it
+writes independent `[token,rank]` slots and performs a final rank-ordered merge.
+
+This distinction is central to the co-design: concurrency is used where
+ownership and dependencies prove it safe; fusion is used where it removes a
+materialized intermediate without changing accepted rounding; and serial work
+is preserved when it carries model semantics or a finite-precision ordering.
+
 ## 9. Layer-major blocked prefill
 
 Token-major prefill would stream most of the active model once per prompt
@@ -742,4 +852,3 @@ Only changes with a direct path to the measured reward vector are justified:
 
 The V0 architecture is intentionally specific. Generality comes after one
 model, one checkpoint, one machine, and one 1,000+1,000 run are correct.
-

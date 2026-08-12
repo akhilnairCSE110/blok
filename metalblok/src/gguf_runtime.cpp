@@ -167,7 +167,7 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
     // Full pre-allocation ledger. This legacy GGUF contains the combined
     // attn_kv_b tensor, so exact parity requires expanded per-head K/V state.
     // Only the output head is permanently resident. Per-layer fixed weights
-    // use one bounded slab; pinning all 61 layers competes with the exact KV
+    // use two bounded slabs; pinning all 61 layers competes with the exact KV
     // cache and triggers macOS compression at 1K context.
     const uint64_t Dn = cfg_.key_length - cfg_.rope_dim;
     const uint64_t kv = uint64_t(cfg_.n_layers) * cfg_.max_seq *
@@ -303,7 +303,7 @@ void GgufRuntime::parse_config_(const Gguf& g) {
     cfg_.vocab            = g.get_u32("deepseek2.vocab_size");
     cfg_.rms_eps          = g.get_f32_or("deepseek2.attention.layer_norm_rms_epsilon", 1e-6f);
     // DeepSeek applies mscale^2 to QK and YaRN interpolation to rotary
-    // frequencies. The latter is implemented in the pinned Metal NEOX
+    // frequencies. The latter is implemented in the pinned consecutive-pair
     // kernels; this value is only the former softmax multiplier.
     cfg_.yarn_mscale = 1.0f;
     {
@@ -319,9 +319,8 @@ void GgufRuntime::parse_config_(const Gguf& g) {
             cfg_.yarn_mscale = (float)(m * m);
         }
     }
-    // MoE routing parameters. R1 declares sigmoid gating (==2), a routed
-    // scaling factor of 2.5, and weight normalization. Defaults keep the
-    // legacy softmax path for models that omit these keys.
+    // R1 declares sigmoid gating (==2), scale 2.5, and normalized top-k.
+    // Defaults make omitted metadata fail the pinned-contract check below.
     cfg_.expert_gating_func   = g.get_u32_or("deepseek2.expert_gating_func", 1);
     cfg_.expert_weights_scale = g.get_f32_or("deepseek2.expert_weights_scale", 1.0f);
     cfg_.expert_weights_norm  =
@@ -412,8 +411,7 @@ void GgufRuntime::verify_tensor_table_(const GgufModel& gm) const {
             std::snprintf(buf, sizeof(buf), "blk.%u.ffn_gate_inp.weight", L);
             require_(gm, buf, cfg_.hidden, cfg_.n_experts);
             std::snprintf(buf, sizeof(buf), "blk.%u.exp_probs_b.bias", L);
-            if (!gm.find(buf))
-                std::fprintf(stderr, "gguf_runtime: note: %s absent\n", buf);
+            require_(gm, buf, cfg_.n_experts, 0);
 
             std::snprintf(buf, sizeof(buf), "blk.%u.ffn_gate_shexp.weight", L);
             require_(gm, buf, cfg_.hidden, 0);
@@ -503,9 +501,6 @@ void GgufRuntime::alloc_activations_() {
     rwts_b_    = fp32(B * cfg_.n_experts_active);
     routed_b_  = fp32(B * cfg_.n_experts_active * H);
 
-    // Zero bias for V3-style router fallback.
-    zero_bias_ = mtl_->alloc((size_t)cfg_.n_experts * 4);
-    std::memset(zero_bias_.contents, 0, (size_t)cfg_.n_experts * 4);
 }
 
 void GgufRuntime::alloc_kv_cache_() {
@@ -597,15 +592,15 @@ void GgufRuntime::load_resident_norms_() {
         load_into(buf, lw_[L].kv_a_norm, cfg_.kv_lora_rank);
         if (L >= cfg_.n_dense_layers) {
             std::snprintf(buf, sizeof(buf), "blk.%u.exp_probs_b.bias", L);
-            if (const auto* e = gm_->find(buf)) {
-                if (e->type != GGML_F32 || e->nbytes != uint64_t(cfg_.n_experts) * 4)
-                    die("router bias must be f32[n_experts]");
-                lw_[L].router_bias = mtl_->alloc(e->nbytes);
-                std::atomic<bool> done{false};
-                gm_->ring().submit(e->shard, e->abs_offset, e->nbytes,
-                                   lw_[L].router_bias.contents, &done);
-                PreadRing::wait(&done);
-            }
+            const auto* e = gm_->find(buf);
+            if (!e || e->type != GGML_F32 ||
+                e->nbytes != uint64_t(cfg_.n_experts) * 4)
+                die("router bias must be f32[n_experts]");
+            lw_[L].router_bias = mtl_->alloc(e->nbytes);
+            std::atomic<bool> done{false};
+            gm_->ring().submit(e->shard, e->abs_offset, e->nbytes,
+                               lw_[L].router_bias.contents, &done);
+            PreadRing::wait(&done);
         }
     }
     load_into("output_norm.weight", output_norm_b_, cfg_.hidden);
@@ -931,8 +926,8 @@ void GgufRuntime::mla_attn_(uint32_t L) {
     float eps = cfg_.rms_eps;
     float scale = (1.0f / std::sqrt((float)(Dn + Dr))) * cfg_.yarn_mscale;
 
-    // All weights are immutable and resident. Metal preserves dispatch order
-    // inside this command buffer, including current-position cache writes.
+    // Current-layer weights are immutable and ready in staged/cached shared
+    // buffers. Metal preserves dispatch order, including the cache writes.
     mtl_->begin();
     rmsnorm_f32(*mtl_, x_, w.attn_norm, x_norm_, H, eps);
     dispatch_projection_(w.q_a, x_norm_, q_a_);
@@ -982,9 +977,7 @@ void GgufRuntime::ffn_dense_(uint32_t L) {
 // ---------------------------------------------------------------------------
 // MoE FFN (R1: layers n_dense_layers..n_layers-1).
 //
-// Routing mode for R1 (V3 family, norm_topk_prob=true) = 0 in router_topk_f16.
-// If the per-expert bias `exp_probs_b.bias` is present we bind it; otherwise
-// the kernel sees zero_bias_ and the same softmax+norm path is exercised.
+// The pinned R1 checkpoint uses exact grouped sigmoid/noaux_tc routing.
 // ---------------------------------------------------------------------------
 void GgufRuntime::ffn_moe_(uint32_t L) {
     const auto& w = lw_[L];
@@ -993,29 +986,20 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
     const uint32_t Fs = w.ffn_gate.N;
     const uint32_t K  = cfg_.n_experts_active;
     const uint32_t Ne = cfg_.n_experts;
-    const MtlBuf& bias = w.router_bias.obj ? w.router_bias : zero_bias_;
 
-    // Router is the only serial discovery point. Keep its matrix and bias
-    // resident and publish top-8 before any routed expert read is issued.
+    // Router is the serial discovery point. Its staged/cached matrix and
+    // resident bias publish top-8 before any routed expert read is issued.
     rmsnorm_f32(*mtl_, x_, w.ffn_norm, x_norm_, H, cfg_.rms_eps);
     dispatch_projection_(w.router, x_norm_, router_log_);
-    if (cfg_.expert_gating_func == 2) {
-        float scale = cfg_.expert_weights_scale;
-        uint32_t norm = cfg_.expert_weights_norm;
-        const uint32_t groups = cfg_.n_expert_groups;
-        const uint32_t top_groups = cfg_.n_limited_groups;
-        mtl_->dispatch("router_topk_grouped_sigmoid_f32",
-                       { router_log_, bias, router_idx_, router_wts_ },
-                       { {&Ne,4},{&K,4},{&groups,4},{&top_groups,4},
-                         {&scale,4},{&norm,4} },
-                       1, 1, true);
-    } else {
-        uint32_t mode = 0u;
-        mtl_->dispatch("router_topk_f16",
-                       { router_log_, bias, router_idx_, router_wts_ },
-                       { {&Ne,4},{&K,4},{&mode,4} },
-                       1, 1, true);
-    }
+    float scale = cfg_.expert_weights_scale;
+    uint32_t norm = cfg_.expert_weights_norm;
+    const uint32_t groups = cfg_.n_expert_groups;
+    const uint32_t top_groups = cfg_.n_limited_groups;
+    mtl_->dispatch("router_topk_grouped_sigmoid_f32",
+                   { router_log_, w.router_bias, router_idx_, router_wts_ },
+                   { {&Ne,4},{&K,4},{&groups,4},{&top_groups,4},
+                     {&scale,4},{&norm,4} },
+                   1, 1, true);
     mtl_->commit_and_wait();
 
     if (trace_ && L == 3) {
@@ -1202,7 +1186,6 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
     const uint32_t H = cfg_.hidden, Fe = cfg_.expert_ffn;
     const uint32_t Fs = w.ffn_gate.N, K = cfg_.n_experts_active;
     const uint32_t Ne = cfg_.n_experts;
-    const MtlBuf& bias = w.router_bias.obj ? w.router_bias : zero_bias_;
     auto row = [](const MtlBuf& b, uint32_t i, size_t n) {
         return view(b, size_t(i) * n * sizeof(float), n * sizeof(float));
     };
@@ -1218,7 +1201,7 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
     const uint32_t groups = cfg_.n_expert_groups, top_groups = cfg_.n_limited_groups;
     for (uint32_t i = 0; i < count; ++i)
         mtl_->dispatch("router_topk_grouped_sigmoid_f32",
-                       {row(rlog_b_, i, Ne), bias,
+                       {row(rlog_b_, i, Ne), w.router_bias,
                         view(ridx_b_, size_t(i) * K * 4, size_t(K) * 4),
                         view(rwts_b_, size_t(i) * K * 4, size_t(K) * 4)},
                        {{&Ne,4},{&K,4},{&groups,4},{&top_groups,4},

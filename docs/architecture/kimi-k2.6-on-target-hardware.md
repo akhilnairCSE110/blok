@@ -1,5 +1,10 @@
 # Kimi K2.6 on a 16 GB Consumer GPU with NVMe-Resident Weights
 
+> **Legacy Linux target, not active V0.** This is the pinned Kimi/CUDA/uGDS
+> research path for different hardware and a different checkpoint. The current
+> working inference engine is the
+> [DeepSeek-R1 Apple-Metal V0](../../metalblok/docs/V0_ARCHITECTURE.md).
+
 ## A direct-storage MoE execution design, mathematical audit, and statement of the Blok thesis
 
 **Status:** systems design and implementation audit, 2026-08-09

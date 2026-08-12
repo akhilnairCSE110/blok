@@ -38,6 +38,7 @@ scripts/prove_metal_1k.py
 ```
 
 See the [complete CLI guide](metalblok/docs/RUN_GUIDE.md),
+[deep architecture](metalblok/docs/V0_ARCHITECTURE.md),
 [V0 closeout](metalblok/docs/V0_CLOSEOUT.md), and
 [current status](metalblok/STATUS.md). Output text, native timing, token/logit,
 NVMe, Metal, memory-pressure, and checkpoint evidence is saved under
@@ -57,7 +58,6 @@ missing, sparse, dataless, wrong-sized, or wrong-model shard before inference.
 
 ## Repository scope
 
-`metalblok/` and `run_blok.py` are the active M5/DeepSeek V0. The root Rust,
-CUDA, Kimi, GLM, and vendored `sub_dir/uGDS` material records a separate Linux
+`metalblok/` and `run_blok.py` are the active M5/DeepSeek V0. The root CUDA,
+Kimi, GLM, and vendored `sub_dir/uGDS` material records a separate Linux
 research target; it is not linked into or required by the MetalBlok CLI.
-

@@ -55,7 +55,7 @@ struct GgufConfig {
     // YaRN but is functional with mscale=1.0 for short prompts; we keep this
     // conservative default and only multiply the attention scale by it.
     float    yarn_mscale       = 1.0f;
-    // MoE routing (DeepSeek-V3 / R1). expert_gating_func: 1=softmax, 2=sigmoid.
+    // Pinned R1 routing metadata; initialization rejects non-sigmoid paths.
     // expert_weights_scale = routed_scaling_factor (2.5 for R1).
     // expert_weights_norm  = normalize the K chosen weights to sum 1.
     uint32_t expert_gating_func   = 1;     // deepseek2.expert_gating_func
@@ -226,9 +226,6 @@ private:
     std::vector<MtlBuf> v_cache_; // each [max_seq, HE, Dv] f16
     std::vector<MtlBuf> k_rope_;  // each [max_seq, Dr]     f16
     MtlBuf scores_;         // [HE, max_seq]             f32
-
-    // Zero-bias buffer for V3-style routing when exp_probs_b is absent.
-    MtlBuf zero_bias_;      // [Ne]    f32
 
     // Vendored codebook grids copied once into Metal-owned shared buffers.
     MtlBuf iq1s_grid_b_;
