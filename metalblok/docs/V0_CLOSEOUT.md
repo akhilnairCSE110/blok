@@ -113,8 +113,9 @@ with greedy decoding. The old and optimized paths produced identical anchors:
 |---|---:|---:|
 | model bytes | 13,849,970,112 | 13,587,632,064 |
 | logical reads | 1,939 | 1,869 |
-| steady wall time | about 3.76–3.96 s | about 3.09–3.22 s |
-| effective NVMe | about 3.1–3.3 GB/s late in run | about 4.4–4.6 GB/s |
+| best steady wall interval | about 3.76–3.96 s | about 3.09–3.22 s |
+| best effective NVMe interval | about 3.1–3.3 GB/s | about 4.4–4.6 GB/s |
+| late long-run wall / NVMe | not instrumented equally | about 4.2–4.5 s / 3.1–3.4 GB/s |
 | GPU kernel time | about 0.48–0.54 s | about 0.47–0.52 s |
 | Metal command buffers | 178 | 178 |
 | hot-path allocations | 0 | 0 |
@@ -126,6 +127,14 @@ caused materially more memory compression on the 24 GB host, so it was not
 chosen as the safe default. `METALBLOK_FIXED_CACHE_MB=0..2048` remains an
 explicit measured tuning control, guarded by live available memory plus a
 2 GiB cache margin.
+
+The long run also found a limit that a short benchmark missed. Through
+position 1,848, host-wide VM counters recorded 2,129 swap-ins and 116
+swap-outs. The counters include other macOS processes and do not identify
+which process owned a page, but they are still a real contention signal. The
+model remained coherent and atomic state remained valid; the impact is a
+slower sustained storage path. The best interval is retained as optimization
+evidence, while the late interval is the conservative 24 GB demo expectation.
 
 ## Telemetry contract
 
@@ -199,4 +208,5 @@ repacked expert format, larger safe fixed/cache capacity on a higher-memory
 host, true quantized matrix-matrix fixed projections for prefill, and a
 finite-precision-compatible compact MLA representation. Each enters only if it
 improves bytes, requests, overlap, or compute while preserving token parity.
-
+The full staged path to one-million input plus one-million output tokens is in
+[`MILLION_TOKEN_SCALE_PLAN.md`](MILLION_TOKEN_SCALE_PLAN.md).

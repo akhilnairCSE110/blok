@@ -36,6 +36,9 @@ For persistent chat and interruption recovery, read the
 
 - [Complete V0 architecture](docs/V0_ARCHITECTURE.md): deep mathematical,
   memory, NVMe, Metal, concurrency, KV, and performance rationale.
+- [Million-token scale plan](docs/MILLION_TOKEN_SCALE_PLAN.md): the paged
+  state, compact MLA, SSD attention, QMM prefill, and model-quality path to
+  one-million input plus one-million output tokens.
 - [V0 closeout](docs/V0_CLOSEOUT.md): implemented schedule, rejected
   optimizations, measured deltas, logging contract, and acceptance artifacts.
 - [Tensor/hardware specification](docs/TENSOR_HARDWARE_SPEC.md): normative

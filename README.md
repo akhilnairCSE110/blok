@@ -35,10 +35,13 @@ For the exact 1,000-input/1,000-output coding acceptance:
 
 ```sh
 scripts/prove_metal_1k.py
+# equivalent project-level entry point:
+./end_goal_prompt.py
 ```
 
 See the [complete CLI guide](metalblok/docs/RUN_GUIDE.md),
 [deep architecture](metalblok/docs/V0_ARCHITECTURE.md),
+[million-token scale plan](metalblok/docs/MILLION_TOKEN_SCALE_PLAN.md),
 [V0 closeout](metalblok/docs/V0_CLOSEOUT.md), and
 [current status](metalblok/STATUS.md). Output text, native timing, token/logit,
 NVMe, Metal, memory-pressure, and checkpoint evidence is saved under

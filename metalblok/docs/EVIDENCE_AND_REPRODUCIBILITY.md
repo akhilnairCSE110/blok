@@ -229,9 +229,12 @@ runtime allocation was about 10.22 GB against 20.95 GB live available memory.
 
 Every decode line carries pageouts, compressions, decompressions, swap-ins,
 swap-outs, and available-memory delta. The acceptance continuation has shown
-memory compression and pageout activity late in the run, but no observed
-swap-ins or swap-outs at the latest retained checkpoint. Final totals are
-recorded only after the proof reaches position 1,999.
+memory compression and pageout activity. Through position 1,848 it accumulated
+2,129 system-wide swap-ins and 116 swap-outs; the swap-outs occurred at five
+positions. The counters cover the whole host and cannot be attributed solely
+to MetalBlok, but they are a real pressure/performance signal and explain why
+the late run is slower than its early steady sample. Final totals are recorded
+only after the proof reaches position 1,999.
 
 ## 11. Exact 1,000 + 1,000 acceptance chain
 

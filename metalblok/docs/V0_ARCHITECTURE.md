@@ -693,6 +693,17 @@ pressure signal; swap-out is a stronger release concern. The 2 GiB fixed-cache
 experiment saved more bytes but caused enough compression to reject it as the
 24 GB default.
 
+The long 256 MiB-cache acceptance continuation also eventually recorded
+system-wide swap activity: 116 swap-outs across five positions through
+position 1,848. This does not indicate a bad model tensor or checkpoint—the
+forward continued coherently and state commits remained valid—but it does show
+that 2,048-position expanded KV plus the host workload reaches macOS pressure.
+The counters are host-wide, so causality is not process-local. Early 3.1–3.2 s
+decode is therefore a best measured interval; late 4.2–4.5 s decode is the
+more conservative sustained 24 GB expectation. A future release should
+compare a zero fixed cache and smaller safety context from the same state, or
+move to compact/paged KV, before increasing cache residency.
+
 ## 12. Performance model and measured bottleneck
 
 Let \(N_w\) be actual model bytes, \(B_s\) realized storage bandwidth,
@@ -852,3 +863,7 @@ Only changes with a direct path to the measured reward vector are justified:
 
 The V0 architecture is intentionally specific. Generality comes after one
 model, one checkpoint, one machine, and one 1,000+1,000 run are correct.
+
+The staged design for replacing expanded KV, full checkpoint rewrites, and
+token-by-token prefill at much larger scale is in the
+[million-token scale plan](MILLION_TOKEN_SCALE_PLAN.md).

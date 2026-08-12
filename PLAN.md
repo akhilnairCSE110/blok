@@ -13,4 +13,5 @@ on the 24 GB Apple M5. Kimi/CUDA/uGDS remains separate legacy/future research.
    and complete architecture/evidence record.
 
 Current status and artifacts: [MetalBlok status](metalblok/STATUS.md) and
-[V0 closeout](metalblok/docs/V0_CLOSEOUT.md).
+[V0 closeout](metalblok/docs/V0_CLOSEOUT.md). Work beyond V0 is specified in
+the [million-token scale plan](metalblok/docs/MILLION_TOKEN_SCALE_PLAN.md).

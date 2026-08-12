@@ -27,7 +27,7 @@ prefill with per-layer expert unions; a 256 MiB fixed-projection cache; two
 aligned slabs that prefetch layer \(L+1\) during layer \(L\); and priority
 expert reads overlapped with shared-expert Metal compute. On the measured M5,
 the optimized decode moves 13.588 GB in 1,869 logical reads per token and
-typically takes 3.1–4.2 seconds depending on current SSD/VM conditions. GPU
+typically takes 3.1–4.6 seconds depending on current SSD/VM conditions. GPU
 execution is roughly 0.5 seconds, so the end-to-end path is storage-bound.
 
 ## 1. Claim discipline
@@ -179,6 +179,12 @@ The 256 MiB cache and I/O schedule changed per-step traffic from
 13,849,970,112 bytes / 1,939 reads to 13,587,632,064 bytes / 1,869 reads. In
 the fastest steady interval, effective NVMe reached 4.4–4.6 GB/s and decode
 took 3.09–3.22 seconds. The GPU component remained 0.47–0.52 seconds.
+
+Late in the long expanded-KV run, host-wide VM pressure reduced effective
+NVMe to roughly 3.1–3.4 GB/s and raised steps to about 4.2–4.5 seconds. The
+system counters also recorded 116 swap-outs across five positions through
+position 1,848. This does not imply token corruption, but it is evidence that
+short-run peak throughput is not sustained indefinitely on the 24 GB host.
 
 An attempted residual/RMSNorm fusion changed the position-1,282 logit to
 45.2879. It was deleted despite locally plausible math. A 2 GiB fixed cache

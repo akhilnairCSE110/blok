@@ -17,10 +17,12 @@
 
 Current steady decode is approximately 3.1–3.4 seconds/token at 4.1–4.6 GB/s
 effective NVMe on the 24 GB M5, with about 0.47–0.57 seconds GPU time,
-178 command buffers, zero hot-path allocations, and no observed swap-outs in
-the optimized continuation.
+178 command buffers, and zero hot-path allocations. The long continuation has
+also exposed real system pressure: 116 system-wide swap-outs across five
+positions as of position 1,848. Correctness continued, but late-run sustained
+decode is closer to 4.2–4.5 seconds/token at 3.1–3.4 GB/s. These VM counters
+include the whole host, not just MetalBlok.
 
 The exact live artifacts and complete implementation record are in
 [`docs/V0_CLOSEOUT.md`](docs/V0_CLOSEOUT.md). CLI usage is in
 [`docs/RUN_GUIDE.md`](docs/RUN_GUIDE.md).
-
