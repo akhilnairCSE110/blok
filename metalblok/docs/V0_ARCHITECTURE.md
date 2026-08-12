@@ -694,8 +694,8 @@ experiment saved more bytes but caused enough compression to reject it as the
 24 GB default.
 
 The long 256 MiB-cache acceptance continuation also eventually recorded
-system-wide swap activity: 116 swap-outs across five positions through
-position 1,848. This does not indicate a bad model tensor or checkpoint—the
+system-wide swap activity: 2,407 swap-ins and 168 swap-outs over its final 719
+steps. This does not indicate a bad model tensor or checkpoint—the
 forward continued coherently and state commits remained valid—but it does show
 that 2,048-position expanded KV plus the host workload reaches macOS pressure.
 The counters are host-wide, so causality is not process-local. Early 3.1–3.2 s
@@ -863,6 +863,9 @@ Only changes with a direct path to the measured reward vector are justified:
 
 The V0 architecture is intentionally specific. Generality comes after one
 model, one checkpoint, one machine, and one 1,000+1,000 run are correct.
+
+That run is now complete. Its exact prompt, output, state arithmetic, segment
+metrics, and limitations are in [the proof report](PROOF_1K_REPORT.md).
 
 The staged design for replacing expanded KV, full checkpoint rewrites, and
 token-by-token prefill at much larger scale is in the

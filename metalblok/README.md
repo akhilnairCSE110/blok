@@ -39,6 +39,8 @@ For persistent chat and interruption recovery, read the
 - [Million-token scale plan](docs/MILLION_TOKEN_SCALE_PLAN.md): the paged
   state, compact MLA, SSD attention, QMM prefill, and model-quality path to
   one-million input plus one-million output tokens.
+- [Completed 1,000+1,000 proof](docs/PROOF_1K_REPORT.md): exact prompt,
+  complete output, checkpoint arithmetic, performance, and limitations.
 - [V0 closeout](docs/V0_CLOSEOUT.md): implemented schedule, rejected
   optimizations, measured deltas, logging contract, and acceptance artifacts.
 - [Tensor/hardware specification](docs/TENSOR_HARDWARE_SPEC.md): normative

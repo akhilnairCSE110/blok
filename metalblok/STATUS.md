@@ -1,6 +1,6 @@
 # MetalBlok status
 
-**Active release gate:** exact 1,000-native-token coding prompt plus exactly
+**Release gate completed:** exact 1,000-native-token coding prompt plus exactly
 1,000 emitted tokens on the three-shard DeepSeek-R1 checkpoint.
 
 | Gate | Status | Evidence |
@@ -13,28 +13,17 @@
 | Exact 1,000-token prefill | Pass | 591.94 s runtime, 1.69 token/s, first token `Okay` |
 | Scheduling optimization parity | Pass | positions 1,280–1,282 token IDs and greedy logits match old path |
 | Fixed-weight traffic reduction | Pass | 13.850 → 13.588 GB and 1,939 → 1,869 reads/decode step |
-| 1,000 emitted-token acceptance | In progress | live position 1,900; durable checkpoint 1,792; required final 1,999 |
+| 1,000 emitted-token acceptance | **Pass** | 1,000 IDs reconstructed; final state position 1,999, 8,007,002,532 bytes |
 
-Current steady decode is approximately 3.1–3.4 seconds/token at 4.1–4.6 GB/s
-effective NVMe on the 24 GB M5, with about 0.47–0.57 seconds GPU time,
-178 command buffers, and zero hot-path allocations. The long continuation has
-also exposed real system pressure: 116 system-wide swap-outs across five
-positions as of position 1,848. Correctness continued, but late-run sustained
-decode is closer to 4.2–4.5 seconds/token at 3.1–3.4 GB/s. These VM counters
-include the whole host, not just MetalBlok.
+The final optimized 719-step segment averaged 4.179 s/step, 0.578 s GPU time,
+and 3.408 GB/s aggregate effective NVMe, with 178 command buffers and zero
+hot-path allocations per step. The best early interval was 3.09–3.22 s/step;
+late expanded-KV pressure lowered sustained performance. Host-wide VM counters
+over the segment recorded 2,407 swap-ins and 168 swap-outs.
 
-The exact live artifacts and complete implementation record are in
+The exact artifacts and complete implementation record are in
 [`docs/V0_CLOSEOUT.md`](docs/V0_CLOSEOUT.md). CLI usage is in
 [`docs/RUN_GUIDE.md`](docs/RUN_GUIDE.md).
 
-Operator handoff for the current run:
-
-```sh
-tail -f metalblok/runs/run-20260812-021356-20767.log
-kill -INT 20767  # graceful wrapper stop; durable checkpoint remains valid
-scripts/prove_metal_1k.py --resume-state metalblok/runs/proof-1k-20260812-012449.state
-```
-
-If PID 20767 has already exited, the `kill` command will only report that the
-process no longer exists. Do not kill PID 20778 directly; the wrapper owns the
-native child and reports interruption cleanly.
+The full prompt, decoded output, segment arithmetic, metrics, quality judgment,
+and limitations are in [`docs/PROOF_1K_REPORT.md`](docs/PROOF_1K_REPORT.md).

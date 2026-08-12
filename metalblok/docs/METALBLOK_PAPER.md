@@ -182,8 +182,8 @@ took 3.09–3.22 seconds. The GPU component remained 0.47–0.52 seconds.
 
 Late in the long expanded-KV run, host-wide VM pressure reduced effective
 NVMe to roughly 3.1–3.4 GB/s and raised steps to about 4.2–4.5 seconds. The
-system counters also recorded 116 swap-outs across five positions through
-position 1,848. This does not imply token corruption, but it is evidence that
+final 719-step counters recorded 2,407 swap-ins and 168 swap-outs. This does
+not imply token corruption, but it is evidence that
 short-run peak throughput is not sustained indefinitely on the 24 GB host.
 
 An attempted residual/RMSNorm fusion changed the position-1,282 logit to

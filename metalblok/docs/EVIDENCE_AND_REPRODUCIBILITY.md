@@ -229,12 +229,11 @@ runtime allocation was about 10.22 GB against 20.95 GB live available memory.
 
 Every decode line carries pageouts, compressions, decompressions, swap-ins,
 swap-outs, and available-memory delta. The acceptance continuation has shown
-memory compression and pageout activity. Through position 1,848 it accumulated
-2,129 system-wide swap-ins and 116 swap-outs; the swap-outs occurred at five
-positions. The counters cover the whole host and cannot be attributed solely
-to MetalBlok, but they are a real pressure/performance signal and explain why
-the late run is slower than its early steady sample. Final totals are recorded
-only after the proof reaches position 1,999.
+memory compression and pageout activity. The final 719-step segment accumulated
+2,407 system-wide swap-ins and 168 swap-outs. The counters cover the whole
+host and cannot be attributed solely to MetalBlok, but they are a real
+pressure/performance signal and explain why the late run was slower than its
+early steady sample.
 
 ## 11. Exact 1,000 + 1,000 acceptance chain
 
@@ -248,8 +247,9 @@ prefill completed in 591.937584 s, or 1.69 token/s, and produced token ID
 | authoritative state | `../runs/proof-1k-20260812-012449.state` | atomic v3 continuation |
 | optimized continuation log | `../runs/run-20260812-021356-20767.log` | live per-position metrics |
 | optimized continuation text | `../runs/run-20260812-021356-20767.txt` | live emitted suffix |
-| handoff observation | live position 1,900 / durable position 1,792 | in progress |
-| acceptance position | state position 1,999 | pending |
+| complete reconstructed text | `../runs/proof-1k-complete-output.txt` | exactly 1,000 logged IDs |
+| full result report | `PROOF_1K_REPORT.md` | exact prompt/output/metrics |
+| acceptance position | state position 1,999 | **pass** |
 
 Why the final committed position is 1,999 rather than 2,000: prefill commits
 1,000 prompt positions and computes pending output `A0`; emitting `A0` does
@@ -290,7 +290,7 @@ or final sampling rather than merely reporting “bad output.”
 | shared-buffer command accounting | `../src/metal_ctx.mm`, `../src/metal_ctx.hpp` |
 | prioritized exact-length I/O | `../src/pread_ring.cpp`, `../src/pread_ring.hpp` |
 | memory-pressure counters | `../src/memstat.hpp` |
-| tokenizer/decode loop/state CLI | `../src/main.mm` |
+| tokenizer/decode loop/state CLI | `../src/main.cpp` |
 | admission and wrapper safety | `../../run_blok.py` |
 | exact acceptance harness | `../../scripts/prove_metal_1k.py` |
 
@@ -312,5 +312,5 @@ or final sampling rather than merely reporting “bad output.”
 The defensible V0 statement is deliberately narrow: this exact 140.231 GB
 checkpoint executes its complete native graph from an explicit SSD-backed
 working set on a 24 GB M5; its accepted schedule is instrumented, resumable,
-and parity-checked at named anchors; and the release closes only when the saved
-state reaches position 1,999 with 1,000 emitted tokens.
+and parity-checked at named anchors. The release gate closed when the saved
+state reached position 1,999 with exactly 1,000 emitted tokens.

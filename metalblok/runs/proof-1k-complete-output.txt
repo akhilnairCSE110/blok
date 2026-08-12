@@ -1,0 +1,68 @@
+Okay, I need to write a Python program called jsonl_report.py that meets a lot of specific requirements. Let's break down the problem step by step.
+
+First, the program needs to process a large JSON Lines input file without loading it all into memory. That means I'll have to read it line by line. Each line is a JSON object, and I need to parse each one as I go.
+
+The key features required are:
+
+1. **Streaming**: Process each line without reading the entire file into memory. So, using a loop that reads each line and parses it one by one.
+
+2. **Error Handling**: Reject malformed records and report the line number. So, for each line, I'll try to parse it with json.loads(), and if it fails, I'll note the line number. Also, in strict mode, any error should stop the program immediately.
+
+3. **Grouping by Category**: Valid records must be grouped by the 'category' field. So, I'll need a dictionary where each key is a category, and the value is an aggregate structure tracking count, sum, min, max, and mean.
+
+4. **Statistics Calculation**: For the 'value' field, compute count, sum, min, max, and a numerically stable mean. Numerically stable mean implies using compensated summation to avoid floating-point errors. Also, check that the value is a finite number (not a boolean, not NaN or infinity).
+
+5. **Command Line Arguments**: Use argparse for input path, output path, and strict mode. So, set up the CLI arguments properly.
+
+6. **Output**: Emit deterministic UTF-8 JSON with sorted categories and keys. The output should be written atomically, meaning write to a temp file and then replace the output file. Also, ensure the JSON is sorted.
+
+7. **Type Checks**: Reject booleans as numbers. So, if the 'value' is a boolean, even though it's technically 0 or 1 in Python, it should be considered invalid.
+
+8. **Exit Codes**: Use proper exit codes. Probably, 0 for success, 1 for runtime errors, 2 for argument errors.
+
+9. **Type Hints and Docstrings**: Include type hints and docstrings for functions.
+
+10. **Unit Tests**: Include unittests that cover all the cases mentioned: empty input, malformed JSON, missing fields, boolean values, non-finite values, strict mode, Unicode, deterministic ordering, and a successful multi-category file. The tests should be self-contained and runnable with python -m unittest.
+
+Now, let's think about the structure.
+
+The main steps are:
+
+- Parse command line arguments.
+- Read input line by line.
+- For each line, parse JSON.
+- Validate each JSON object: check presence of 'category' and 'value', correct types, valid value.
+- If invalid, either report and continue (unless strict mode) or exit.
+- For valid records, accumulate statistics per category.
+- After processing all lines, compute the mean using compensated summation.
+- Sort the categories and their keys, then output the JSON.
+
+For the compensated summation, I'll track the sum and a compensation term to handle numerical stability. The mean can then be calculated as (sum + compensation) / count, but wait, actually compensated summation is a technique to accumulate small values accurately. The standard method is the Kahan summation algorithm. So, for each value, we'll update the sum using the Kahan method.
+
+Wait, but the mean is computed as sum / count. So, the sum needs to be accurate. Using Kahan summation for the sum would help maintain precision.
+
+So, for each category's 'value' statistics:
+
+- count: integer count of values.
+- sum: the accumulated sum using Kahan compensation.
+- min: the minimum value encountered.
+- max: the maximum value encountered.
+- mean: sum / count, but computed from the Kahan sum.
+
+Wait, but the mean is just sum / count. So, the sum must be accurately computed. So, yes, Kahan summation is needed here.
+
+So, the structure for each category would have:
+
+- count: int
+- sum_comp: a tuple of (sum, compensation) using Kahan.
+- min: float or int
+- max: float or int
+
+But how to track the Kahan summation. Let's see. For each value, we add it to the current sum using the Kahan algorithm.
+
+Alternatively, since the order of processing is irrelevant for the sum (since addition is commutative), but the Kahan summation is order-dependent. However, since we're adding each value sequentially, the Kahan summation will give a more accurate result.
+
+So, for each value in the 'value' field:
+
+- Check it's a number (int or float), not a boolean.
+- Check it's finite (

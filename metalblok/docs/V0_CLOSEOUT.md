@@ -14,11 +14,11 @@ nucleus sampling, output projection, decoding, and exact crash-safe
 continuation. The model remains on SSD; no 140 GB payload mapping or full
 dequantized copy is created.
 
-The release acceptance is a single exact run with 1,000 native input tokens
-and 1,000 emitted output tokens. Its 1,000-token prefill completed on this host
-at 1.69 token/s and produced first token ID 33001 (`Okay`). The output
-continuation is retained in atomic state and log artifacts. The final row in
-this document is filled only after the state reaches position 1,999.
+The release acceptance completed with 1,000 native input tokens and 1,000
+emitted output tokens. Its prefill ran at 1.69 token/s and produced first token
+ID 33001 (`Okay`). The exact chain finished normally at state position 1,999;
+the 8,007,002,532-byte state, all token/logit logs, and reconstructed full text
+are retained.
 
 ## Exact model contract
 
@@ -128,13 +128,13 @@ chosen as the safe default. `METALBLOK_FIXED_CACHE_MB=0..2048` remains an
 explicit measured tuning control, guarded by live available memory plus a
 2 GiB cache margin.
 
-The long run also found a limit that a short benchmark missed. Through
-position 1,848, host-wide VM counters recorded 2,129 swap-ins and 116
-swap-outs. The counters include other macOS processes and do not identify
-which process owned a page, but they are still a real contention signal. The
-model remained coherent and atomic state remained valid; the impact is a
-slower sustained storage path. The best interval is retained as optimization
-evidence, while the late interval is the conservative 24 GB demo expectation.
+The long run also found a limit that a short benchmark missed. Over the final
+719 steps, host-wide VM counters recorded 2,407 swap-ins and 168 swap-outs.
+The counters include other macOS processes and do not identify which process
+owned a page, but they are still a real contention signal. The model remained
+coherent and atomic state remained valid; the impact was a slower sustained
+storage path. The best interval is retained as optimization evidence, while
+the 4.179 s final-segment average is the conservative measured result.
 
 ## Telemetry contract
 
@@ -191,34 +191,16 @@ optimization and a real complete-generation proof.
 | authoritative v3 state | `metalblok/runs/proof-1k-20260812-012449.state` |
 | continuation log | `metalblok/runs/run-20260812-021356-20767.log` |
 | continuation text | `metalblok/runs/run-20260812-021356-20767.txt` |
+| complete 1,000-token text | `metalblok/runs/proof-1k-complete-output.txt` |
+| full proof report | `metalblok/docs/PROOF_1K_REPORT.md` |
 | required final state position | 1,999 |
-| handoff observation | live position 1,900; durable atomic position 1,792 |
-| final result | **IN PROGRESS — position 1,999 remains the acceptance gate** |
+| actual final state size | 8,007,002,532 bytes, exact formula match |
+| final result | **PASS — normal max-token termination, native exit 0** |
 
-The run is intentionally left alive for the operator. Watch it with
-
-```sh
-tail -f metalblok/runs/run-20260812-021356-20767.log
-```
-
-To stop the active wrapper gracefully, preserving the last complete atomic
-checkpoint:
-
-```sh
-kill -INT 20767
-```
-
-Resume without repeating the 1,000-token prefill:
-
-```sh
-scripts/prove_metal_1k.py \
-  --resume-state metalblok/runs/proof-1k-20260812-012449.state
-```
-
-The proof harness reads the saved position and requests exactly the remaining
-emitted tokens. At the handoff's durable position 1,792 that is 208 tokens.
-The live process may finish or create its final state before these commands are
-used; in that case no stop/resume is necessary.
+The generated text remained coherent and constraint-aware but exhausted its
+1,000-token thinking budget before producing the requested program. This is an
+engine execution pass, not a semantic completion pass for the coding task. See
+the full proof report for the exact prompt/output and that distinction.
 
 ## Non-claims and next boundary
 

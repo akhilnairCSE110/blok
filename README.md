@@ -42,6 +42,7 @@ scripts/prove_metal_1k.py
 See the [complete CLI guide](metalblok/docs/RUN_GUIDE.md),
 [deep architecture](metalblok/docs/V0_ARCHITECTURE.md),
 [million-token scale plan](metalblok/docs/MILLION_TOKEN_SCALE_PLAN.md),
+[completed 1,000+1,000 report](metalblok/docs/PROOF_1K_REPORT.md),
 [V0 closeout](metalblok/docs/V0_CLOSEOUT.md), and
 [current status](metalblok/STATUS.md). Output text, native timing, token/logit,
 NVMe, Metal, memory-pressure, and checkpoint evidence is saved under
