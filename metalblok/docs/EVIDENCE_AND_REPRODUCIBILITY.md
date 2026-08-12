@@ -248,7 +248,8 @@ prefill completed in 591.937584 s, or 1.69 token/s, and produced token ID
 | authoritative state | `../runs/proof-1k-20260812-012449.state` | atomic v3 continuation |
 | optimized continuation log | `../runs/run-20260812-021356-20767.log` | live per-position metrics |
 | optimized continuation text | `../runs/run-20260812-021356-20767.txt` | live emitted suffix |
-| acceptance position | state position 1,999 | **RUNNING** |
+| handoff observation | live position 1,900 / durable position 1,792 | in progress |
+| acceptance position | state position 1,999 | pending |
 
 Why the final committed position is 1,999 rather than 2,000: prefill commits
 1,000 prompt positions and computes pending output `A0`; emitting `A0` does

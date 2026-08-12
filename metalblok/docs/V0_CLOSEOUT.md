@@ -192,7 +192,33 @@ optimization and a real complete-generation proof.
 | continuation log | `metalblok/runs/run-20260812-021356-20767.log` |
 | continuation text | `metalblok/runs/run-20260812-021356-20767.txt` |
 | required final state position | 1,999 |
-| final result | **RUNNING — replace only after position 1,999 is verified** |
+| handoff observation | live position 1,900; durable atomic position 1,792 |
+| final result | **IN PROGRESS — position 1,999 remains the acceptance gate** |
+
+The run is intentionally left alive for the operator. Watch it with
+
+```sh
+tail -f metalblok/runs/run-20260812-021356-20767.log
+```
+
+To stop the active wrapper gracefully, preserving the last complete atomic
+checkpoint:
+
+```sh
+kill -INT 20767
+```
+
+Resume without repeating the 1,000-token prefill:
+
+```sh
+scripts/prove_metal_1k.py \
+  --resume-state metalblok/runs/proof-1k-20260812-012449.state
+```
+
+The proof harness reads the saved position and requests exactly the remaining
+emitted tokens. At the handoff's durable position 1,792 that is 208 tokens.
+The live process may finish or create its final state before these commands are
+used; in that case no stop/resume is necessary.
 
 ## Non-claims and next boundary
 

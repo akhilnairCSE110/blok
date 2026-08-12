@@ -13,7 +13,7 @@
 | Exact 1,000-token prefill | Pass | 591.94 s runtime, 1.69 token/s, first token `Okay` |
 | Scheduling optimization parity | Pass | positions 1,280–1,282 token IDs and greedy logits match old path |
 | Fixed-weight traffic reduction | Pass | 13.850 → 13.588 GB and 1,939 → 1,869 reads/decode step |
-| 1,000 emitted-token acceptance | Running | authoritative checkpoint must finish at position 1,999 |
+| 1,000 emitted-token acceptance | In progress | live position 1,900; durable checkpoint 1,792; required final 1,999 |
 
 Current steady decode is approximately 3.1–3.4 seconds/token at 4.1–4.6 GB/s
 effective NVMe on the 24 GB M5, with about 0.47–0.57 seconds GPU time,
@@ -26,3 +26,15 @@ include the whole host, not just MetalBlok.
 The exact live artifacts and complete implementation record are in
 [`docs/V0_CLOSEOUT.md`](docs/V0_CLOSEOUT.md). CLI usage is in
 [`docs/RUN_GUIDE.md`](docs/RUN_GUIDE.md).
+
+Operator handoff for the current run:
+
+```sh
+tail -f metalblok/runs/run-20260812-021356-20767.log
+kill -INT 20767  # graceful wrapper stop; durable checkpoint remains valid
+scripts/prove_metal_1k.py --resume-state metalblok/runs/proof-1k-20260812-012449.state
+```
+
+If PID 20767 has already exited, the `kill` command will only report that the
+process no longer exists. Do not kill PID 20778 directly; the wrapper owns the
+native child and reports interruption cleanly.
