@@ -1,61 +1,57 @@
 # MetalBlok
 
-MetalBlok is a bounded, native Metal inference runtime for the local
-DeepSeek-R1 671B `UD-IQ1_S` GGUF checkpoint. Correctness and host safety are
-release gates; caching, overlap, and kernel tuning come afterward.
+MetalBlok is the active native V0 for DeepSeek-R1 671B `UD-IQ1_S` on the
+24 GB Apple M5 target. It performs real tokenization, blocked prefill, exact
+continuation, all 61 Metal transformer layers, grouped top-8 MoE routing,
+mixed-GGUF quantized multiplication, causal attention, sampling, and decoding.
 
-## Architecture package
-
-- [`docs/METALBLOK_PAPER.md`](docs/METALBLOK_PAPER.md) gives the arXiv-style
-  mathematical argument, complete transformer/MoE/MLA forward pass, measured
-  results, limitations, and chip implications.
-- [`docs/TENSOR_HARDWARE_SPEC.md`](docs/TENSOR_HARDWARE_SPEC.md) is the
-  tensor-by-tensor normative hardware contract: shapes, addresses, block
-  decoders, kernels, buffer states, byte counts, and concrete decisions.
-- [`docs/EVIDENCE_AND_REPRODUCIBILITY.md`](docs/EVIDENCE_AND_REPRODUCIBILITY.md)
-  separates exact, derived, implemented, measured, and proposed claims and
-  supplies the reproduction commands and saved-log index.
-
-The initial code is derived from the adjacent Blade prototype. Imported code
-is treated as untrusted until it passes MetalBlok's real-model gates.
-
-## One-command run
+## Fast path
 
 From the repository root:
 
 ```sh
-./run_blok.py "Hi"
+./run_blok.py "Explain why the sky is blue." -n 256
 ```
 
-The safe default is eight output tokens. Select a different verified limit
-with `-n`; the wrapper refuses values above 32:
+For a model outside the default local path:
 
 ```sh
-./run_blok.py "Explain why the sky is blue." -n 16
+export METALBLOK_MODEL=/path/to/DeepSeek-R1-UD-IQ1_S-00001-of-00003.gguf
 ```
 
-The wrapper builds when necessary, performs the non-hydrating shard
-preflight, enforces the 64-token verified context, serializes concurrent runs,
-uses a unique atomic checkpoint, and executes one token per child process. It
-prints model text on stdout and records complete native diagnostics under
-`metalblok/runs/`.
+The wrapper defaults to greedy decoding and context 2,048, prints model text,
+and saves exact state, output, and diagnostics paths. It preflights all three
+shards, enforces one native run at a time, and builds on first use.
+
+For exactly 1,000 native input and 1,000 emitted output tokens:
+
+```sh
+scripts/prove_metal_1k.py
+```
+
+For persistent chat and interruption recovery, read the
+[full run guide](docs/RUN_GUIDE.md).
+
+## Architecture and evidence
+
+- [V0 closeout](docs/V0_CLOSEOUT.md): implemented schedule, rejected
+  optimizations, measured deltas, logging contract, and acceptance artifacts.
+- [Tensor/hardware specification](docs/TENSOR_HARDWARE_SPEC.md): normative
+  shapes, exact expanded-KV contract, buffer ownership, and kernels.
+- [Evidence ledger](docs/EVIDENCE_AND_REPRODUCIBILITY.md): commands, saved
+  logs, parity gates, and non-claims.
+- [Architecture study](docs/METALBLOK_PAPER.md): mathematical motivation and
+  the relation to conditional weight streaming.
 
 ## Build
 
 ```sh
 cmake -S metalblok -B metalblok/build
-cmake --build metalblok/build -j
+cmake --build metalblok/build -j8
+ctest --test-dir metalblok/build --output-on-failure
 ```
 
-The default build compiles `kernels.metal` through the Metal runtime. An
-offline `.metallib` can be selected later with
-`-DMETALBLOK_OFFLINE_METALLIB=ON` after installing Apple's Metal Toolchain.
+The standard build runtime-compiles `kernels.metal`; an offline `.metallib` is
+optional. `--preflight` reads allocation metadata rather than model payload and
+must report `all_resident=true` before inference.
 
-## Safe first command
-
-```sh
-metalblok/build/metalblok --preflight /path/to/model-00001-of-00003.gguf
-```
-
-Preflight never reads model payload and refuses sparse or dataless shards.
-Do not run inference until it reports every shard as resident.

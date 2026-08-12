@@ -1,60 +1,63 @@
 # Blok
 
-Minimal text-only inference for the pinned `moonshotai/Kimi-K2.6` revision `7eb5002f6aadc958aed6a9177b7ed26bb94011bb` on an RTX 5060 Ti. Python performs the exact Kimi chat-template/tokenizer work; one CUDA executable performs all 61 transformer layers, greedy decoding, and direct uGDS model/KV I/O.
-
-## Implementation rule
-
-Apply Musk's five-step algorithm in order:
-
-1. Challenge every requirement and identify its owner.
-2. Delete every part or process not required for a full Kimi forward pass.
-3. Simplify and optimize only what survives.
-4. Shorten the test and execution cycle.
-5. Automate only after the path is correct.
-
-The requirement is one public, reference-correct Kimi text-generation path. Languages, wrappers, duplicate indexes, fallback tokenizers, and generic tooling are not requirements; every surviving line must serve the forward pass. Sources: [Starbase interview](https://www.youtube.com/watch?v=t705r8ICkRw) and [transcript/excerpt](https://www.startuparchive.org/p/elon-musk-explains-his-5-step-algorithm-for-running-companies-1eae).
-
-Forward semantics are pinned to Kimi's [configuration](https://huggingface.co/moonshotai/Kimi-K2.6/blob/7eb5002f6aadc958aed6a9177b7ed26bb94011bb/config.json), [reference implementation](https://huggingface.co/moonshotai/Kimi-K2.6/blob/7eb5002f6aadc958aed6a9177b7ed26bb94011bb/modeling_deepseek.py), and the [INT4 packing format](https://github.com/vllm-project/compressed-tensors/blob/main/src/compressed_tensors/compressors/quantized_compressors/pack_quantized.py).
-
-## Target
-
-- Ubuntu/Linux, Ryzen 9 5950X, 48 GB RAM
-- RTX 5060 Ti 16 GB (`sm_120`), CUDA 12.8+, NVIDIA open modules
-- Samsung 990 EVO Plus 1 TB bound to uGDS
-- Model payload on the detachable NVMe filesystem
-- Metadata, repository, binaries, and `ugds.env` on the system filesystem
-- Dedicated 4 KiB-aligned raw KV range outside every filesystem and model extent
+Blok's active V0 is MetalBlok: a native Apple-Silicon inference engine for the
+exact three-shard DeepSeek-R1 671B `UD-IQ1_S` GGUF. It streams the model from
+SSD through reusable unified-memory slabs and executes the complete 61-layer
+forward pass with custom Metal kernels. There is no llama.cpp, MLX, PyTorch,
+or server process in the inference path.
 
 ## Run
 
-```sh
-git submodule update --init --recursive
-scripts/bootstrap_linux.sh
-
-export BLOK_MODEL_ROOT=/mnt/kimi-models
-export BLOK_META_ROOT="$HOME/.blok/metadata"
-export BLOK_UGDS_DEVICE=/dev/ugds_drv0
-export BLOK_UGDS_MAP="$PWD/ugds-map.blok"
-export BLOK_UGDS_ENV_OUTPUT="$PWD/ugds.env"
-export BLOK_KV_UGDS_BASE=<reserved-raw-byte-offset>
-export BLOK_KV_UGDS_BYTES=<reserved-raw-byte-count>
-export BLOK_UGDS_PHYSICAL_OFFSET_ADD=<partition-start-or-zero>
-
-scripts/model_fetch.py kimi-k2.6 fetch
-scripts/target_v0.sh prepare
-```
-
-After `prepare`, bind only the verified, now-unmounted model NVMe controller and run the complete public-path smoke:
+On the target Mac, from this directory:
 
 ```sh
-sub_dir/uGDS/scripts/env_switch.sh ugds <verified-pci-slot>
-scripts/target_v0.sh run
+./run_blok.py "Write a correct C++17 program that validates UTF-8." -n 256
 ```
 
-Success is `{"status": "ok", "text": "paris"}`. Never use filesystem free space for raw KV writes, and regenerate the uGDS map after any shard movement or rewrite.
+The local developer model path is the default. For another location:
 
-## Architecture documents
+```sh
+export METALBLOK_MODEL=/absolute/path/DeepSeek-R1-UD-IQ1_S-00001-of-00003.gguf
+./run_blok.py "Say hello to Max." -n 64
+```
 
-- [`docs/architecture/hardware-design-decisions.md`](docs/architecture/hardware-design-decisions.md): decision-by-decision chip and I/O specification, with equations and falsification tests.
-- [`docs/architecture/kimi-k2.6-on-target-hardware.md`](docs/architecture/kimi-k2.6-on-target-hardware.md): Kimi K2.6 execution derivation and current implementation audit.
-- [`docs/architecture/glm-5.2-on-target-hardware.md`](docs/architecture/glm-5.2-on-target-hardware.md): GLM-5.2 FP8 capacity proof and proposed executor.
+The default is deterministic greedy decoding with a 2,048-position context.
+For a persistent conversation:
+
+```sh
+./run_blok.py "Remember that my name is Max." -n 128 \
+  --state conversations/max.state
+./run_blok.py "What is my name?" -n 64 \
+  --state conversations/max.state
+```
+
+For the exact 1,000-input/1,000-output coding acceptance:
+
+```sh
+scripts/prove_metal_1k.py
+```
+
+See the [complete CLI guide](metalblok/docs/RUN_GUIDE.md),
+[V0 closeout](metalblok/docs/V0_CLOSEOUT.md), and
+[current status](metalblok/STATUS.md). Output text, native timing, token/logit,
+NVMe, Metal, memory-pressure, and checkpoint evidence is saved under
+`metalblok/runs/`.
+
+## Build and verify
+
+```sh
+cmake -S metalblok -B metalblok/build
+cmake --build metalblok/build -j8
+ctest --test-dir metalblok/build --output-on-failure
+python3 -m py_compile run_blok.py scripts/prove_metal_1k.py
+```
+
+The runner builds automatically when the binary is absent and refuses a
+missing, sparse, dataless, wrong-sized, or wrong-model shard before inference.
+
+## Repository scope
+
+`metalblok/` and `run_blok.py` are the active M5/DeepSeek V0. The root Rust,
+CUDA, Kimi, GLM, and vendored `sub_dir/uGDS` material records a separate Linux
+research target; it is not linked into or required by the MetalBlok CLI.
+

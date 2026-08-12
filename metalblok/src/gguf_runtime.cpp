@@ -1,20 +1,8 @@
 // src/gguf_runtime.cpp
 // ---------------------------------------------------------------------------
-// GgufRuntime implementation. See gguf_runtime.hpp for context, memory
-// budget, and the per-tensor streaming primitive.
-//
-// Anti-drift: this file does NOT include runtime.hpp / mla.cpp / moe.cpp.
-// The decode loop is implemented independently against the same Metal
-// kernels they use (rms_norm_f16, mla_q_split_rope, mla_kv_split_rope,
-// mla_attn_decode_f16, swiglu_f16, router_topk_f16, axpy_f16, argmax_f16,
-// and the gemv_<type>_f16 family).
-//
-// Conventions inherited from ops.hpp:
-//   TG_GEMV = 1024 (used by gemv_f16_f16 path -- resident activations)
-//   TG_RED  = 256  (rms_norm, mla_kv_split_rope, mla_attn_decode_f16)
-//   TG_ELT  = 256  (axpy, swiglu, mla_q_split_rope)
-// One 32-lane SIMD-group computes each quantized output row. This exact
-// checkpoint passed the real-tensor validators at the smaller group size.
+// Native GGUF/Metal implementation; independent of the legacy BF16/FP8
+// runtime. Activations and reductions are FP32, exact KV storage is FP16,
+// and one 32-lane SIMD-group computes each quantized output row.
 // ---------------------------------------------------------------------------
 #include "gguf_runtime.hpp"
 
@@ -163,10 +151,12 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
     mtl_ = &mtl;
     pos_ = 0;
     trace_ = std::getenv("METALBLOK_TRACE") != nullptr;
+    profile_layers_ = std::getenv("METALBLOK_PROFILE_LAYERS") != nullptr;
     parse_config_(g);
     verify_tensor_table_(gm);
 
-    // Explicit override; the default stays at 64 for safe bring-up.
+    // The direct native binary defaults to 64; the public runner always sets
+    // this from --context before initialization.
     if (const char* s = std::getenv("METALBLOK_MAX_SEQ")) {
         unsigned long v = std::strtoul(s, nullptr, 10);
         if (v >= 64 && v <= 65536) cfg_.max_seq = (uint32_t)v;
@@ -218,7 +208,7 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
         }
         layer_stage = std::max(layer_stage, layer_bytes);
     }
-    const uint64_t fixed = output_head + layer_stage;
+    const uint64_t fixed = output_head + 2 * layer_stage;
     uint32_t dense_ffn = 0;
     if (cfg_.n_dense_layers) {
         const auto* entry = gm.find("blk.0.ffn_gate.weight");
@@ -236,15 +226,32 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
             (sizeof(uint32_t) + sizeof(float));
     const uint64_t runtime_margin = 32ULL << 20;
     const uint64_t expert_batch = largest_transient * cfg_.n_experts_active * 3;
-    const uint64_t estimated = fixed + kv + scores + expert_batch +
-                               batch_scratch + runtime_margin;
+    const uint64_t base_estimated = fixed + kv + scores + expert_batch +
+                                    batch_scratch + runtime_margin;
     const uint64_t host_reserve = cfg_.max_seq <= 2048 ? 1ULL << 30 : 3ULL << 30;
     const auto memory = mem::snapshot();
-    prof::log("memory-ledger: output=%.2fGB layer_slab=%.2fGB kv=%.2fGB expert_batch=%.2fMB "
-        "batch=%.2fMB margin=%.2fMB estimated=%.2fGB available=%.2fGB reserve=%.2fGB",
-              output_head / 1e9, layer_stage / 1e9, kv / 1e9, expert_batch / 1e6,
-              batch_scratch / 1e6, runtime_margin / 1e6, estimated / 1e9,
-              memory.available / 1e9, host_reserve / 1e9);
+    uint64_t desired_cache = 256ULL << 20;
+    if (const char* value = std::getenv("METALBLOK_FIXED_CACHE_MB")) {
+        char* end = nullptr;
+        const unsigned long mb = std::strtoul(value, &end, 10);
+        if (!end || *end != '\0' || mb > 2048)
+            die("METALBLOK_FIXED_CACHE_MB must be in [0,2048]");
+        desired_cache = uint64_t(mb) << 20;
+    }
+    const uint64_t cache_guard = 2ULL << 30;
+    const uint64_t cache_headroom = memory.available >
+        base_estimated + host_reserve + cache_guard
+        ? memory.available - base_estimated - host_reserve - cache_guard : 0;
+    fixed_cache_budget_ = std::min(desired_cache, cache_headroom);
+    const uint64_t estimated = base_estimated + fixed_cache_budget_;
+    prof::log("memory-ledger: output=%.2fGB layer_slabs=%.2fGB fixed_cache=%.2fGB "
+        "kv=%.2fGB expert_batch=%.2fMB batch=%.2fMB margin=%.2fMB "
+        "estimated=%.2fGB available=%.2fGB reserve=%.2fGB cache_guard=%.2fGB",
+              output_head / 1e9, 2 * layer_stage / 1e9,
+              fixed_cache_budget_ / 1e9, kv / 1e9, expert_batch / 1e6,
+              batch_scratch / 1e6,
+              runtime_margin / 1e6, estimated / 1e9, memory.available / 1e9,
+              host_reserve / 1e9, cache_guard / 1e9);
     if (memory.available < estimated + host_reserve) {
         std::fprintf(stderr,
             "metalblok: memory safety gate refused startup: need %.2f GB "
@@ -651,7 +658,7 @@ GgufRuntime::LoadedWeight GgufRuntime::load_weight_(
     weight.K = K;
     weight.N = N;
     gm_->ring().submit(entry->shard, offset, bytes, weight.buffer.contents,
-                       weight.ready);
+                       weight.ready, true);
     step_model_bytes_ += bytes;
     ++step_reads_;
     return weight;
@@ -728,7 +735,7 @@ void GgufRuntime::load_fixed_projections_() {
             const auto* entry = gm_->find(name);
             if (!entry || !kernel_name_for(entry->type))
                 die("fixed projection is missing or unsupported");
-            dst = {{}, entry, K, N};
+            dst = {{}, entry, K, N, false};
             layer_bytes += align16k(entry->nbytes);
         };
         index(lw_[L].q_a, "attn_q_a.weight", H, Hi);
@@ -751,14 +758,54 @@ void GgufRuntime::load_fixed_projections_() {
         }
         largest_layer = std::max(largest_layer, layer_bytes);
     }
-    layer_stage_ = mtl_->alloc(largest_layer);
+    std::vector<Projection*> candidates;
+    candidates.reserve(cfg_.n_layers * 9);
+    for (auto& layer : lw_) {
+        for (Projection* projection : {
+                 &layer.q_a, &layer.q_b, &layer.kv_a, &layer.kv_b,
+                 &layer.attn_output, &layer.ffn_gate, &layer.ffn_up,
+                 &layer.ffn_down, &layer.router})
+            if (projection->entry) candidates.push_back(projection);
+    }
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const Projection* a, const Projection* b) {
+                         return a->entry->nbytes < b->entry->nbytes;
+                     });
+    uint64_t cache_bytes = 0;
+    size_t cache_count = 0;
+    for (const Projection* projection : candidates) {
+        const uint64_t bytes = align16k(projection->entry->nbytes);
+        if (bytes > fixed_cache_budget_ - cache_bytes) break;
+        cache_bytes += bytes;
+        ++cache_count;
+    }
+    if (cache_bytes) {
+        fixed_cache_ = mtl_->alloc(cache_bytes);
+        auto ready = std::make_unique<std::atomic<bool>[]>(cache_count);
+        size_t offset = 0;
+        for (size_t i = 0; i < cache_count; ++i) {
+            auto& projection = *candidates[i];
+            projection.buffer = view(fixed_cache_, offset, projection.entry->nbytes);
+            projection.resident = true;
+            ready[i].store(false, std::memory_order_relaxed);
+            gm_->ring().submit(projection.entry->shard, projection.entry->abs_offset,
+                               projection.entry->nbytes, projection.buffer.contents,
+                               &ready[i]);
+            offset += align16k(projection.entry->nbytes);
+        }
+        for (size_t i = 0; i < cache_count; ++i) PreadRing::wait(&ready[i]);
+    }
+    for (auto& slab : layer_stage_) slab = mtl_->alloc(largest_layer);
     output_projection_ = load_projection_("output.weight", H, cfg_.vocab);
-    prof::log("gguf_runtime: fixed tier output=%.3fGB layer_slab=%.3fGB",
-              output_projection_.buffer.length / 1e9, layer_stage_.length / 1e9);
+    prof::log("gguf_runtime: fixed tier output=%.3fGB cache=%.3fGB/%zu projections "
+              "layer_slabs=2x%.3fGB",
+              output_projection_.buffer.length / 1e9, cache_bytes / 1e9, cache_count,
+              layer_stage_[0].length / 1e9);
 }
 
-void GgufRuntime::stage_layer_(uint32_t L) {
+void GgufRuntime::begin_stage_layer_(uint32_t L, uint32_t slot) {
     if (L >= cfg_.n_layers) die("stage layer out of range");
+    if (slot >= layer_stage_.size()) die("stage slot out of range");
     auto& layer = lw_[L];
     std::array<Projection*, 9> projections = {
         &layer.q_a, &layer.q_b, &layer.kv_a, &layer.kv_b,
@@ -769,20 +816,36 @@ void GgufRuntime::stage_layer_(uint32_t L) {
     size_t offset = 0;
     for (uint32_t i = 0; i < count; ++i) {
         auto& projection = *projections[i];
+        if (projection.resident) {
+            layer_ready_[slot][i].store(true, std::memory_order_relaxed);
+            continue;
+        }
         offset = (offset + 16383) & ~size_t(16383);
-        projection.buffer = view(layer_stage_, offset, projection.entry->nbytes);
-        layer_ready_[i].store(false, std::memory_order_relaxed);
+        if (offset > layer_stage_[slot].length ||
+            projection.entry->nbytes > layer_stage_[slot].length - offset)
+            die("layer staging slab overflow");
+        projection.buffer = view(layer_stage_[slot], offset, projection.entry->nbytes);
+        layer_ready_[slot][i].store(false, std::memory_order_relaxed);
         gm_->ring().submit(projection.entry->shard, projection.entry->abs_offset,
                            projection.entry->nbytes, projection.buffer.contents,
-                           &layer_ready_[i]);
+                           &layer_ready_[slot][i]);
         step_model_bytes_ += projection.entry->nbytes;
         ++step_reads_;
         offset += projection.entry->nbytes;
     }
-    if (offset > layer_stage_.length) die("layer staging slab overflow");
+    layer_stage_started_[slot] = prof::now_us();
+}
+
+void GgufRuntime::wait_stage_layer_(uint32_t L, uint32_t slot) {
+    const uint32_t count = L < cfg_.n_dense_layers ? 8 : 9;
     const long long started = prof::now_us();
-    for (uint32_t i = 0; i < count; ++i) PreadRing::wait(&layer_ready_[i]);
-    step_io_wait_us_ += prof::now_us() - started;
+    for (uint32_t i = 0; i < count; ++i)
+        PreadRing::wait(&layer_ready_[slot][i]);
+    const long long now = prof::now_us();
+    step_io_wait_us_ += now - started;
+    if (profile_layers_)
+        prof::log("layer-stage pos=%u layer=%u slot=%u span_us=%lld blocked_us=%lld",
+                  pos_, L, slot, now - layer_stage_started_[slot], now - started);
 }
 
 void GgufRuntime::alloc_expert_slots_() {
@@ -1269,8 +1332,11 @@ void GgufRuntime::prefill_chunk_(const uint32_t* ids, uint32_t count) {
     for (uint32_t i = 0; i < count; ++i)
         embed_lookup_into_(ids[i], view(x_b_, size_t(i) * cfg_.hidden * 4,
                                         size_t(cfg_.hidden) * 4));
+    begin_stage_layer_(0, 0);
     for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
-        stage_layer_(L);
+        const uint32_t slot = L & 1u;
+        wait_stage_layer_(L, slot);
+        if (L + 1 < cfg_.n_layers) begin_stage_layer_(L + 1, slot ^ 1u);
         attention_batch_(L, count);
         if (L < cfg_.n_dense_layers) dense_batch_(L, count);
         else moe_batch_(L, count);
@@ -1290,13 +1356,21 @@ void GgufRuntime::prefill_chunk_(const uint32_t* ids, uint32_t count) {
                                  int64_t(mem::snapshot().available);
     prof::log("prefill-tile begin=%u tokens=%u wall_us=%lld tok_s=%.3f "
               "gpu_us=%lld io_wait_us=%lld nvme_bytes=%llu nvme_reads=%llu "
-              "nvme_gbps=%.3f cmdbufs=%d allocations=%llu available_delta=%lld",
+              "urgent_bytes=%llu urgent_reads=%llu nvme_gbps=%.3f "
+              "io_service_us=%llu io_max_us=%llu io_peak=%llu "
+              "cmdbufs=%d dispatches=%d allocations=%llu available_delta=%lld",
               pos_ - count, count, elapsed, count * 1e6 / double(elapsed),
               mtl_->step_gpu_us, step_io_wait_us_,
               static_cast<unsigned long long>(io.bytes),
               static_cast<unsigned long long>(io.requests),
+              static_cast<unsigned long long>(io.urgent_bytes),
+              static_cast<unsigned long long>(io.urgent_requests),
               io.elapsed_us ? double(io.bytes) / (io.elapsed_us * 1e3) : 0.0,
+              static_cast<unsigned long long>(io.service_us),
+              static_cast<unsigned long long>(io.max_service_us),
+              static_cast<unsigned long long>(io.peak_outstanding),
               mtl_->step_cmdbufs,
+              mtl_->step_dispatches,
               static_cast<unsigned long long>(step_allocations_),
               static_cast<long long>(memory_delta));
 }
@@ -1309,7 +1383,7 @@ void GgufRuntime::prefill_chunk_(const uint32_t* ids, uint32_t count) {
 // ---------------------------------------------------------------------------
 void GgufRuntime::forward_one_(uint32_t tok) {
     const long long started = prof::now_us();
-    const uint64_t available_before = mem::snapshot().available;
+    const auto memory_before = mem::snapshot();
     mtl_->reset_step_stats();
     gm_->ring().reset_stats();
     step_model_bytes_ = 0;
@@ -1323,10 +1397,45 @@ void GgufRuntime::forward_one_(uint32_t tok) {
     // 2. 61 transformer blocks. Each block:
     //      attn_out = MLA(x);  x += attn_out
     //      ffn_out  = FFN(x);  x += ffn_out
+    begin_stage_layer_(0, 0);
     for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
-        stage_layer_(L);
+        const long long layer_started = prof::now_us();
+        const long long io_wait_before = step_io_wait_us_;
+        const long long gpu_before = mtl_->step_gpu_us;
+        const int cmdbufs_before = mtl_->step_cmdbufs;
+        const int dispatches_before = mtl_->step_dispatches;
+        const auto io_before = profile_layers_ ? gm_->ring().stats() : PreadRing::Stats{};
+        const uint32_t slot = L & 1u;
+        wait_stage_layer_(L, slot);
+        if (L + 1 < cfg_.n_layers) begin_stage_layer_(L + 1, slot ^ 1u);
+        const long long fixed_done = prof::now_us();
+        const long long fixed_wait = step_io_wait_us_;
+        const auto fixed_io = profile_layers_ ? gm_->ring().stats() : PreadRing::Stats{};
         mla_attn_(L);
+        const long long attention_done = prof::now_us();
+        const long long attention_gpu = mtl_->step_gpu_us;
         if (L < cfg_.n_dense_layers) ffn_dense_(L); else ffn_moe_(L);
+        if (profile_layers_) {
+            const auto final_io = gm_->ring().stats();
+            prof::log(
+                "layer-metrics pos=%u layer=%u wall_us=%lld fixed_wall_us=%lld "
+                "fixed_io_wait_us=%lld fixed_bytes=%llu fixed_reads=%llu "
+                "attention_wall_us=%lld attention_gpu_us=%lld ffn_wall_us=%lld "
+                "ffn_gpu_us=%lld expert_io_wait_us=%lld expert_bytes=%llu "
+                "expert_reads=%llu cmdbufs=%d dispatches=%d",
+                pos_, L, prof::now_us() - layer_started,
+                fixed_done - layer_started, fixed_wait - io_wait_before,
+                static_cast<unsigned long long>(fixed_io.bytes - io_before.bytes),
+                static_cast<unsigned long long>(fixed_io.requests - io_before.requests),
+                attention_done - fixed_done, attention_gpu - gpu_before,
+                prof::now_us() - attention_done,
+                mtl_->step_gpu_us - attention_gpu,
+                step_io_wait_us_ - fixed_wait,
+                static_cast<unsigned long long>(final_io.bytes - fixed_io.bytes),
+                static_cast<unsigned long long>(final_io.requests - fixed_io.requests),
+                mtl_->step_cmdbufs - cmdbufs_before,
+                mtl_->step_dispatches - dispatches_before);
+        }
         if (trace_) trace_hidden_(L);
     }
 
@@ -1340,11 +1449,12 @@ void GgufRuntime::forward_one_(uint32_t tok) {
 
     pos_++;
     const long long elapsed = prof::now_us() - started;
-    const uint64_t available_after = mem::snapshot().available;
+    const auto memory_after = mem::snapshot();
     const auto io = gm_->ring().stats();
     const double io_gbps = io.elapsed_us > 0
         ? double(io.bytes) / (io.elapsed_us * 1e3) : 0.0;
-    const int64_t memory_delta = int64_t(available_before) - int64_t(available_after);
+    const int64_t memory_delta = int64_t(memory_before.available) -
+                                 int64_t(memory_after.available);
     const uint64_t kv_bytes = uint64_t(cfg_.n_layers) *
         (uint64_t(cfg_.n_heads) *
          ((cfg_.key_length - cfg_.rope_dim) + cfg_.value_length) +
@@ -1352,17 +1462,30 @@ void GgufRuntime::forward_one_(uint32_t tok) {
     prof::log(
         "metrics pos=%u wall_us=%lld gpu_us=%lld io_wait_us=%lld model_bytes=%llu "
         "nvme_bytes=%llu nvme_span_us=%llu nvme_gbps=%.3f useful_reads=%llu nvme_reads=%llu "
-        "cmdbufs=%d allocations=%llu kv_bytes=%llu "
-        "available_delta=%lld",
+        "urgent_bytes=%llu urgent_reads=%llu io_service_us=%llu io_max_us=%llu io_peak=%llu "
+        "cmdbufs=%d dispatches=%d allocations=%llu kv_bytes=%llu available_delta=%lld "
+        "pageouts=%llu compressions=%llu decompressions=%llu swapins=%llu swapouts=%llu",
         pos_, elapsed, mtl_->step_gpu_us, step_io_wait_us_,
         static_cast<unsigned long long>(step_model_bytes_),
         static_cast<unsigned long long>(io.bytes),
         static_cast<unsigned long long>(io.elapsed_us), io_gbps,
         static_cast<unsigned long long>(step_reads_),
-        static_cast<unsigned long long>(io.requests), mtl_->step_cmdbufs,
+        static_cast<unsigned long long>(io.requests),
+        static_cast<unsigned long long>(io.urgent_bytes),
+        static_cast<unsigned long long>(io.urgent_requests),
+        static_cast<unsigned long long>(io.service_us),
+        static_cast<unsigned long long>(io.max_service_us),
+        static_cast<unsigned long long>(io.peak_outstanding),
+        mtl_->step_cmdbufs,
+        mtl_->step_dispatches,
         static_cast<unsigned long long>(step_allocations_),
         static_cast<unsigned long long>(kv_bytes),
-        static_cast<long long>(memory_delta));
+        static_cast<long long>(memory_delta),
+        static_cast<unsigned long long>(memory_after.pageouts - memory_before.pageouts),
+        static_cast<unsigned long long>(memory_after.compressions - memory_before.compressions),
+        static_cast<unsigned long long>(memory_after.decompressions - memory_before.decompressions),
+        static_cast<unsigned long long>(memory_after.swapins - memory_before.swapins),
+        static_cast<unsigned long long>(memory_after.swapouts - memory_before.swapouts));
 }
 
 uint32_t GgufRuntime::sample_logits_() {

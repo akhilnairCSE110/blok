@@ -49,13 +49,18 @@ public:
                 uint64_t offset,
                 uint64_t nbytes,
                 void*    dst,
-                std::atomic<bool>* done);
+                std::atomic<bool>* done,
+                bool urgent = false);
 
     // Spin until *done == true (acquire). Caller must reset *done = false
     // before re-using it for another submit().
     static void wait(const std::atomic<bool>* done);
 
-    struct Stats { uint64_t bytes, requests, elapsed_us; };
+    struct Stats {
+        uint64_t bytes, requests, elapsed_us;
+        uint64_t urgent_bytes, urgent_requests;
+        uint64_t service_us, max_service_us, peak_outstanding;
+    };
     void reset_stats();
     Stats stats() const;
 
@@ -79,11 +84,14 @@ private:
         PreadRing* owner = nullptr;
         int               fd = -1;
         std::string       path;
-        Request           ring[kQueueCapacity];
+        // Queue 0 is background fixed-weight prefetch; queue 1 is the exact
+        // router-selected expert critical path. The worker drains urgent
+        // work first but never interrupts an in-flight pread.
+        Request           ring[2][kQueueCapacity];
         // SPSC indices. Producer publishes with head.store(release);
         // consumer reads with head.load(acquire). Mirror for tail.
-        std::atomic<uint64_t> head{0};
-        std::atomic<uint64_t> tail{0};
+        std::atomic<uint64_t> head[2]{};
+        std::atomic<uint64_t> tail[2]{};
         std::atomic<bool>     stop{false};
         std::mutex            mutex;
         std::condition_variable wake;
@@ -101,6 +109,12 @@ private:
     std::atomic<uint64_t> stat_requests_{0};
     std::atomic<uint64_t> stat_first_ns_{0};
     std::atomic<uint64_t> stat_last_ns_{0};
+    std::atomic<uint64_t> stat_urgent_bytes_{0};
+    std::atomic<uint64_t> stat_urgent_requests_{0};
+    std::atomic<uint64_t> stat_service_ns_{0};
+    std::atomic<uint64_t> stat_max_service_ns_{0};
+    std::atomic<uint64_t> stat_outstanding_{0};
+    std::atomic<uint64_t> stat_peak_outstanding_{0};
 };
 
 } // namespace blade

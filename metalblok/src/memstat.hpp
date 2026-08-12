@@ -48,6 +48,11 @@ struct Snapshot {
     uint64_t free;        // strictly unused
     uint64_t available;   // free + reclaimable (inactive/cached file pages)
     uint64_t page_size;
+    uint64_t pageouts;       // lifetime VM counters; deltas expose pressure
+    uint64_t compressions;
+    uint64_t decompressions;
+    uint64_t swapins;
+    uint64_t swapouts;
 };
 
 inline Snapshot snapshot() {
@@ -78,6 +83,11 @@ inline Snapshot snapshot() {
         const uint64_t active_file = external > counted ? external - counted : 0;
         s.available = s.free +
             (uint64_t(vm.inactive_count) + active_file) * pg;
+        s.pageouts = vm.pageouts;
+        s.compressions = vm.compressions;
+        s.decompressions = vm.decompressions;
+        s.swapins = vm.swapins;
+        s.swapouts = vm.swapouts;
     }
 #elif defined(__linux__)
     s.page_size = (uint64_t)::sysconf(_SC_PAGESIZE);

@@ -79,17 +79,19 @@ def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stream DeepSeek-R1 671B from SSD through Metal")
     parser.add_argument("prompt", help="user message")
     parser.add_argument("-n", "--max-output-tokens", type=int, default=256)
-    parser.add_argument("--context", type=int, default=16_384)
+    parser.add_argument("--context", type=int, default=2_048)
     parser.add_argument("--model", type=Path, default=Path(os.getenv("METALBLOK_MODEL", MODEL)))
     parser.add_argument("--state", type=Path, help="new or existing conversation checkpoint")
     parser.add_argument("--continue-decode", action="store_true",
                         help="continue the unfinished decode loop in --state")
-    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--checkpoint-every", type=int, default=256)
     parser.add_argument("--stall-timeout", type=int, default=300)
     parser.add_argument("--trace", action="store_true", help="log per-layer numerical telemetry")
+    parser.add_argument("--profile-layers", action="store_true",
+                        help="log per-layer GPU and NVMe attribution")
     return parser.parse_args()
 
 
@@ -136,6 +138,8 @@ def run(args: argparse.Namespace) -> int:
     env = os.environ.copy()
     if args.trace:
         env["METALBLOK_TRACE"] = "1"
+    if args.profile_layers:
+        env["METALBLOK_PROFILE_LAYERS"] = "1"
     note(f"input={inputs} output_cap={args.max_output_tokens} context={args.context}")
     note(f"state={state}")
     note(f"diagnostics={log_path}")

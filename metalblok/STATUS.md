@@ -1,19 +1,26 @@
 # MetalBlok status
 
-Completion requires a real prompt to generate repeatable text from the exact
-three-shard DeepSeek-R1 checkpoint without crossing the memory ledger.
+**Active release gate:** exact 1,000-native-token coding prompt plus exactly
+1,000 emitted tokens on the three-shard DeepSeek-R1 checkpoint.
 
 | Gate | Status | Evidence |
 |---|---|---|
-| Native build and runtime Metal compilation | Pass | Native binary built; executing Metal kernels used in inference |
-| Non-hydrating shard preflight | Pass | Exact manifest, allocation, sparse, and dataless checks |
-| All three model shards resident and verified | Pass | 140,231,438,464 logical bytes; `missing_physical=0` |
-| Six real GGUF quant types pass CPU/Metal parity | Pass | F32, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ1_S; relative errors 2.04–2.13e-4 |
-| Exact grouped DeepSeek router passes parity | Pass | Same eight IDs; maximum displayed weight difference 3.0e-8 |
-| One real generated token | Pass | Prompt `Hi` predicts `Okay` through all 61 layers |
-| Five repeatable coherent tokens | Pass | Exact checkpoint chain begins `Okay, so I need...` |
-| 32-token safety soak | Pass | Position 6 to 38; atomic +1 advancement; 1.08–1.77 GB final RSS |
+| Native C++/Metal build | Pass | warning-clean build; runtime Metal source compiles |
+| Shard/model admission | Pass | 3 physically resident shards, 1,025 tensors, 140,231,438,464 bytes |
+| Stored quant kernels | Pass | F32, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ1_S CPU/Metal checks |
+| Exact grouped router | Pass | CPU/Metal IDs identical; weights within declared FP tolerance |
+| Complete 61-layer generation | Pass | coherent real output and exact atomic continuation |
+| Exact 1,000-token prefill | Pass | 591.94 s runtime, 1.69 token/s, first token `Okay` |
+| Scheduling optimization parity | Pass | positions 1,280–1,282 token IDs and greedy logits match old path |
+| Fixed-weight traffic reduction | Pass | 13.850 → 13.588 GB and 1,939 → 1,869 reads/decode step |
+| 1,000 emitted-token acceptance | Running | authoritative checkpoint must finish at position 1,999 |
 
-The executability milestone is complete. Full independent-runtime logit parity,
-physical expert-record bundling, temporal caching, optimized scheduling, and
-contexts above 64 remain explicitly outside this milestone.
+Current steady decode is approximately 3.1–3.4 seconds/token at 4.1–4.6 GB/s
+effective NVMe on the 24 GB M5, with about 0.47–0.57 seconds GPU time,
+178 command buffers, zero hot-path allocations, and no observed swap-outs in
+the optimized continuation.
+
+The exact live artifacts and complete implementation record are in
+[`docs/V0_CLOSEOUT.md`](docs/V0_CLOSEOUT.md). CLI usage is in
+[`docs/RUN_GUIDE.md`](docs/RUN_GUIDE.md).
+

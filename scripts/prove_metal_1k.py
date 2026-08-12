@@ -85,7 +85,7 @@ def main() -> int:
     parser.add_argument("--model", type=Path, default=MODEL)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume-state", type=Path,
-                        help="resume output from a completed 1000-token prefill")
+                        help="resume an exact checkpoint at position 1000..1998")
     args = parser.parse_args()
     if not BINARY.is_file():
         subprocess.run(["cmake", "-S", str(ROOT / "metalblok"), "-B", str(BINARY.parent)], check=True)
@@ -98,11 +98,13 @@ def main() -> int:
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     state = args.resume_state or ROOT / "metalblok/runs" / f"proof-1k-{stamp}.state"
-    if args.resume_state and state_position(state) != TARGET:
-        raise RuntimeError("resume checkpoint must be the completed 1000-token prefill")
+    position = state_position(state) if args.resume_state else TARGET
+    if args.resume_state and not TARGET <= position < 2 * TARGET - 1:
+        raise RuntimeError("resume checkpoint position must be in [1000,1998]")
+    output_tokens = 2 * TARGET - position if args.resume_state else TARGET
     output = ROOT / "metalblok/runs" / f"proof-1k-{stamp}.txt"
     command = [
-        str(RUNNER), prompt, "-n", str(TARGET), "--context", "2048",
+        str(RUNNER), prompt, "-n", str(output_tokens), "--context", "2048",
         "--state", str(state), "--checkpoint-every", "256", "--temperature", "0",
     ]
     if args.resume_state:

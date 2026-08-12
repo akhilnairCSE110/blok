@@ -77,7 +77,12 @@ public:
     // kernel call site.
     long long step_gpu_us  = 0;
     int       step_cmdbufs = 0;
-    void reset_step_stats() { step_gpu_us = 0; step_cmdbufs = 0; }
+    int       step_dispatches = 0;
+    void reset_step_stats() {
+        step_gpu_us = 0;
+        step_cmdbufs = 0;
+        step_dispatches = 0;
+    }
 
 private:
     void* device_   = nullptr;     // id<MTLDevice>

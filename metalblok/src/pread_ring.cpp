@@ -3,6 +3,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -93,28 +94,35 @@ void PreadRing::submit(uint32_t shard_idx,
                        uint64_t offset,
                        uint64_t nbytes,
                        void*    dst,
-                       std::atomic<bool>* done) {
+                       std::atomic<bool>* done,
+                       bool urgent) {
     if (shard_idx >= logical_shards_) {
         std::fprintf(stderr, "pread_ring: invalid shard %u\n", shard_idx);
         std::abort();
     }
     const uint32_t lane = lane_cursor_[shard_idx]++ % kLanesPerShard;
     Shard* s = shards_[shard_idx * kLanesPerShard + lane].get();
+    const uint32_t queue = urgent ? 1u : 0u;
     // Wait for a free slot. Single-producer => only this thread writes head,
     // so head doesn't need atomic load with synchronization.
-    uint64_t head = s->head.load(std::memory_order_relaxed);
+    uint64_t head = s->head[queue].load(std::memory_order_relaxed);
     for (;;) {
-        uint64_t tail = s->tail.load(std::memory_order_acquire);
+        uint64_t tail = s->tail[queue].load(std::memory_order_acquire);
         if (head - tail < kQueueCapacity) break;
         // Busy-wait; queue is sized so this is rare.
         std::this_thread::yield();
     }
-    Request& r = s->ring[head % kQueueCapacity];
+    Request& r = s->ring[queue][head % kQueueCapacity];
     r.offset = offset;
     r.nbytes = nbytes;
     r.dst    = dst;
     r.done   = done;
-    s->head.store(head + 1, std::memory_order_release);
+    s->head[queue].store(head + 1, std::memory_order_release);
+    const uint64_t outstanding = stat_outstanding_.fetch_add(
+        1, std::memory_order_relaxed) + 1;
+    uint64_t peak = stat_peak_outstanding_.load(std::memory_order_relaxed);
+    while (peak < outstanding && !stat_peak_outstanding_.compare_exchange_weak(
+               peak, outstanding, std::memory_order_relaxed)) {}
     s->wake.notify_one();
 }
 
@@ -130,6 +138,12 @@ void PreadRing::reset_stats() {
     stat_requests_.store(0, std::memory_order_relaxed);
     stat_first_ns_.store(0, std::memory_order_relaxed);
     stat_last_ns_.store(0, std::memory_order_relaxed);
+    stat_urgent_bytes_.store(0, std::memory_order_relaxed);
+    stat_urgent_requests_.store(0, std::memory_order_relaxed);
+    stat_service_ns_.store(0, std::memory_order_relaxed);
+    stat_max_service_ns_.store(0, std::memory_order_relaxed);
+    stat_peak_outstanding_.store(stat_outstanding_.load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
 }
 
 PreadRing::Stats PreadRing::stats() const {
@@ -137,23 +151,36 @@ PreadRing::Stats PreadRing::stats() const {
     const uint64_t last = stat_last_ns_.load(std::memory_order_relaxed);
     return {stat_bytes_.load(std::memory_order_relaxed),
             stat_requests_.load(std::memory_order_relaxed),
-            last > first ? (last - first) / 1000 : 0};
+            last > first ? (last - first) / 1000 : 0,
+            stat_urgent_bytes_.load(std::memory_order_relaxed),
+            stat_urgent_requests_.load(std::memory_order_relaxed),
+            stat_service_ns_.load(std::memory_order_relaxed) / 1000,
+            stat_max_service_ns_.load(std::memory_order_relaxed) / 1000,
+            stat_peak_outstanding_.load(std::memory_order_relaxed)};
 }
 
 void PreadRing::worker_loop(Shard* s) {
-    uint64_t tail = s->tail.load(std::memory_order_relaxed);
+    uint64_t tail[2] = {
+        s->tail[0].load(std::memory_order_relaxed),
+        s->tail[1].load(std::memory_order_relaxed),
+    };
     for (;;) {
-        uint64_t head = s->head.load(std::memory_order_acquire);
-        if (tail == head) {
+        uint64_t head[2] = {
+            s->head[0].load(std::memory_order_acquire),
+            s->head[1].load(std::memory_order_acquire),
+        };
+        if (tail[0] == head[0] && tail[1] == head[1]) {
             if (s->stop.load(std::memory_order_acquire)) return;
             std::unique_lock<std::mutex> lock(s->mutex);
             s->wake.wait(lock, [&] {
                 return s->stop.load(std::memory_order_acquire) ||
-                       s->head.load(std::memory_order_acquire) != tail;
+                       s->head[0].load(std::memory_order_acquire) != tail[0] ||
+                       s->head[1].load(std::memory_order_acquire) != tail[1];
             });
             continue;
         }
-        Request r = s->ring[tail % kQueueCapacity];
+        const uint32_t queue = tail[1] != head[1] ? 1u : 0u;
+        Request r = s->ring[queue][tail[queue] % kQueueCapacity];
         const auto now_ns = [] {
             return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -177,26 +204,35 @@ void PreadRing::worker_loop(Shard* s) {
                 continue;
             }
             if (n < 0 && errno == EINTR) continue;
-            // Hard failure or EOF mid-read. We have no error channel per
-            // request, so log to stderr and still flip done so the producer
-            // doesn't deadlock. Higher layers should treat partial data as
-            // a fatal model-load error and abort.
+            // A short model read invalidates the forward pass. Fail closed;
+            // the last atomic checkpoint remains usable after process exit.
             std::fprintf(stderr,
                 "pread_ring: %s: pread off=%llu left=%llu rc=%zd errno=%d\n",
                 s->path.c_str(),
                 (unsigned long long)off, (unsigned long long)left, n, errno);
-            break;
+            std::abort();
         }
         s->owner->stat_bytes_.fetch_add(r.nbytes - left, std::memory_order_relaxed);
         s->owner->stat_requests_.fetch_add(1, std::memory_order_relaxed);
         const uint64_t finished = now_ns();
+        const uint64_t service = finished - started;
+        s->owner->stat_service_ns_.fetch_add(service, std::memory_order_relaxed);
+        uint64_t maximum = s->owner->stat_max_service_ns_.load(std::memory_order_relaxed);
+        while (maximum < service && !s->owner->stat_max_service_ns_.compare_exchange_weak(
+                   maximum, service, std::memory_order_relaxed)) {}
+        if (queue) {
+            s->owner->stat_urgent_bytes_.fetch_add(r.nbytes - left,
+                                                   std::memory_order_relaxed);
+            s->owner->stat_urgent_requests_.fetch_add(1, std::memory_order_relaxed);
+        }
         uint64_t previous = s->owner->stat_last_ns_.load(std::memory_order_relaxed);
         while (previous < finished && !s->owner->stat_last_ns_.compare_exchange_weak(
                    previous, finished, std::memory_order_relaxed)) {}
         // Publish result to producer.
         r.done->store(true, std::memory_order_release);
-        ++tail;
-        s->tail.store(tail, std::memory_order_release);
+        s->owner->stat_outstanding_.fetch_sub(1, std::memory_order_relaxed);
+        ++tail[queue];
+        s->tail[queue].store(tail[queue], std::memory_order_release);
     }
 }
 

@@ -171,6 +171,7 @@ void Metal::dispatch(const char* name,
                      uint32_t grid_x, uint32_t tg_x,
                      bool one_tg_per_grid_x)
 {
+    ++step_dispatches;
     id<MTLComputePipelineState> pso = get_pso(DEV, LIB, PSOPTR, PSONAMED, name);
     [ENC setComputePipelineState:pso];
     last_kernel_ = name;
@@ -195,6 +196,7 @@ void Metal::dispatch2d(const char* name,
                        std::initializer_list<ByteArg> byte_args,
                        uint32_t grid_x, uint32_t grid_y, uint32_t tg_x)
 {
+    ++step_dispatches;
     id<MTLComputePipelineState> pso = get_pso(DEV, LIB, PSOPTR, PSONAMED, name);
     [ENC setComputePipelineState:pso];
     last_kernel_ = name;
