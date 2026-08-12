@@ -2,6 +2,7 @@
 #include "pread_ring.hpp"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -24,6 +25,7 @@ bool PreadRing::open(const std::vector<std::string>& shard_paths) {
     shards_.reserve(shard_paths.size());
     for (const auto& p : shard_paths) {
         auto s = std::make_unique<Shard>();
+        s->owner = this;
         s->path = p;
         s->fd = ::open(p.c_str(), O_RDONLY);
         if (s->fd < 0) {
@@ -106,6 +108,21 @@ void PreadRing::wait(const std::atomic<bool>* done) {
     }
 }
 
+void PreadRing::reset_stats() {
+    stat_bytes_.store(0, std::memory_order_relaxed);
+    stat_requests_.store(0, std::memory_order_relaxed);
+    stat_first_ns_.store(0, std::memory_order_relaxed);
+    stat_last_ns_.store(0, std::memory_order_relaxed);
+}
+
+PreadRing::Stats PreadRing::stats() const {
+    const uint64_t first = stat_first_ns_.load(std::memory_order_relaxed);
+    const uint64_t last = stat_last_ns_.load(std::memory_order_relaxed);
+    return {stat_bytes_.load(std::memory_order_relaxed),
+            stat_requests_.load(std::memory_order_relaxed),
+            last > first ? (last - first) / 1000 : 0};
+}
+
 void PreadRing::worker_loop(Shard* s) {
     uint64_t tail = s->tail.load(std::memory_order_relaxed);
     for (;;) {
@@ -116,6 +133,14 @@ void PreadRing::worker_loop(Shard* s) {
             continue;
         }
         Request r = s->ring[tail % kQueueCapacity];
+        const auto now_ns = [] {
+            return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        };
+        const uint64_t started = now_ns();
+        uint64_t unset = 0;
+        s->owner->stat_first_ns_.compare_exchange_strong(
+            unset, started, std::memory_order_relaxed);
 
         // Loop pread to handle short reads (very rare with F_NOCACHE on a
         // local file, but cheap insurance).
@@ -141,6 +166,12 @@ void PreadRing::worker_loop(Shard* s) {
                 (unsigned long long)off, (unsigned long long)left, n, errno);
             break;
         }
+        s->owner->stat_bytes_.fetch_add(r.nbytes - left, std::memory_order_relaxed);
+        s->owner->stat_requests_.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t finished = now_ns();
+        uint64_t previous = s->owner->stat_last_ns_.load(std::memory_order_relaxed);
+        while (previous < finished && !s->owner->stat_last_ns_.compare_exchange_weak(
+                   previous, finished, std::memory_order_relaxed)) {}
         // Publish result to producer.
         r.done->store(true, std::memory_order_release);
         ++tail;

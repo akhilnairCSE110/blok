@@ -3,6 +3,9 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+target_env="${BLOK_TARGET_ENV:-$repo_root/target.env}"
+# shellcheck source=/dev/null
+test ! -f "$target_env" || source "$target_env"
 
 revision=7eb5002f6aadc958aed6a9177b7ed26bb94011bb
 blok_home="${BLOK_HOME:-$HOME/.blok}"
@@ -10,6 +13,7 @@ model_root="${BLOK_MODEL_ROOT:-$blok_home/models}/moonshotai/Kimi-K2.6"
 model_dir="$model_root/source/hf/$revision"
 index="${BLOK_META_ROOT:-$blok_home/metadata}/moonshotai/Kimi-K2.6/runtime-index.blok"
 env_file="${BLOK_UGDS_ENV_OUTPUT:-$repo_root/ugds.env}"
+proof_kv_bytes=99942400000
 
 require_linux() {
   test "$(uname -s)" = Linux || { echo "target_v0.sh requires target Linux" >&2; exit 1; }
@@ -38,6 +42,10 @@ prepare() {
   }
   test -n "${BLOK_KV_UGDS_BASE:-}" || { echo "set BLOK_KV_UGDS_BASE" >&2; exit 1; }
   test -n "${BLOK_KV_UGDS_BYTES:-}" || { echo "set BLOK_KV_UGDS_BYTES" >&2; exit 1; }
+  [[ "$BLOK_KV_UGDS_BYTES" =~ ^[0-9]+$ ]] && (( BLOK_KV_UGDS_BYTES >= proof_kv_bytes )) || {
+    echo "BLOK_KV_UGDS_BYTES must reserve at least $proof_kv_bytes bytes for the 10k+10k proof" >&2
+    exit 1
+  }
   layout_args=("$index" --output "${BLOK_UGDS_MAP:?set BLOK_UGDS_MAP}" --env-output "$env_file")
   test -z "${BLOK_UGDS_PHYSICAL_OFFSET_ADD:-}" || layout_args+=(--physical-offset-add "$BLOK_UGDS_PHYSICAL_OFFSET_ADD")
   .venv/bin/python scripts/plan_ugds_layout.py "${layout_args[@]}"
@@ -48,7 +56,13 @@ prepare() {
   echo "next: unmount the model filesystem, bind its NVMe controller to uGDS, then run: scripts/target_v0.sh run"
 }
 
-run() {
+fetch() {
+  require_linux
+  require_source
+  .venv/bin/python -m scripts.model_fetch kimi-k2.6 fetch
+}
+
+activate_runtime() {
   require_linux
   require_source
   test -f "$env_file" || { echo "missing $env_file; run prepare first" >&2; exit 1; }
@@ -58,11 +72,30 @@ run() {
   export BLOK_MODEL="$index"
   scripts/check_hardware.sh
   .venv/bin/python -m scripts.check_kimi_contract "$index"
+}
+
+run() {
+  activate_runtime
   .venv/bin/python -m scripts.smoke_kimi "$index"
 }
 
-case "${1:-}" in
-  prepare) prepare ;;
-  run) run ;;
-  *) echo "usage: $0 {prepare|run}" >&2; exit 2 ;;
+prove() {
+  activate_runtime
+  .venv/bin/python -m scripts.prove_kimi_10k "$index" "$@"
+}
+
+serve() {
+  activate_runtime
+  exec .venv/bin/python -m scripts.chat_server --model "$index" "$@"
+}
+
+action="${1:-}"
+test "$#" -eq 0 || shift
+case "$action" in
+  fetch) fetch "$@" ;;
+  prepare) prepare "$@" ;;
+  run) run "$@" ;;
+  prove) prove "$@" ;;
+  serve) serve "$@" ;;
+  *) echo "usage: $0 {fetch|prepare|run|prove|serve}" >&2; exit 2 ;;
 esac

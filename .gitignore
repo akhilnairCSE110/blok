@@ -5,3 +5,7 @@ dist/
 target/
 __pycache__/
 *.pyc
+target.env
+ugds.env
+ugds-map.blok
+runs/

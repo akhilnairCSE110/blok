@@ -14,9 +14,9 @@
 //
 // Darwin: host_statistics64(HOST_VM_INFO64).
 //   "free" = (free_count + speculative_count) * page_size
-//   "available" (= what malloc could probably get without swapping) =
-//     free + inactive + (purgeable portion of external) - we approximate as
-//     free + inactive, which matches Activity Monitor's "Memory Available".
+//   "available" = free + inactive + conservative active file-backed pages.
+//     Model reads leave clean pages on the active external queue; excluding
+//     them makes a warmed 420 GB checkpoint look like unreclaimable RAM.
 // Linux:  /proc/meminfo MemAvailable (kernel-computed; kernel-correct).
 //
 // We expose two numbers because they answer different questions:
@@ -68,13 +68,16 @@ inline Snapshot snapshot() {
                           (host_info64_t)&vm, &cnt) == KERN_SUCCESS) {
         const uint64_t pg = s.page_size;
         s.free      = (uint64_t)(vm.free_count + vm.speculative_count) * pg;
-        // Inactive pages are clean-or-dirty file-backed mappings the kernel
-        // will evict under pressure.  Activity Monitor's "Memory Available"
-        // is approximately free + inactive.  We do NOT add purgeable_count:
-        // on macOS, purgeable pages overlap with internal/inactive in the
-        // kernel's per-page accounting, so adding them double-counts and
-        // makes us think we have more headroom than we do.
-        s.available = s.free + (uint64_t)vm.inactive_count * pg;
+        // external_page_count spans page queues. Subtract every inactive and
+        // speculative page (even internal ones) before adding the remainder;
+        // this deliberately undercounts rather than double-counts reclaimable
+        // active file cache. Wired, anonymous-active, and compressed pages are
+        // never included.
+        const uint64_t external = vm.external_page_count;
+        const uint64_t counted = uint64_t(vm.inactive_count) + vm.speculative_count;
+        const uint64_t active_file = external > counted ? external - counted : 0;
+        s.available = s.free +
+            (uint64_t(vm.inactive_count) + active_file) * pg;
     }
 #elif defined(__linux__)
     s.page_size = (uint64_t)::sysconf(_SC_PAGESIZE);

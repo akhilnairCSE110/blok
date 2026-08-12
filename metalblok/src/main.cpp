@@ -344,15 +344,13 @@ static int validate_router() {
     constexpr uint32_t N = 256, K = 8, G = 8, TG = 4;
     constexpr float scale = 2.5f;
     constexpr uint32_t norm = 1;
-    std::vector<uint16_t> logits_h(N);
     std::vector<float> logits_f(N), bias(N);
     uint64_t state = 0x726f757465722d31ULL;
     for (uint32_t i = 0; i < N; ++i) {
         state ^= state << 13; state ^= state >> 7; state ^= state << 17;
         float l = static_cast<int32_t>(state & 0xffff) / 8192.0f - 4.0f;
         float b = static_cast<int32_t>((state >> 16) & 0xffff) / 131072.0f - 0.25f;
-        logits_h[i] = f32_to_f16(l);
-        logits_f[i] = f16_to_f32(logits_h[i]);
+        logits_f[i] = l;
         bias[i] = b;
     }
     std::vector<RoutedExpert> ref;
@@ -360,14 +358,14 @@ static int validate_router() {
                                scale, true, ref)) return 1;
 
     Metal mtl; mtl.init(METALBLOK_KERNEL_PATH);
-    MtlBuf bLogits = mtl.alloc(N * sizeof(uint16_t));
+    MtlBuf bLogits = mtl.alloc(N * sizeof(float));
     MtlBuf bBias = mtl.alloc(N * sizeof(float));
     MtlBuf bIdx = mtl.alloc(K * sizeof(uint32_t));
     MtlBuf bWts = mtl.alloc(K * sizeof(float));
-    std::memcpy(bLogits.contents, logits_h.data(), bLogits.length);
+    std::memcpy(bLogits.contents, logits_f.data(), bLogits.length);
     std::memcpy(bBias.contents, bias.data(), bBias.length);
     mtl.begin();
-    mtl.dispatch("router_topk_grouped_sigmoid_f16",
+    mtl.dispatch("router_topk_grouped_sigmoid_f32",
                  {bLogits, bBias, bIdx, bWts},
                  {{&N,4},{&K,4},{&G,4},{&TG,4},{&scale,4},{&norm,4}},
                  1, 1, true);
@@ -410,13 +408,13 @@ static int validate_gemv(const char* path, const char* tname, bool force) {
     struct TypeInfo { uint32_t bpb; DqFn cpu; const char* kernel; bool needs_grid; const void* grid; size_t grid_bytes; };
     TypeInfo ti{};
     switch (ref.type) {
-        case GGML_F32:      ti = {1024, &dequant_f32_256,          "gemv_f32_f16",     false, nullptr, 0 }; break;
-        case GGML_Q6_K:    ti = { 210, &dequantize_q6_K_block,    "gemv_q6_K_f16",    false, nullptr, 0 }; break;
-        case GGML_Q4_K:    ti = { 144, &dequantize_q4_K_block,    "gemv_q4_K_f16",    false, nullptr, 0 }; break;
-        case GGML_Q5_K:    ti = { 176, &dequantize_q5_K_block,    "gemv_q5_K_f16",    false, nullptr, 0 }; break;
-        case GGML_IQ1_S:   ti = {  50, &dequantize_iq1_s_block,   "gemv_iq1_s_f16",   true,
+        case GGML_F32:      ti = {1024, &dequant_f32_256,          "gemv_f32_f32",     false, nullptr, 0 }; break;
+        case GGML_Q6_K:    ti = { 210, &dequantize_q6_K_block,    "gemv_q6_K_f32",    false, nullptr, 0 }; break;
+        case GGML_Q4_K:    ti = { 144, &dequantize_q4_K_block,    "gemv_q4_K_f32",    false, nullptr, 0 }; break;
+        case GGML_Q5_K:    ti = { 176, &dequantize_q5_K_block,    "gemv_q5_K_f32",    false, nullptr, 0 }; break;
+        case GGML_IQ1_S:   ti = {  50, &dequantize_iq1_s_block,   "gemv_iq1_s_f32",   true,
                                   blade::vendored::iq1s_grid,    sizeof(blade::vendored::iq1s_grid)   }; break;
-        case GGML_IQ2_XXS: ti = {  66, &dequantize_iq2_xxs_block, "gemv_iq2_xxs_f16", true,
+        case GGML_IQ2_XXS: ti = {  66, &dequantize_iq2_xxs_block, "gemv_iq2_xxs_f32", true,
                                   blade::vendored::iq2xxs_grid,  sizeof(blade::vendored::iq2xxs_grid) }; break;
         default:
             std::fprintf(stderr, "validate-gemv: type %s not wired up yet\n",
@@ -558,10 +556,9 @@ static int validate_gemv(const char* path, const char* tname, bool force) {
 
     // GPU dispatch.  bW is already populated by the pread above; we just
     // bind the small X/Y buffers and (for iq1_s) the codebook grid.
-    MtlBuf bX = mtl.alloc(K * sizeof(uint16_t));
-    MtlBuf bY = mtl.alloc(n_rows * sizeof(uint16_t));
-    std::memcpy(bX.contents, x_h.data(), K * sizeof(uint16_t));
-    std::vector<MtlBuf> bufs{ bW, bX, bY };
+    MtlBuf bX = mtl.alloc(K * sizeof(float));
+    MtlBuf bY = mtl.alloc(n_rows * sizeof(float));
+    std::memcpy(bX.contents, x_f.data(), K * sizeof(float));
     MtlBuf bGrid{};
     if (ti.needs_grid) {
         // Bound at buffer(3); the kernel reads it as device const ulong*.
@@ -570,15 +567,18 @@ static int validate_gemv(const char* path, const char* tname, bool force) {
         // (hard fault on dispatch), so copy it into a real shared buffer.
         bGrid = mtl.alloc(ti.grid_bytes);
         std::memcpy(bGrid.contents, ti.grid, ti.grid_bytes);
-        bufs.push_back(bGrid);
     }
 
     const uint32_t Ku = (uint32_t)K;
-    const uint32_t TG = 128;
+    const uint32_t TG = 32; // one SIMD-group covers this model's <=28 blocks/row
     long long tg0 = prof::now_us();
     mtl.begin();
-    mtl.dispatch(ti.kernel, bufs, { { &Ku, sizeof(Ku) } },
-                 (uint32_t)n_rows, TG, true);
+    if (ti.needs_grid)
+        mtl.dispatch(ti.kernel, {bW, bX, bY, bGrid}, {{&Ku, sizeof(Ku)}},
+                     (uint32_t)n_rows, TG, true);
+    else
+        mtl.dispatch(ti.kernel, {bW, bX, bY}, {{&Ku, sizeof(Ku)}},
+                     (uint32_t)n_rows, TG, true);
     mtl.commit_and_wait();
     long long tg1 = prof::now_us();
     std::fprintf(stdout, "  GPU kernel: %.2f ms  (%.2f GB/s W, %.2f GFLOP/s)\n",
@@ -587,11 +587,11 @@ static int validate_gemv(const char* path, const char* tname, bool force) {
                  (double)(2 * K * n_rows) / 1e9 / ((tg1 - tg0) / 1e6));
 
     // Compare.  fp16 round-to-nearest accumulates ~ sqrt(K) * 2^-11 noise.
-    const uint16_t* y_h = static_cast<const uint16_t*>(bY.contents);
+    const float* y_h = static_cast<const float*>(bY.contents);
     double max_abs = 0.0, sumsq_err = 0.0, sumsq_ref = 0.0;
     uint64_t worst_i = 0;
     for (uint64_t r = 0; r < n_rows; ++r) {
-        const float yg = f16_to_f32(y_h[r]);
+        const float yg = y_h[r];
         const float yr = y_ref[r];
         const double d = (double)yg - (double)yr;
         if (std::fabs(d) > max_abs) { max_abs = std::fabs(d); worst_i = r; }
@@ -603,7 +603,7 @@ static int validate_gemv(const char* path, const char* tname, bool force) {
     const double rel     = rms_err / (rms_ref > 0 ? rms_ref : 1.0);
     std::fprintf(stdout, "  vs oracle:  max_abs=%.6f  rms_err=%.6f  rms_ref=%.6f  rel=%.2e  worst[%llu]: ref=%+.4f gpu=%+.4f\n",
                  max_abs, rms_err, rms_ref, rel,
-                 (unsigned long long)worst_i, y_ref[worst_i], f16_to_f32(y_h[worst_i]));
+                 (unsigned long long)worst_i, y_ref[worst_i], y_h[worst_i]);
 
     // No mmap to clean up.  All MtlBufs release on scope exit.
     return (rel < 5e-3) ? 0 : 2;
@@ -644,6 +644,11 @@ static void usage() {
 "      --state       <file>  exact per-token MLA KV checkpoint\n"
 "      --single-step-token N process one token, save --state, print next token\n"
 "      --continue-state      emit/extend generation already stored in --state\n"
+"      --resume-turn         append a user turn to --state and continue its KV cache\n"
+"      --temperature <F>     sampler temperature; 0 is greedy (default 0)\n"
+"      --top-p       <F>     nucleus probability mass       (default 0.95)\n"
+"      --seed        <N>     deterministic sampling seed     (default 3407)\n"
+"      --checkpoint-every N  full KV snapshot interval       (default 256)\n"
 "      --stop       <str>   stop generation when this substring appears\n"
 "      --kv-cache   <dir>   reuse / extend a KV prefix cache directory\n"
 "      --preflight  <file>  metadata-only residency/safety check; never reads payload\n"
@@ -684,6 +689,11 @@ int main(int argc, char** argv) {
     bool        single_step = false;
     uint32_t    single_step_token = 0;
     bool        continue_state = false;
+    bool        resume_turn = false;
+    float       temperature = 0.0f;
+    float       top_p = 0.95f;
+    uint64_t    seed = 3407;
+    uint32_t    checkpoint_every = 256;
     int  n_predict = 128;
     uint32_t context = 64;
     for (int i = 1; i < argc; ++i) {
@@ -716,6 +726,11 @@ int main(int argc, char** argv) {
             single_step_token = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
         }
         else if ( a == "--continue-state")                          continue_state = true;
+        else if ( a == "--resume-turn")                             resume_turn = true;
+        else if ( a == "--temperature" && i+1 < argc)               temperature = std::strtof(argv[++i], nullptr);
+        else if ( a == "--top-p" && i+1 < argc)                     top_p = std::strtof(argv[++i], nullptr);
+        else if ( a == "--seed" && i+1 < argc)                      seed = std::strtoull(argv[++i], nullptr, 10);
+        else if ( a == "--checkpoint-every" && i+1 < argc)          checkpoint_every = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
         else if ( a == "-h" || a == "--help")                      usage();
         else usage();
     }
@@ -739,6 +754,19 @@ int main(int argc, char** argv) {
     if (vgemv_path && vgemv_name)     return validate_gemv(vgemv_path, vgemv_name, force);
     if (!model_dir || !prompt) usage();
     if (n_predict <= 0) n_predict = 128;
+    if (continue_state && resume_turn) {
+        std::fprintf(stderr, "metalblok: choose one of --continue-state or --resume-turn\n");
+        return 2;
+    }
+    if (!std::isfinite(temperature) || temperature < 0.0f || temperature > 2.0f ||
+        !std::isfinite(top_p) || top_p <= 0.0f || top_p > 1.0f) {
+        std::fprintf(stderr, "metalblok: temperature must be [0,2] and top-p must be (0,1]\n");
+        return 2;
+    }
+    if (checkpoint_every == 0 || checkpoint_every > 4096) {
+        std::fprintf(stderr, "metalblok: checkpoint interval must be in [1,4096]\n");
+        return 2;
+    }
     if (context < 64 || context > 65536) {
         std::fprintf(stderr, "metalblok: --context must be in [64, 65536]\n");
         return 2;
@@ -783,7 +811,7 @@ int main(int argc, char** argv) {
             // DeepSeek-R1's BOS id is literally 0, so we must gate on the
             // add_bos flag, not on bos()!=0 (which would silently drop BOS and
             // prefill the model off-distribution from position 0).
-            if (tok.add_bos() && (ids.empty() || ids.front() != tok.bos()))
+            if (!resume_turn && tok.add_bos() && (ids.empty() || ids.front() != tok.bos()))
                 ids.insert(ids.begin(), tok.bos());
             if (tokenize_only) {
                 std::printf("formatted_prompt=%s\ntoken_ids=", formatted_prompt.c_str());
@@ -812,6 +840,7 @@ int main(int argc, char** argv) {
             Metal mtl; mtl.init(METALBLOK_KERNEL_PATH);
             GgufRuntime rt;
             rt.init(gmeta, gm, mtl);
+            rt.set_sampling(temperature, top_p, seed);
 
             if (single_step) {
                 if (!state_path) {
@@ -839,8 +868,8 @@ int main(int argc, char** argv) {
             prof::mark("gguf: PREFILL begin");
             long long tp0 = prof::now_us();
             uint32_t reused = 0;
-            if (continue_state && (!state_path || !file_exists(state_path))) {
-                std::fprintf(stderr, "metalblok: --continue-state requires an existing --state file\n");
+            if ((continue_state || resume_turn) && (!state_path || !file_exists(state_path))) {
+                std::fprintf(stderr, "metalblok: continuation requires an existing --state file\n");
                 return 5;
             }
             if (state_path && file_exists(state_path)) {
@@ -849,16 +878,46 @@ int main(int argc, char** argv) {
                     return 5;
                 }
                 reused = rt.pos();
-                if (!continue_state && reused > ids.size()) {
+                if (!continue_state && !resume_turn && reused > ids.size()) {
                     std::fprintf(stderr, "metalblok: state position exceeds prompt length\n");
                     return 5;
                 }
             }
             uint32_t next = rt.predicted_token();
+            const uint64_t generation_steps = n_predict > 0 ? uint64_t(n_predict - 1) : 0;
+            uint64_t required_pos = continue_state
+                ? uint64_t(rt.pos()) + generation_steps
+                : uint64_t(ids.size()) + generation_steps;
+            if (resume_turn) {
+                required_pos = uint64_t(rt.pos()) + 1 +
+                    (next == tok.eos() ? 0 : 1) + ids.size() + generation_steps;
+            }
+            if (required_pos > context) {
+                std::fprintf(stderr,
+                    "metalblok: context %u is too small; run needs %llu committed positions\n",
+                    context, static_cast<unsigned long long>(required_pos));
+                return 2;
+            }
+            if (resume_turn) {
+                const uint32_t pending = next;
+                next = rt.step(pending);
+                if (state_path && !rt.save_state(state_path)) {
+                    std::fprintf(stderr, "metalblok: failed to save resumed state: %s\n", state_path);
+                    return 5;
+                }
+                if (pending != tok.eos()) {
+                    next = rt.step(tok.eos());
+                    if (state_path && rt.pos() % checkpoint_every == 0 && !rt.save_state(state_path)) {
+                        std::fprintf(stderr, "metalblok: failed to save turn boundary: %s\n", state_path);
+                        return 5;
+                    }
+                }
+                reused = 0;
+            }
             if (!continue_state) {
                 for (uint32_t i = reused; i < ids.size(); ++i) {
                     next = rt.step(ids[i]);
-                    if (state_path && !rt.save_state(state_path)) {
+                    if (state_path && rt.pos() % checkpoint_every == 0 && !rt.save_state(state_path)) {
                         std::fprintf(stderr, "metalblok: failed to save state: %s\n", state_path);
                         return 5;
                     }
@@ -887,21 +946,27 @@ int main(int argc, char** argv) {
                 }
                 if (i + 1 < n_predict) {
                     next = rt.step(next);
-                    if (state_path && !rt.save_state(state_path)) {
+                    if (state_path && rt.pos() % checkpoint_every == 0 && !rt.save_state(state_path)) {
                         std::fprintf(stderr, "metalblok: failed to save state: %s\n", state_path);
                         return 5;
                     }
                 }
             }
+            if (state_path && !rt.save_state(state_path)) {
+                std::fprintf(stderr, "metalblok: failed to save final state: %s\n", state_path);
+                return 5;
+            }
             std::fputc('\n', stdout);
             long long td1 = prof::now_us();
             double dprefill_s = (tp1 - tp0) / 1e6;
             double ddecode_s  = (td1 - td0) / 1e6;
-            double dtps = produced > 0 && ddecode_s > 0 ? produced / ddecode_s : 0.0;
-            prof::log("gguf: SUMMARY prefill %zu tok in %.2fs (%.1f tok/s) | decode %d tok in %.2fs (%.1f tok/s) | %s",
+            const int decode_steps = std::max(0, produced - 1);
+            double dtps = decode_steps > 0 && ddecode_s > 0 ? decode_steps / ddecode_s : 0.0;
+            prof::log("gguf: SUMMARY prefill %zu tok in %.2fs (%.3f tok/s, includes TTFT) | "
+                      "decode %d steps/%d emitted in %.2fs (%.3f step/s) | %s",
                       ids.size(), dprefill_s,
                       ids.size() / (dprefill_s > 0 ? dprefill_s : 1.0),
-                      produced, ddecode_s, dtps,
+                      decode_steps, produced, ddecode_s, dtps,
                       hit_eos  ? "stopped: EOS"   :
                       hit_stop ? "stopped: --stop" : "stopped: max-tokens");
             return 0;

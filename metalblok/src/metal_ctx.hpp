@@ -6,7 +6,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
-#include <vector>
+#include <initializer_list>
 
 namespace blade {
 
@@ -27,6 +27,11 @@ public:
     // Allocate a private (managed) shared-storage buffer (CPU+GPU visible).
     MtlBuf alloc(size_t bytes);
 
+    // Reserve page-aligned virtual memory and wrap it without eager physical
+    // commitment. Used for multi-GB KV capacity: pages become resident only
+    // as tokens are written. The MTLBuffer owns and unmaps the reservation.
+    MtlBuf alloc_lazy(size_t bytes);
+
     // Wrap an existing host pointer as a GPU buffer (no copy). The pointer
     // must remain valid for the lifetime of the buffer (we use mmap regions).
     MtlBuf wrap(const void* ptr, size_t bytes);
@@ -41,8 +46,8 @@ public:
     // threadgroup_position_in_grid for the row index).
     struct ByteArg { const void* p; size_t n; };
     void dispatch(const char* name,
-                  const std::vector<MtlBuf>& bufs,
-                  const std::vector<ByteArg>& byte_args,
+                  std::initializer_list<MtlBuf> bufs,
+                  std::initializer_list<ByteArg> byte_args,
                   uint32_t grid_x, uint32_t tg_x,
                   bool one_tg_per_grid_x);
 
@@ -50,8 +55,8 @@ public:
     // Threadgroup id is read as uint2 [[threadgroup_position_in_grid]].
     // Used by tiled matmul kernels (output tile = 2D).
     void dispatch2d(const char* name,
-                    const std::vector<MtlBuf>& bufs,
-                    const std::vector<ByteArg>& byte_args,
+                    std::initializer_list<MtlBuf> bufs,
+                    std::initializer_list<ByteArg> byte_args,
                     uint32_t grid_x, uint32_t grid_y, uint32_t tg_x);
 
     // Begin/commit a single command buffer that batches many dispatches.

@@ -41,6 +41,7 @@ struct RuntimeIndex {
 
 struct Generation {
   std::vector<std::uint32_t> ids;
+  bool eos = false;
 };
 
 struct FileExtent {
@@ -889,7 +890,7 @@ Generation generate(Io &io, const RuntimeIndex &rt, const Args &a) {
     if (i + 1 < a.tokens) next = run(next, (int)(input.size() + i), true);
   }
   cudaFree(did); cudaFree(dex);
-  return {std::move(made)};
+  return {std::move(made), next == EOS_IM_END};
 }
 
 int main(int argc, char **argv) {
@@ -900,5 +901,5 @@ int main(int argc, char **argv) {
   auto gen = generate(io, rt, a);
   std::cout << "{\"status\":\"ok\",\"token_ids\":[";
   for (std::size_t i = 0; i < gen.ids.size(); ++i) std::cout << (i ? "," : "") << gen.ids[i];
-  std::cout << "]}\n";
+  std::cout << "],\"finish_reason\":\"" << (gen.eos ? "eos" : "length") << "\"}\n";
 }

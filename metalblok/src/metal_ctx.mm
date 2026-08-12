@@ -1,6 +1,7 @@
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #include "metal_ctx.hpp"
+#include <sys/mman.h>
 #include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
@@ -35,11 +36,11 @@ void Metal::init(const char* kernel_path) {
         die("read kernels.metal");
     }
     MTLCompileOptions* opts = [MTLCompileOptions new];
-    if (@available(macOS 15.0, *)) {
-        opts.mathMode = MTLMathModeSafe;
-    } else {
-        opts.fastMathEnabled = NO;
-    }
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+    opts.mathMode = MTLMathModeSafe;
+#else
+    opts.fastMathEnabled = NO;
+#endif
     library_ = (__bridge_retained void*)[DEV newLibraryWithSource:source
                                                           options:opts
                                                             error:&err];
@@ -63,6 +64,25 @@ MtlBuf Metal::alloc(size_t bytes) {
     id<MTLBuffer> b = [DEV newBufferWithLength:bytes options:MTLResourceStorageModeShared];
     if (!b) die("alloc");
     return { (__bridge_retained void*)b, bytes, b.contents, 0 };
+}
+
+MtlBuf Metal::alloc_lazy(size_t bytes) {
+    const size_t page = static_cast<size_t>(::getpagesize());
+    const size_t mapped = (bytes + page - 1) & ~(page - 1);
+    void* ptr = ::mmap(nullptr, mapped, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (ptr == MAP_FAILED) die("lazy mmap");
+    id<MTLBuffer> b = [DEV newBufferWithBytesNoCopy:ptr
+                                             length:mapped
+                                            options:MTLResourceStorageModeShared
+                                        deallocator:^(void* p, NSUInteger n) {
+                                            ::munmap(p, n);
+                                        }];
+    if (!b) {
+        ::munmap(ptr, mapped);
+        die("lazy buffer");
+    }
+    return {(__bridge_retained void*)b, bytes, ptr, 0};
 }
 
 MtlBuf Metal::wrap(const void* ptr, size_t bytes) {
@@ -146,8 +166,8 @@ void Metal::commit_and_wait() {
 void Metal::flush() { commit_and_wait(); begin(); }
 
 void Metal::dispatch(const char* name,
-                     const std::vector<MtlBuf>& bufs,
-                     const std::vector<ByteArg>& byte_args,
+                     std::initializer_list<MtlBuf> bufs,
+                     std::initializer_list<ByteArg> byte_args,
                      uint32_t grid_x, uint32_t tg_x,
                      bool one_tg_per_grid_x)
 {
@@ -171,8 +191,8 @@ void Metal::dispatch(const char* name,
 }
 
 void Metal::dispatch2d(const char* name,
-                       const std::vector<MtlBuf>& bufs,
-                       const std::vector<ByteArg>& byte_args,
+                       std::initializer_list<MtlBuf> bufs,
+                       std::initializer_list<ByteArg> byte_args,
                        uint32_t grid_x, uint32_t grid_y, uint32_t tg_x)
 {
     id<MTLComputePipelineState> pso = get_pso(DEV, LIB, PSOPTR, PSONAMED, name);

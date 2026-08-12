@@ -1,11 +1,20 @@
 import json
 import os
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 
 class BlokRuntimeError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class GenerationResult:
+    text: str
+    input_tokens: int
+    output_tokens: int
+    finish_reason: str
 
 
 KIMI_TEXT = {
@@ -46,9 +55,15 @@ KIMI_PATTERN = "|".join(
         r"\s+",
     ]
 )
+MAX_CONTEXT = 262144
+KV_BYTES_PER_TOKEN = 61 * (64 * 192 + 64 * 128) * 4
 
 
 def generate(*, model_dir: str | os.PathLike[str], prompt: str, max_tokens: int, max_time: float) -> str:
+    return generate_report(model_dir=model_dir, prompt=prompt, max_tokens=max_tokens, max_time=max_time).text
+
+
+def generate_report(*, model_dir: str | os.PathLike[str], prompt: str, max_tokens: int, max_time: float) -> GenerationResult:
     if not prompt or max_tokens <= 0 or max_time <= 0:
         raise BlokRuntimeError("prompt must be non-empty and limits must be positive")
     index = runtime_index(model_dir)
@@ -67,13 +82,20 @@ def generate(*, model_dir: str | os.PathLike[str], prompt: str, max_tokens: int,
             raise BlokRuntimeError(f"{key} must be a positive integer")
     try:
         encoding = tokenizer_encoding(tokenizer)
+        prompt_ids = encode_prompt(tokenizer, prompt, encoding)
+        if len(prompt_ids) + max_tokens > MAX_CONTEXT:
+            raise BlokRuntimeError(f"requested {len(prompt_ids) + max_tokens} tokens exceeds Kimi's {MAX_CONTEXT}-token context")
+        required = required_kv_bytes(len(prompt_ids), max_tokens)
+        capacity = int(os.environ["BLOK_KV_UGDS_BYTES"])
+        if capacity < required:
+            raise BlokRuntimeError(f"BLOK_KV_UGDS_BYTES={capacity} is smaller than the required {required} bytes")
         result = subprocess.run(
             [
                 str(executor),
                 "--index",
                 str(index),
                 "--prompt-tokens",
-                ",".join(map(str, encode_prompt(tokenizer, prompt, encoding))),
+                ",".join(map(str, prompt_ids)),
                 "--tokens",
                 str(max_tokens),
             ],
@@ -90,9 +112,17 @@ def generate(*, model_dir: str | os.PathLike[str], prompt: str, max_tokens: int,
     except json.JSONDecodeError as error:
         raise BlokRuntimeError(f"executor returned invalid JSON: {result.stdout!r}") from error
     ids = report.get("token_ids")
-    if report.get("status") != "ok" or not isinstance(ids, list) or not all(type(i) is int and 0 <= i < KIMI_TEXT["vocab_size"] for i in ids):
+    finish_reason = report.get("finish_reason")
+    if (report.get("status") != "ok" or finish_reason not in {"eos", "length"} or not isinstance(ids, list) or
+            not all(type(i) is int and 0 <= i < KIMI_TEXT["vocab_size"] for i in ids)):
         raise BlokRuntimeError(f"executor failed: {report}")
-    return encoding.decode(ids)
+    return GenerationResult(encoding.decode(ids), len(prompt_ids), len(ids), finish_reason)
+
+
+def required_kv_bytes(input_tokens: int, output_tokens: int) -> int:
+    if input_tokens <= 0 or output_tokens <= 0 or input_tokens + output_tokens > MAX_CONTEXT:
+        raise BlokRuntimeError("token counts must be positive and fit the Kimi context")
+    return (input_tokens + output_tokens) * KV_BYTES_PER_TOKEN
 
 
 def runtime_index(model: str | os.PathLike[str]) -> Path:

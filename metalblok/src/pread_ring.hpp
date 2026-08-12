@@ -52,6 +52,10 @@ public:
     // before re-using it for another submit().
     static void wait(const std::atomic<bool>* done);
 
+    struct Stats { uint64_t bytes, requests, elapsed_us; };
+    void reset_stats();
+    Stats stats() const;
+
     const std::string& last_error() const { return last_error_; }
     size_t             shard_count() const { return shards_.size(); }
 
@@ -69,6 +73,7 @@ private:
     };
 
     struct Shard {
+        PreadRing* owner = nullptr;
         int               fd = -1;
         std::string       path;
         Request           ring[kQueueCapacity];
@@ -85,6 +90,10 @@ private:
     std::vector<std::unique_ptr<Shard>> shards_;
     std::string                         last_error_;
     bool                                running_ = false;
+    std::atomic<uint64_t> stat_bytes_{0};
+    std::atomic<uint64_t> stat_requests_{0};
+    std::atomic<uint64_t> stat_first_ns_{0};
+    std::atomic<uint64_t> stat_last_ns_{0};
 };
 
 } // namespace blade

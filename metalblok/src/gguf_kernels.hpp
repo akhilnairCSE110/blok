@@ -28,12 +28,12 @@ namespace blade {
 // weight of the given ggml type, or nullptr if unsupported on the R1 path.
 inline const char* kernel_name_for(uint32_t ggml_type) {
     switch (ggml_type) {
-        case GGML_F32:     return "gemv_f32_f16";      // norms/bias/router
-        case GGML_Q4_K:    return "gemv_q4_K_f16";     // validated
-        case GGML_Q5_K:    return "gemv_q5_K_f16";     // placeholder, S3
-        case GGML_Q6_K:    return "gemv_q6_K_f16";     // validated
-        case GGML_IQ2_XXS: return "gemv_iq2_xxs_f16";  // placeholder, S4
-        case GGML_IQ1_S:   return "gemv_iq1_s_f16";    // validated
+        case GGML_F32:     return "gemv_f32_f32";
+        case GGML_Q4_K:    return "gemv_q4_K_f32";
+        case GGML_Q5_K:    return "gemv_q5_K_f32";
+        case GGML_Q6_K:    return "gemv_q6_K_f32";
+        case GGML_IQ2_XXS: return "gemv_iq2_xxs_f32";
+        case GGML_IQ1_S:   return "gemv_iq1_s_f32";
         default:           return nullptr;
     }
 }

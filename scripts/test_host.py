@@ -44,14 +44,15 @@ def main():
         for path in (executor, device, map_file): path.touch()
         encoding = Encoding()
         env = {"BLOK_KIMI_EXEC_BIN": str(executor), "BLOK_UGDS_DEVICE": str(device),
-               "BLOK_UGDS_MAP": str(map_file), "BLOK_KV_UGDS_BASE": "4096", "BLOK_KV_UGDS_BYTES": "8192"}
-        result = subprocess.CompletedProcess([], 0, '{"status":"ok","token_ids":[13]}', "")
+               "BLOK_UGDS_MAP": str(map_file), "BLOK_KV_UGDS_BASE": "4096", "BLOK_KV_UGDS_BYTES": "100000000"}
+        result = subprocess.CompletedProcess([], 0, '{"status":"ok","token_ids":[13],"finish_reason":"length"}', "")
         with mock.patch.dict(os.environ, env, clear=False), \
              mock.patch.object(runtime, "tokenizer_encoding", return_value=encoding), \
              mock.patch.object(runtime.subprocess, "run", return_value=result) as run:
             assert runtime.answer(runtime.generate(model_dir=meta, prompt="Paris?", max_tokens=1, max_time=2)) == "paris"
         assert encoding.encoded == "<|im_user|>user<|im_middle|>Paris?<|im_end|><|im_assistant|>assistant<|im_middle|><think></think>"
         assert run.call_args.args[0][-4:] == ["--prompt-tokens", "11,12", "--tokens", "1"]
+        assert runtime.required_kv_bytes(10_000, 10_000) == 99_942_400_000
     print("ok: host index, contract, layout, tokenizer, executor, and public API")
 
 

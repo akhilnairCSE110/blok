@@ -1,0 +1,1 @@
+<｜User｜>Answer this arithmetic question directly: 5+5=?<｜Assistant｜><think>

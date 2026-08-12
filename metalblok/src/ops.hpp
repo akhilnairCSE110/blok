@@ -46,4 +46,17 @@ inline void swiglu(Metal& g, const MtlBuf& gate, const MtlBuf& up, const MtlBuf&
     g.dispatch("swiglu_f16", {gate,up,y}, {{&N,4}}, N, TG_ELT, false);
 }
 
+inline void rmsnorm_f32(Metal& g, const MtlBuf& x, const MtlBuf& gain,
+                        const MtlBuf& y, uint32_t H, float eps) {
+    g.dispatch("rms_norm_f32", {x, gain, y}, {{&H,4},{&eps,4}}, 1, TG_RED, true);
+}
+inline void axpy_f32(Metal& g, const MtlBuf& y, const MtlBuf& x,
+                     float a, uint32_t N) {
+    g.dispatch("axpy_f32", {y,x}, {{&a,4},{&N,4}}, N, TG_ELT, false);
+}
+inline void swiglu_f32(Metal& g, const MtlBuf& gate, const MtlBuf& up,
+                       const MtlBuf& y, uint32_t N) {
+    g.dispatch("swiglu_f32", {gate,up,y}, {{&N,4}}, N, TG_ELT, false);
+}
+
 } // namespace blade

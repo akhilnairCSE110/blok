@@ -89,6 +89,7 @@
 #include "metal_ctx.hpp"
 
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -149,6 +150,11 @@ public:
     // Decode one token: feed `prev_id`, run all 61 layers, sample, return id.
     uint32_t step(uint32_t prev_id);
 
+    // DeepSeek-R1 recommends temperature 0.6. A zero temperature preserves
+    // the greedy parity mode. Sampling is position-derived, so a restored
+    // checkpoint produces the same continuation for the same seed.
+    void set_sampling(float temperature, float top_p, uint64_t seed);
+
     // Crash-safe diagnostic checkpoint for long correctness runs. Stores only
     // exact MLA KV state and position; weights remain in GGUF and are rebuilt.
     bool save_state(const std::string& path) const;
@@ -169,6 +175,8 @@ private:
     void alloc_activations_();
     void alloc_kv_cache_();
     void load_resident_norms_();
+    void load_fixed_projections_();
+    void alloc_expert_slots_();
     void build_grids_();
 
     // -----------------------------------------------------------------------
@@ -181,28 +189,26 @@ private:
     // attn_kv_b at ~9 MB/layer). Returns the number of fp16 elements written.
     uint64_t cpu_dequant_to_f16_(const GgufTensorEntry& e, uint16_t* dst);
 
-    // One streaming GEMV: pread the tensor identified by `name` into a
-    // freshly-allocated MtlBuf, dispatch the appropriate GGUF kernel, release.
-    // For 3D tensors (expert stacks) pass slice_idx (0 to n_experts-1) and
-    // the per-slice byte stride. For 2D pass slice_idx=0, stride=0.
-    //
-    // K is the innermost dim (cols), N the number of output rows. TG=128
-    // matches the validated path in validate_gemv (main.cpp:480-495).
-    void stream_gemv_(const std::string& name,
-                      const MtlBuf& bX, const MtlBuf& bY,
-                      uint32_t K, uint32_t N,
-                      uint32_t slice_idx = 0, uint64_t slice_stride = 0);
-
-    // f16 grouped GEMV against a resident weight buffer (e.g. absorbed
-    // W_uk / W_uv). Uses ops.hpp helpers via gemv_f16_f16.
-    void grouped_gemv_f16_(const MtlBuf& bW, const MtlBuf& bX, const MtlBuf& bY,
-                           uint32_t N, uint32_t K, uint32_t group);
-
-    // Build the absorbed per-head W_uk / W_uv for layer L from the GGUF
-    // attn_kv_b tensor (quantized, stacked [Lk, HE*(Dn+Dv)]). Done lazily on
-    // first use of the layer. The result lives in lw_[L].w_uk_b / w_uv_b
-    // for the lifetime of GgufRuntime.
-    void build_absorbed_kv_b_(uint32_t L);
+    struct LoadedWeight {
+        MtlBuf buffer{};
+        const GgufTensorEntry* entry = nullptr;
+        std::atomic<bool>* ready = nullptr;
+        uint32_t K = 0, N = 0;
+    };
+    struct Projection {
+        MtlBuf buffer{};
+        const GgufTensorEntry* entry = nullptr;
+        uint32_t K = 0, N = 0;
+    };
+    LoadedWeight load_weight_(const std::string& name, uint32_t K, uint32_t N,
+                              uint32_t slice_idx = 0, uint64_t slice_stride = 0);
+    void wait_weight_(const LoadedWeight& weight);
+    void dispatch_weight_(const LoadedWeight& weight,
+                          const MtlBuf& x, const MtlBuf& y);
+    void release_weight_(LoadedWeight& weight);
+    Projection load_projection_(const std::string& name, uint32_t K, uint32_t N);
+    void dispatch_projection_(const Projection& projection,
+                              const MtlBuf& x, const MtlBuf& y);
 
     // Resolve token_embd row for `tok` into x_b (f16 [hidden]). One row =
     // hidden / 256 IQ1_S blocks (28 blocks * 50 bytes = 1400 bytes for R1).
@@ -214,6 +220,10 @@ private:
     void mla_attn_(uint32_t L);
     void ffn_dense_(uint32_t L);
     void ffn_moe_(uint32_t L);
+    uint32_t sample_logits_();
+    void trace_hidden_(uint32_t layer) const;
+    void trace_buffer_(const char* name, uint32_t layer,
+                       const MtlBuf& buffer, uint32_t size) const;
 
     // -----------------------------------------------------------------------
     // State.
@@ -223,6 +233,10 @@ private:
     Metal*       mtl_ = nullptr;
     GgufConfig   cfg_{};
     uint32_t     pos_ = 0;       // KV-cache position counter
+    float        temperature_ = 0.0f;
+    float        top_p_ = 0.95f;
+    uint64_t     seed_ = 3407;
+    bool         trace_ = false;
 
     // Per-layer resident f16 buffers.
     struct LayerResident {
@@ -230,14 +244,17 @@ private:
         MtlBuf ffn_norm;    // [H]   f16
         MtlBuf q_a_norm;    // [Hi]  f16
         MtlBuf kv_a_norm;   // [Lk]  f16
-        // Absorbed MLA projections, built lazily by build_absorbed_kv_b_().
-        // w_uk_b: [HE, Lk, Dn] grouped GEMV input.  Rows = HE*Lk, group = Lk.
-        // w_uv_b: [HE, Dv, Lk] grouped GEMV input.  Rows = HE*Dv, group = Dv.
-        MtlBuf w_uk_b;
-        MtlBuf w_uv_b;
-        bool   absorbed_built = false;
+        MtlBuf router_bias; // [Ne]  f32; sparse layers only
+        Projection q_a, q_b, kv_a, kv_b, attn_output;
+        Projection ffn_gate, ffn_up, ffn_down;
+        Projection router;
     };
     std::vector<LayerResident> lw_;
+    Projection output_projection_;
+    static constexpr uint32_t kExpertSlots = 24;
+    std::array<MtlBuf, kExpertSlots> expert_slots_{};
+    std::array<std::atomic<bool>, kExpertSlots> expert_ready_{};
+    uint32_t expert_slot_cursor_ = 0;
 
     // Global resident: output norm (f16).
     MtlBuf output_norm_b_;
@@ -246,8 +263,8 @@ private:
     MtlBuf x_, x_norm_;
     MtlBuf q_a_, q_a_n_;
     MtlBuf q_full_, q_nope_, q_rope_;
-    MtlBuf kv_a_;
-    MtlBuf q_eff_, o_lat_, o_full_, attn_out_;
+    MtlBuf kv_a_, kv_lat_, kv_full_;
+    MtlBuf o_full_, attn_out_;
     MtlBuf ffn_gate_, ffn_up_, ffn_act_, ffn_out_, expert_tmp_;
     MtlBuf router_log_;     // [Ne]    f16
     MtlBuf router_idx_;     // [K]     u32
@@ -256,8 +273,11 @@ private:
     MtlBuf next_tok_;       // [1]     u32
 
     // KV cache + scores scratch.
-    MtlBuf c_kv_;           // [n_layers, max_seq, Lk]   f16
-    MtlBuf k_rope_;         // [n_layers, max_seq, Dr]   f16
+    // Separate resources prevent Metal from making a multi-GB monolithic
+    // cache resident whenever one layer binds it.
+    std::vector<MtlBuf> k_nope_;  // each [max_seq, HE, Dn] f16
+    std::vector<MtlBuf> v_cache_; // each [max_seq, HE, Dv] f16
+    std::vector<MtlBuf> k_rope_;  // each [max_seq, Dr]     f16
     MtlBuf scores_;         // [HE, max_seq]             f32
 
     // Zero-bias buffer for V3-style routing when exp_probs_b is absent.
@@ -272,6 +292,11 @@ private:
     // tensor we dequant on CPU = attn_kv_b at ~9.4 MB / layer).
     std::vector<uint8_t> dequant_scratch_bytes_;
     std::vector<float>   dequant_scratch_f32_;
+
+    uint64_t step_model_bytes_ = 0;
+    uint64_t step_reads_ = 0;
+    uint64_t step_allocations_ = 0;
+    long long step_io_wait_us_ = 0;
 };
 
 } // namespace blade

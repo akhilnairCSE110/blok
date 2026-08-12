@@ -13,8 +13,8 @@
 //   TG_GEMV = 1024 (used by gemv_f16_f16 path -- resident activations)
 //   TG_RED  = 256  (rms_norm, mla_kv_split_rope, mla_attn_decode_f16)
 //   TG_ELT  = 256  (axpy, swiglu, mla_q_split_rope)
-// For GGUF k-quant / i-quant gemv we use TG=128, matching validate_gemv in
-// main.cpp (already a validated path -- changing it would re-open numerics).
+// One 32-lane SIMD-group computes each quantized output row. This exact
+// checkpoint passed the real-tensor validators at the smaller group size.
 // ---------------------------------------------------------------------------
 #include "gguf_runtime.hpp"
 
@@ -35,6 +35,7 @@
 #include <string>
 #include <vector>
 #include <cerrno>
+#include <algorithm>
 
 namespace blade {
 
@@ -68,6 +69,36 @@ inline uint16_t f32_to_f16(float f) {
     uint32_t round_bit = (mant >> 12) & 1;
     uint32_t out_mant  = (mant + (round_bit ? 0x1000 : 0)) >> 13;
     return uint16_t(sign | ((uint32_t)exp << 10) | (out_mant & 0x3ff));
+}
+
+inline float f16_to_f32(uint16_t h) {
+    const uint32_t sign = uint32_t(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1fu;
+    uint32_t mant = h & 0x3ffu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) bits = sign;
+        else {
+            int shift = 0;
+            while ((mant & 0x400u) == 0) { mant <<= 1; ++shift; }
+            mant &= 0x3ffu;
+            bits = sign | uint32_t(127 - 14 - shift) << 23 | mant << 13;
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7f800000u | mant << 13;
+    } else {
+        bits = sign | (exp + 112u) << 23 | mant << 13;
+    }
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+inline uint64_t splitmix64(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
 }
 
 // Round n_elems up to a whole number of 256-element super-blocks. Most
@@ -121,6 +152,7 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
     gm_  = &gm;
     mtl_ = &mtl;
     pos_ = 0;
+    trace_ = std::getenv("METALBLOK_TRACE") != nullptr;
     parse_config_(g);
     verify_tensor_table_(gm);
 
@@ -132,25 +164,53 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
     if (cfg_.max_seq > cfg_.context_length && cfg_.context_length > 0)
         cfg_.max_seq = cfg_.context_length;
 
-    // Full pre-allocation ledger. Absorbed MLA is retained lazily but reaches
-    // this exact total after all layers. The largest transient is the untied
-    // output head. Keep 3 GiB reclaimable host headroom on this 24 GB target.
+    // Full pre-allocation ledger. This legacy GGUF contains the combined
+    // attn_kv_b tensor, so exact parity requires expanded per-head K/V state.
+    // The largest transient is the untied output head.
     const uint64_t Dn = cfg_.key_length - cfg_.rope_dim;
-    const uint64_t absorbed = uint64_t(cfg_.n_layers) * cfg_.n_heads *
-        cfg_.kv_lora_rank * (Dn + cfg_.value_length) * 2ULL;
     const uint64_t kv = uint64_t(cfg_.n_layers) * cfg_.max_seq *
-        (cfg_.kv_lora_rank + cfg_.rope_dim) * 2ULL;
+        (cfg_.n_heads * (Dn + cfg_.value_length) + cfg_.rope_dim) * 2ULL;
     const uint64_t scores = uint64_t(cfg_.n_heads) * cfg_.max_seq * 4ULL;
-    const auto* output = gm.find("output.weight");
-    const uint64_t largest_transient = output ? output->nbytes : 0;
+    uint64_t fixed = gm.find("output.weight")->nbytes;
+    uint64_t largest_transient = 0;
+    char fixed_name[96];
+    for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
+        for (const char* suffix : {"attn_q_a.weight", "attn_q_b.weight",
+                                   "attn_kv_a_mqa.weight", "attn_kv_b.weight",
+                                   "attn_output.weight"}) {
+            std::snprintf(fixed_name, sizeof(fixed_name), "blk.%u.%s", L, suffix);
+            fixed += gm.find(fixed_name)->nbytes;
+        }
+        const char* ffn_suffixes[3] = {
+            L < cfg_.n_dense_layers ? "ffn_gate.weight" : "ffn_gate_shexp.weight",
+            L < cfg_.n_dense_layers ? "ffn_up.weight" : "ffn_up_shexp.weight",
+            L < cfg_.n_dense_layers ? "ffn_down.weight" : "ffn_down_shexp.weight",
+        };
+        for (const char* suffix : ffn_suffixes) {
+            std::snprintf(fixed_name, sizeof(fixed_name), "blk.%u.%s", L, suffix);
+            fixed += gm.find(fixed_name)->nbytes;
+        }
+        if (L >= cfg_.n_dense_layers) {
+            std::snprintf(fixed_name, sizeof(fixed_name), "blk.%u.ffn_gate_inp.weight", L);
+            fixed += gm.find(fixed_name)->nbytes;
+            for (const char* suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight",
+                                       "ffn_down_exps.weight"}) {
+                std::snprintf(fixed_name, sizeof(fixed_name), "blk.%u.%s", L, suffix);
+                const auto* entry = gm.find(fixed_name);
+                largest_transient = std::max(largest_transient,
+                                             entry->nbytes / cfg_.n_experts);
+            }
+        }
+    }
     const uint64_t runtime_margin = 256ULL << 20;
-    const uint64_t estimated = absorbed + kv + scores + largest_transient +
+    const uint64_t expert_batch = largest_transient * cfg_.n_experts_active * 3;
+    const uint64_t estimated = fixed + kv + scores + expert_batch +
                                runtime_margin;
-    const uint64_t host_reserve = 3ULL << 30;
+    const uint64_t host_reserve = cfg_.max_seq <= 2048 ? 1ULL << 30 : 3ULL << 30;
     const auto memory = mem::snapshot();
-    prof::log("memory-ledger: absorbed=%.2fGB kv=%.2fMB transient=%.2fMB "
+    prof::log("memory-ledger: fixed=%.2fGB kv=%.2fGB expert_batch=%.2fMB "
               "margin=%.2fMB estimated=%.2fGB available=%.2fGB reserve=%.2fGB",
-              absorbed / 1e9, kv / 1e6, largest_transient / 1e6,
+              fixed / 1e9, kv / 1e9, expert_batch / 1e6,
               runtime_margin / 1e6, estimated / 1e9,
               memory.available / 1e9, host_reserve / 1e9);
     if (memory.available < estimated + host_reserve) {
@@ -164,6 +224,8 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
     alloc_activations_();
     alloc_kv_cache_();
     load_resident_norms_();
+    load_fixed_projections_();
+    alloc_expert_slots_();
     build_grids_();
 
     prof::log("gguf_runtime: init n_layers=%u hidden=%u vocab=%u "
@@ -171,6 +233,16 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
               cfg_.n_layers, cfg_.hidden, cfg_.vocab,
               cfg_.n_experts, cfg_.n_experts_active,
               cfg_.kv_lora_rank, cfg_.rope_dim, cfg_.max_seq, prof::rss_mb());
+}
+
+void GgufRuntime::set_sampling(float temperature, float top_p, uint64_t seed) {
+    if (!std::isfinite(temperature) || temperature < 0.0f || temperature > 2.0f)
+        die("temperature must be in [0, 2]");
+    if (!std::isfinite(top_p) || top_p <= 0.0f || top_p > 1.0f)
+        die("top-p must be in (0, 1]");
+    temperature_ = temperature;
+    top_p_ = top_p;
+    seed_ = seed;
 }
 
 void GgufRuntime::parse_config_(const Gguf& g) {
@@ -191,28 +263,23 @@ void GgufRuntime::parse_config_(const Gguf& g) {
     cfg_.context_length   = g.get_u32_or("deepseek2.context_length", 4096);
     cfg_.vocab            = g.get_u32("deepseek2.vocab_size");
     cfg_.rms_eps          = g.get_f32_or("deepseek2.attention.layer_norm_rms_epsilon", 1e-6f);
-    // YaRN attention scale. DeepSeek V2/V3/R1 softmax_scale =
-    //   (1/sqrt(Dn+Dr)) * yarn_mscale
-    // with    yarn_mscale = (1 + log_mult * ln(factor))^2
-    // (matches model.cpp:307-324 derivation from HF rope_scaling). The GGUF
-    // stores `yarn_log_multiplier` = 0.1 * mscale_all_dim and
-    // `scaling.factor` directly. If either is absent, mscale stays at 1.0
-    // (correct for prompts inside the trained window). $BLADE_YARN_MSCALE
-    // overrides for explicit experimentation.
+    // DeepSeek applies mscale^2 to QK and YaRN interpolation to rotary
+    // frequencies. The latter is implemented in the pinned Metal NEOX
+    // kernels; this value is only the former softmax multiplier.
     cfg_.yarn_mscale = 1.0f;
     {
         float factor   = g.get_f32_or("deepseek2.rope.scaling.factor", 0.0f);
         float log_mult = g.get_f32_or("deepseek2.rope.scaling.yarn_log_multiplier", 0.0f);
+        const uint32_t original =
+            g.get_u32_or("deepseek2.rope.scaling.original_context_length", 0);
+        if (std::fabs(factor - 40.0f) > 1e-6f ||
+            std::fabs(log_mult - 0.1f) > 1e-6f || original != 4096)
+            die("config: checkpoint YaRN contract differs from pinned R1");
         if (factor > 1.0f && log_mult > 0.0f) {
             double m = 1.0 + (double)log_mult * std::log((double)factor);
             cfg_.yarn_mscale = (float)(m * m);
         }
     }
-    if (const char* s = std::getenv("BLADE_YARN_MSCALE")) {
-        float v = std::strtof(s, nullptr);
-        if (v > 0.0f && v < 8.0f) cfg_.yarn_mscale = v;
-    }
-
     // MoE routing parameters. R1 declares sigmoid gating (==2), a routed
     // scaling factor of 2.5, and weight normalization. Defaults keep the
     // legacy softmax path for models that omit these keys.
@@ -231,6 +298,15 @@ void GgufRuntime::parse_config_(const Gguf& g) {
         die("config: key_length <= rope_dim (no nope split)");
     if (cfg_.n_experts != 256 || cfg_.n_experts_active != 8)
         die("config: this correctness target requires DeepSeek-R1 256/top-8 routing");
+    if (cfg_.n_layers != 61 || cfg_.hidden != 7168 || cfg_.n_heads != 128 ||
+        cfg_.q_lora_rank != 1536 || cfg_.kv_lora_rank != 512 ||
+        cfg_.key_length != 192 || cfg_.value_length != 128 || cfg_.rope_dim != 64 ||
+        cfg_.n_dense_layers != 3 || cfg_.expert_ffn != 2048 || cfg_.n_shared != 1 ||
+        cfg_.vocab != 129280 || cfg_.context_length != 163840)
+        die("config: checkpoint dimensions differ from pinned DeepSeek-R1-671B");
+    if (cfg_.expert_gating_func != 2 || cfg_.expert_weights_norm != 1 ||
+        std::fabs(cfg_.expert_weights_scale - 2.5f) > 1e-6f)
+        die("config: checkpoint router differs from pinned noaux_tc contract");
     if (cfg_.n_experts % cfg_.n_expert_groups != 0)
         die("config: expert groups do not divide expert count");
 }
@@ -324,7 +400,7 @@ void GgufRuntime::verify_tensor_table_(const GgufModel& gm) const {
 // ---------------------------------------------------------------------------
 
 void GgufRuntime::alloc_activations_() {
-    auto fp16 = [&](size_t n){ return mtl_->alloc(n * 2); };
+    auto fp32 = [&](size_t n){ return mtl_->alloc(n * 4); };
     const uint32_t H  = cfg_.hidden;
     const uint32_t Dn = cfg_.key_length - cfg_.rope_dim;
     const uint32_t Dr = cfg_.rope_dim;
@@ -343,27 +419,27 @@ void GgufRuntime::alloc_activations_() {
     }
     const uint32_t F_max = std::max(F_dense, Fs);
 
-    x_         = fp16(H);
-    x_norm_    = fp16(H);
-    q_a_       = fp16(Hi);
-    q_a_n_     = fp16(Hi);
-    q_full_    = fp16((size_t)HE * (Dn + Dr));
-    q_nope_    = fp16((size_t)HE * Dn);
-    q_rope_    = fp16((size_t)HE * Dr);
-    kv_a_      = fp16((size_t)Lk + Dr);
-    q_eff_     = fp16((size_t)HE * Lk);
-    o_lat_     = fp16((size_t)HE * Lk);
-    o_full_    = fp16((size_t)HE * Dv);
-    attn_out_  = fp16(H);
-    ffn_gate_  = fp16(F_max);
-    ffn_up_    = fp16(F_max);
-    ffn_act_   = fp16(F_max);
-    ffn_out_   = fp16(H);
-    expert_tmp_= fp16(H);
-    router_log_= fp16(cfg_.n_experts);
+    x_         = fp32(H);
+    x_norm_    = fp32(H);
+    q_a_       = fp32(Hi);
+    q_a_n_     = fp32(Hi);
+    q_full_    = fp32((size_t)HE * (Dn + Dr));
+    q_nope_    = fp32((size_t)HE * Dn);
+    q_rope_    = fp32((size_t)HE * Dr);
+    kv_a_      = fp32((size_t)Lk + Dr);
+    kv_lat_    = fp32(Lk);
+    kv_full_   = fp32((size_t)HE * (Dn + Dv));
+    o_full_    = fp32((size_t)HE * Dv);
+    attn_out_  = fp32(H);
+    ffn_gate_  = fp32(F_max);
+    ffn_up_    = fp32(F_max);
+    ffn_act_   = fp32(F_max);
+    ffn_out_   = fp32(H);
+    expert_tmp_= fp32(H);
+    router_log_= fp32(cfg_.n_experts);
     router_idx_= mtl_->alloc((size_t)cfg_.n_experts_active * 4);
     router_wts_= mtl_->alloc((size_t)cfg_.n_experts_active * 4);
-    logits_    = fp16(cfg_.vocab);
+    logits_    = fp32(cfg_.vocab);
     next_tok_  = mtl_->alloc(4);
 
     // Zero bias for V3-style router fallback.
@@ -372,13 +448,25 @@ void GgufRuntime::alloc_activations_() {
 }
 
 void GgufRuntime::alloc_kv_cache_() {
-    const uint32_t HE = cfg_.n_heads, Lk = cfg_.kv_lora_rank, Dr = cfg_.rope_dim;
-    auto fp16 = [&](size_t n){ return mtl_->alloc(n * 2); };
-    c_kv_   = fp16((size_t)cfg_.n_layers * cfg_.max_seq * Lk);
-    k_rope_ = fp16((size_t)cfg_.n_layers * cfg_.max_seq * Dr);
+    const uint32_t HE = cfg_.n_heads;
+    const uint32_t Dn = cfg_.key_length - cfg_.rope_dim;
+    const uint32_t Dv = cfg_.value_length, Dr = cfg_.rope_dim;
+    k_nope_.resize(cfg_.n_layers);
+    v_cache_.resize(cfg_.n_layers);
+    k_rope_.resize(cfg_.n_layers);
+    const size_t key_bytes = (size_t)cfg_.max_seq * HE * Dn * 2;
+    const size_t val_bytes = (size_t)cfg_.max_seq * HE * Dv * 2;
+    const size_t rope_bytes = (size_t)cfg_.max_seq * Dr * 2;
+    for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
+        k_nope_[L] = mtl_->alloc_lazy(key_bytes);
+        v_cache_[L] = mtl_->alloc_lazy(val_bytes);
+        k_rope_[L] = mtl_->alloc_lazy(rope_bytes);
+    }
     scores_ = mtl_->alloc((size_t)HE * cfg_.max_seq * 4);
-    prof::log("gguf_runtime: KV cache c_kv=%.2fMB k_rope=%.2fMB scores=%.2fMB",
-              c_kv_.length / 1e6, k_rope_.length / 1e6, scores_.length / 1e6);
+    prof::log("gguf_runtime: exact KV cache k=%.3fGB v=%.3fGB rope=%.2fMB scores=%.2fMB",
+              key_bytes * cfg_.n_layers / 1e9,
+              val_bytes * cfg_.n_layers / 1e9,
+              rope_bytes * cfg_.n_layers / 1e6, scores_.length / 1e6);
 }
 
 uint64_t GgufRuntime::cpu_dequant_to_f16_(const GgufTensorEntry& e, uint16_t* dst) {
@@ -428,8 +516,12 @@ void GgufRuntime::load_resident_norms_() {
     auto load_into = [&](const std::string& name, MtlBuf& dst, uint64_t n) {
         const GgufTensorEntry* e = gm_->find(name);
         if (!e) { std::fprintf(stderr, "norm missing: %s\n", name.c_str()); std::abort(); }
-        dst = mtl_->alloc(n * 2);
-        cpu_dequant_to_f16_(*e, (uint16_t*)dst.contents);
+        if (e->type != GGML_F32 || e->nbytes != n * sizeof(float))
+            die("exact R1 contract requires f32 norm weights");
+        dst = mtl_->alloc(e->nbytes);
+        std::atomic<bool> done{false};
+        gm_->ring().submit(e->shard, e->abs_offset, e->nbytes, dst.contents, &done);
+        PreadRing::wait(&done);
     };
 
     char buf[128];
@@ -442,6 +534,18 @@ void GgufRuntime::load_resident_norms_() {
         load_into(buf, lw_[L].q_a_norm,  cfg_.q_lora_rank);
         std::snprintf(buf, sizeof(buf), "blk.%u.attn_kv_a_norm.weight", L);
         load_into(buf, lw_[L].kv_a_norm, cfg_.kv_lora_rank);
+        if (L >= cfg_.n_dense_layers) {
+            std::snprintf(buf, sizeof(buf), "blk.%u.exp_probs_b.bias", L);
+            if (const auto* e = gm_->find(buf)) {
+                if (e->type != GGML_F32 || e->nbytes != uint64_t(cfg_.n_experts) * 4)
+                    die("router bias must be f32[n_experts]");
+                lw_[L].router_bias = mtl_->alloc(e->nbytes);
+                std::atomic<bool> done{false};
+                gm_->ring().submit(e->shard, e->abs_offset, e->nbytes,
+                                   lw_[L].router_bias.contents, &done);
+                PreadRing::wait(&done);
+            }
+        }
     }
     load_into("output_norm.weight", output_norm_b_, cfg_.hidden);
     prof::log("gguf_runtime: resident norms loaded (%u layers, %zu MB)",
@@ -465,175 +569,146 @@ void GgufRuntime::build_grids_() {
 }
 
 // ---------------------------------------------------------------------------
-// Absorbed MLA: build per-head W_uk / W_uv from attn_kv_b, lazily per layer.
-//
-// attn_kv_b in R1 is q4_K with shape [Lk=512, HE*(nope+Dv)=128*(128+128)=32768].
-// llama.cpp's deepseek2 convention packs per head as [nope || v_dim] along
-// the N axis, contiguous across heads.
-//
-// Absorbed form:
-//   W_uk[h, k, dn]  -- for each head h, the nope-half projection from latent k
-//                      to nope-dim dn. Shape [HE, Lk, Dn]. Sourced from rows
-//                      [0..nope) of head h's slice of attn_kv_b (transposed:
-//                      attn_kv_b[k, h*(nope+dv) + dn]).
-//   W_uv[h, dv, k]  -- per-head value-up projection. Shape [HE, Dv, Lk].
-//                      Sourced from rows [nope..nope+Dv) of head h's slice,
-//                      transposed so K is innermost (matches gemv layout
-//                      "row reads K contiguous elements").
-//
-// Layout for gemv_f16_f16:
-//   W_uk: stored row-major [HE*Lk rows, Dn cols]. Row r=(h*Lk + k) holds
-//         entries for head h, latent k, varying over nope dim.
-//         Grouped: group_size = Lk so all rows of one head share the same
-//         q_nope[h*Dn..(h+1)*Dn) input slice.
-//   W_uv: stored row-major [HE*Dv rows, Lk cols]. Row r=(h*Dv + dv) holds
-//         entries for head h, value dim dv, varying over latent k.
-//         Grouped: group_size = Dv so all rows of one head share the same
-//         o_lat[h*Lk..(h+1)*Lk) input slice.
-//
-// Build: CPU-dequant attn_kv_b into a [Lk * HE * (nope+Dv)] f32 buffer
-// (innermost = Lk by ggml convention, then we read it as src[k, n] where
-// n = h*(nope+Dv) + (offset in head)). Transpose into the row-major shapes
-// described above.
-// ---------------------------------------------------------------------------
-void GgufRuntime::build_absorbed_kv_b_(uint32_t L) {
-    if (lw_[L].absorbed_built) return;
-
-    const uint32_t HE   = cfg_.n_heads;
-    const uint32_t Lk   = cfg_.kv_lora_rank;
-    const uint32_t Dn   = cfg_.key_length - cfg_.rope_dim;
-    const uint32_t Dv   = cfg_.value_length;
-    const uint32_t Nper = Dn + Dv;
-    const uint32_t Ntot = HE * Nper;
-
-    char nbuf[64];
-    std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_kv_b.weight", L);
-    const GgufTensorEntry* e = gm_->find(nbuf);
-    if (!e) { std::fprintf(stderr, "missing %s\n", nbuf); std::abort(); }
-
-    // 1. CPU-dequant the whole tensor into an f32 scratch.
-    // GGUF convention: ne[0] is innermost.  attn_kv_b has shape [Lk, Ntot]
-    // meaning the WEIGHT is [N rows, K cols] with K=Lk (rows dotted against
-    // the Lk-length latent input).  Flat layout therefore is
-    //   src_flat[n * Lk + k]
-    // for output row n (n = h*Nper + d) and latent column k.
-    std::vector<float> src_f32((size_t)Lk * Ntot);
-    {
-        // Reuse cpu_dequant_to_f16_ shape but materialize as f32.
-        if (dequant_scratch_bytes_.size() < e->nbytes)
-            dequant_scratch_bytes_.resize(e->nbytes);
-        std::atomic<bool> done{false};
-        gm_->ring().submit(e->shard, e->abs_offset, e->nbytes,
-                           dequant_scratch_bytes_.data(), &done);
-        PreadRing::wait(&done);
-
-        const CpuDqInfo info = cpu_dq_info(e->type);
-        if (info.fn == nullptr) {
-            std::fprintf(stderr, "attn_kv_b unexpected type %u\n", e->type);
-            std::abort();
-        }
-        const uint64_t total = (uint64_t)Lk * Ntot;
-        if ((total & 255ull) != 0) die("attn_kv_b: not block-aligned");
-        const uint64_t n_blocks = total / 256ull;
-        std::vector<float> tmp(256);
-        const uint8_t* sb = dequant_scratch_bytes_.data();
-        for (uint64_t b = 0; b < n_blocks; ++b) {
-            info.fn(sb + b * info.bpb, tmp.data());
-            std::memcpy(src_f32.data() + b * 256, tmp.data(), 256 * sizeof(float));
-        }
-    }
-
-    // 2. Allocate the two device buffers and fill via transpose.
-    lw_[L].w_uk_b = mtl_->alloc((size_t)HE * Lk * Dn * 2);
-    lw_[L].w_uv_b = mtl_->alloc((size_t)HE * Dv * Lk * 2);
-    uint16_t* w_uk = (uint16_t*)lw_[L].w_uk_b.contents;
-    uint16_t* w_uv = (uint16_t*)lw_[L].w_uv_b.contents;
-
-    // Source: W_kv_b[h*(Dn+Dv)+d, k] = src_f32[(h*Nper + d) * Lk + k]
-    //
-    // Standard MLA absorption (no transpose; what we want is the row that
-    // pairs each (h, k) with its nope-d coefficient, since q_eff[h,k] dots
-    // q_nope[h, :Dn] with W_kv_b[h, dn=0..Dn, k]):
-    //   W_uk[h, k, dn] = W_kv_b[h, dn, k] = src_f32[(h*Nper + dn) * Lk + k]
-    //   W_uv[h, dv, k] = W_kv_b[h, Dn+dv, k] = src_f32[(h*Nper + Dn+dv) * Lk + k]
-    //
-    // Output layouts (row-major for gemv_f16_f16):
-    //   w_uk_b[ (h*Lk + k) * Dn + dn ]
-    //   w_uv_b[ (h*Dv + dv) * Lk + k ]
-    for (uint32_t h = 0; h < HE; ++h) {
-        const uint32_t base = h * Nper;
-        for (uint32_t k = 0; k < Lk; ++k) {
-            uint16_t* dst_uk = w_uk + ((size_t)h * Lk + k) * Dn;
-            for (uint32_t dn = 0; dn < Dn; ++dn) {
-                dst_uk[dn] = f32_to_f16(
-                    src_f32[(size_t)(base + dn) * Lk + k]);
-            }
-        }
-        for (uint32_t dv = 0; dv < Dv; ++dv) {
-            uint16_t* dst_uv = w_uv + ((size_t)h * Dv + dv) * Lk;
-            for (uint32_t k = 0; k < Lk; ++k) {
-                dst_uv[k] = f32_to_f16(
-                    src_f32[(size_t)(base + Dn + dv) * Lk + k]);
-            }
-        }
-    }
-
-    lw_[L].absorbed_built = true;
-    prof::log("gguf_runtime: layer %u absorbed w_uk/w_uv built (%.2f MB)",
-              L, (lw_[L].w_uk_b.length + lw_[L].w_uv_b.length) / 1e6);
-}
-
-// ---------------------------------------------------------------------------
 // Streaming primitives (hot path)
 // ---------------------------------------------------------------------------
 
-void GgufRuntime::stream_gemv_(const std::string& name,
-                               const MtlBuf& bX, const MtlBuf& bY,
-                               uint32_t K, uint32_t N,
-                               uint32_t slice_idx, uint64_t slice_stride)
-{
-    const GgufTensorEntry* e = gm_->find(name);
-    if (!e) { std::fprintf(stderr, "stream_gemv: missing %s\n", name.c_str()); std::abort(); }
-
-    const char* kn = kernel_name_for(e->type);
-    if (!kn) { std::fprintf(stderr, "stream_gemv: type %u unsupported\n", e->type); std::abort(); }
-
-    // Determine the slice byte count + offset.
-    uint64_t off = e->abs_offset;
-    uint64_t nbytes_slice = e->nbytes;
-    if (slice_stride > 0) {
-        off          += (uint64_t)slice_idx * slice_stride;
-        nbytes_slice  = slice_stride;
+GgufRuntime::LoadedWeight GgufRuntime::load_weight_(
+    const std::string& name, uint32_t K, uint32_t N,
+    uint32_t slice_idx, uint64_t slice_stride) {
+    const auto* entry = gm_->find(name);
+    if (!entry || !kernel_name_for(entry->type)) {
+        std::fprintf(stderr, "load_weight: missing or unsupported %s\n", name.c_str());
+        std::abort();
     }
-
-    // Allocate transient device buffer + pread directly into it.
-    MtlBuf bW = mtl_->alloc(nbytes_slice);
-    std::atomic<bool> done{false};
-    gm_->ring().submit(e->shard, off, nbytes_slice, bW.contents, &done);
-    PreadRing::wait(&done);
-
-    std::vector<MtlBuf> bufs{ bW, bX, bY };
-    if (e->type == GGML_IQ1_S)   bufs.push_back(iq1s_grid_b_);
-    if (e->type == GGML_IQ2_XXS) bufs.push_back(iq2xxs_grid_b_);
-
-    const uint32_t Ku = K;
-    const uint32_t TG = 128;
-    mtl_->begin();
-    mtl_->dispatch(kn, bufs, { { &Ku, sizeof(Ku) } }, N, TG, true);
-    mtl_->commit_and_wait();
-    mtl_->release(bW);
+    uint64_t offset = entry->abs_offset;
+    uint64_t bytes = entry->nbytes;
+    if (slice_stride) {
+        offset += uint64_t(slice_idx) * slice_stride;
+        bytes = slice_stride;
+    }
+    LoadedWeight weight;
+    if (expert_slot_cursor_ >= kExpertSlots ||
+        bytes > expert_slots_[expert_slot_cursor_].length)
+        die("expert staging arena exhausted");
+    weight.buffer = expert_slots_[expert_slot_cursor_];
+    weight.entry = entry;
+    weight.ready = &expert_ready_[expert_slot_cursor_++];
+    weight.ready->store(false, std::memory_order_relaxed);
+    weight.K = K;
+    weight.N = N;
+    gm_->ring().submit(entry->shard, offset, bytes, weight.buffer.contents,
+                       weight.ready);
+    step_model_bytes_ += bytes;
+    ++step_reads_;
+    return weight;
 }
 
-void GgufRuntime::grouped_gemv_f16_(const MtlBuf& bW, const MtlBuf& bX, const MtlBuf& bY,
-                                    uint32_t N, uint32_t K, uint32_t group)
-{
-    // Dispatch in its own cmdbuf -- the streaming gemv's also commit, so
-    // we keep one-dispatch-per-commit ordering consistent.
-    mtl_->begin();
-    mtl_->dispatch("gemv_f16_f16", { bW, bX, bY },
-                   { { &K, 4 }, { &group, 4 } },
-                   N, TG_GEMV, true);
-    mtl_->commit_and_wait();
+void GgufRuntime::wait_weight_(const LoadedWeight& weight) {
+    const long long start = prof::now_us();
+    PreadRing::wait(weight.ready);
+    step_io_wait_us_ += prof::now_us() - start;
+}
+
+void GgufRuntime::dispatch_weight_(const LoadedWeight& weight,
+                                   const MtlBuf& x, const MtlBuf& y) {
+    const char* kernel = kernel_name_for(weight.entry->type);
+    if (weight.entry->type == GGML_IQ1_S)
+        mtl_->dispatch(kernel, {weight.buffer, x, y, iq1s_grid_b_},
+                       {{&weight.K, sizeof(weight.K)}}, weight.N, 32, true);
+    else if (weight.entry->type == GGML_IQ2_XXS)
+        mtl_->dispatch(kernel, {weight.buffer, x, y, iq2xxs_grid_b_},
+                       {{&weight.K, sizeof(weight.K)}}, weight.N, 32, true);
+    else
+        mtl_->dispatch(kernel, {weight.buffer, x, y},
+                       {{&weight.K, sizeof(weight.K)}}, weight.N, 32, true);
+}
+
+void GgufRuntime::release_weight_(LoadedWeight& weight) {
+    weight.ready = nullptr;
+}
+
+GgufRuntime::Projection GgufRuntime::load_projection_(
+    const std::string& name, uint32_t K, uint32_t N) {
+    const auto* entry = gm_->find(name);
+    if (!entry || !kernel_name_for(entry->type)) {
+        std::fprintf(stderr, "load_projection: missing or unsupported %s\n", name.c_str());
+        std::abort();
+    }
+    Projection projection{mtl_->alloc(entry->nbytes), entry, K, N};
+    std::atomic<bool> done{false};
+    gm_->ring().submit(entry->shard, entry->abs_offset, entry->nbytes,
+                       projection.buffer.contents, &done);
+    PreadRing::wait(&done);
+    return projection;
+}
+
+void GgufRuntime::dispatch_projection_(const Projection& projection,
+                                       const MtlBuf& x, const MtlBuf& y) {
+    const char* kernel = kernel_name_for(projection.entry->type);
+    if (projection.entry->type == GGML_IQ1_S)
+        mtl_->dispatch(kernel, {projection.buffer, x, y, iq1s_grid_b_},
+                       {{&projection.K, sizeof(projection.K)}}, projection.N, 32, true);
+    else if (projection.entry->type == GGML_IQ2_XXS)
+        mtl_->dispatch(kernel, {projection.buffer, x, y, iq2xxs_grid_b_},
+                       {{&projection.K, sizeof(projection.K)}}, projection.N, 32, true);
+    else
+        mtl_->dispatch(kernel, {projection.buffer, x, y},
+                       {{&projection.K, sizeof(projection.K)}}, projection.N, 32, true);
+}
+
+void GgufRuntime::load_fixed_projections_() {
+    const uint32_t H = cfg_.hidden;
+    const uint32_t Dn = cfg_.key_length - cfg_.rope_dim;
+    const uint32_t Dr = cfg_.rope_dim;
+    const uint32_t Dv = cfg_.value_length;
+    const uint32_t HE = cfg_.n_heads;
+    const uint32_t Hi = cfg_.q_lora_rank;
+    const uint32_t Lk = cfg_.kv_lora_rank;
+    uint64_t bytes = 0;
+    char name[96];
+    for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
+        auto load = [&](Projection& dst, const char* suffix, uint32_t K, uint32_t N) {
+            std::snprintf(name, sizeof(name), "blk.%u.%s", L, suffix);
+            dst = load_projection_(name, K, N);
+            bytes += dst.buffer.length;
+        };
+        load(lw_[L].q_a, "attn_q_a.weight", H, Hi);
+        load(lw_[L].q_b, "attn_q_b.weight", Hi, HE * (Dn + Dr));
+        load(lw_[L].kv_a, "attn_kv_a_mqa.weight", H, Lk + Dr);
+        load(lw_[L].kv_b, "attn_kv_b.weight", Lk, HE * (Dn + Dv));
+        load(lw_[L].attn_output, "attn_output.weight", HE * Dv, H);
+        if (L < cfg_.n_dense_layers) {
+            std::snprintf(name, sizeof(name), "blk.%u.ffn_gate.weight", L);
+            const uint32_t F = static_cast<uint32_t>(gm_->find(name)->shape[1]);
+            load(lw_[L].ffn_gate, "ffn_gate.weight", H, F);
+            load(lw_[L].ffn_up, "ffn_up.weight", H, F);
+            load(lw_[L].ffn_down, "ffn_down.weight", F, H);
+        } else {
+            const uint32_t F = cfg_.expert_ffn * cfg_.n_shared;
+            load(lw_[L].ffn_gate, "ffn_gate_shexp.weight", H, F);
+            load(lw_[L].ffn_up, "ffn_up_shexp.weight", H, F);
+            load(lw_[L].ffn_down, "ffn_down_shexp.weight", F, H);
+            load(lw_[L].router, "ffn_gate_inp.weight", H, cfg_.n_experts);
+        }
+    }
+    output_projection_ = load_projection_("output.weight", H, cfg_.vocab);
+    bytes += output_projection_.buffer.length;
+    prof::log("gguf_runtime: fixed compressed projections resident %.3f GB", bytes / 1e9);
+}
+
+void GgufRuntime::alloc_expert_slots_() {
+    uint64_t largest = 0;
+    char name[96];
+    for (uint32_t L = cfg_.n_dense_layers; L < cfg_.n_layers; ++L) {
+        for (const char* suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight",
+                                   "ffn_down_exps.weight"}) {
+            std::snprintf(name, sizeof(name), "blk.%u.%s", L, suffix);
+            largest = std::max(largest, gm_->find(name)->nbytes / cfg_.n_experts);
+        }
+    }
+    for (auto& slot : expert_slots_) slot = mtl_->alloc(largest);
+    prof::log("gguf_runtime: expert arena %u x %.3f MB = %.3f MB",
+              kExpertSlots, largest / 1e6, kExpertSlots * largest / 1e6);
 }
 
 // ---------------------------------------------------------------------------
@@ -651,15 +726,21 @@ void GgufRuntime::embed_lookup_(uint32_t tok) {
     if (dequant_scratch_bytes_.size() < per_row) dequant_scratch_bytes_.resize(per_row);
     std::atomic<bool> done{false};
     gm_->ring().submit(e->shard, off, per_row, dequant_scratch_bytes_.data(), &done);
+    const long long io_start = prof::now_us();
     PreadRing::wait(&done);
+    step_io_wait_us_ += prof::now_us() - io_start;
+    step_model_bytes_ += per_row;
+    ++step_reads_;
 
-    uint16_t* dst = (uint16_t*)x_.contents;
+    float* dst = static_cast<float*>(x_.contents);
     const CpuDqInfo info = cpu_dq_info(e->type);
     if (info.is_f16) {
-        std::memcpy(dst, dequant_scratch_bytes_.data(), (size_t)H * 2);
+        const uint16_t* src = static_cast<const uint16_t*>(
+            static_cast<const void*>(dequant_scratch_bytes_.data()));
+        for (uint32_t i = 0; i < H; ++i) dst[i] = f16_to_f32(src[i]);
     } else if (info.is_f32) {
         const float* src = (const float*)dequant_scratch_bytes_.data();
-        for (uint32_t i = 0; i < H; ++i) dst[i] = f32_to_f16(src[i]);
+        std::memcpy(dst, src, (size_t)H * sizeof(float));
     } else if (info.fn) {
         require_block_aligned(H, "token_embd");
         const uint32_t n_blocks = H / 256;
@@ -668,7 +749,7 @@ void GgufRuntime::embed_lookup_(uint32_t tok) {
         const uint8_t* src = dequant_scratch_bytes_.data();
         for (uint32_t b = 0; b < n_blocks; ++b) {
             info.fn(src + b * info.bpb, tmp);
-            for (uint32_t i = 0; i < 256; ++i) dst[b * 256 + i] = f32_to_f16(tmp[i]);
+            std::memcpy(dst + b * 256, tmp, 256 * sizeof(float));
         }
     } else {
         die("token_embd: unsupported type");
@@ -676,80 +757,51 @@ void GgufRuntime::embed_lookup_(uint32_t tok) {
 }
 
 // ---------------------------------------------------------------------------
-// MLA decode attention for ONE token at the GGUF path. Mirrors mla.cpp
-// Runtime::mla_attn (mla.cpp:225-256) but every weight gemv streams the
-// quantized weight from disk on demand; the absorbed per-head W_uk/W_uv
-// are taken from the resident f16 cache built by build_absorbed_kv_b_().
+// Exact legacy DeepSeek attention. This checkpoint has a combined wkv_b
+// tensor, so it is expanded before fp16 K/V caching exactly like llama.cpp's
+// non-MLA compatibility graph. Algebraic absorption is not interchangeable
+// after the cache's fp16 rounding and fails token parity on this GGUF.
 // ---------------------------------------------------------------------------
 void GgufRuntime::mla_attn_(uint32_t L) {
-    build_absorbed_kv_b_(L);
     const auto& w  = lw_[L];
     const uint32_t H  = cfg_.hidden;
     const uint32_t Dn = cfg_.key_length - cfg_.rope_dim;
     const uint32_t Dr = cfg_.rope_dim;
     const uint32_t Dv = cfg_.value_length;
     const uint32_t HE = cfg_.n_heads, Lk = cfg_.kv_lora_rank, Hi = cfg_.q_lora_rank;
-    uint32_t pos_u = pos_, L_u = L, ms = cfg_.max_seq, T = pos_ + 1;
+    uint32_t pos_u = pos_, cache_layer = 0, ms = cfg_.max_seq, T = pos_ + 1;
     float th  = cfg_.rope_freq_base;
     float eps = cfg_.rms_eps;
     float scale = (1.0f / std::sqrt((float)(Dn + Dr))) * cfg_.yarn_mscale;
 
-    char nbuf[64];
-
-    // attn_norm * x -> x_norm   (resident gain)
+    // All weights are immutable and resident. Metal preserves dispatch order
+    // inside this command buffer, including current-position cache writes.
     mtl_->begin();
-    rmsnorm(*mtl_, x_, w.attn_norm, x_norm_, H, eps);
-    mtl_->commit_and_wait();
-
-    // Q LoRA: q_a = W_q_a @ x_norm; q_a_n = rmsnorm(q_a, q_a_norm);
-    // q_full = W_q_b @ q_a_n
-    std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_q_a.weight", L);
-    stream_gemv_(nbuf, x_norm_, q_a_, H, Hi);
-
-    mtl_->begin();
-    rmsnorm(*mtl_, q_a_, w.q_a_norm, q_a_n_, Hi, eps);
-    mtl_->commit_and_wait();
-
-    std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_q_b.weight", L);
-    stream_gemv_(nbuf, q_a_n_, q_full_, Hi, HE * (Dn + Dr));
-
-    // Split Q into nope / rope halves; rope half rotates by `pos`.
-    // GGUF (llama.cpp/Unsloth) stores rope dims in NEOX split-half layout,
-    // so use the _neox variant (NOT the interleaved .blade kernel).
-    mtl_->begin();
-    mtl_->dispatch("mla_q_split_rope_neox", { q_full_, q_nope_, q_rope_ },
+    rmsnorm_f32(*mtl_, x_, w.attn_norm, x_norm_, H, eps);
+    dispatch_projection_(w.q_a, x_norm_, q_a_);
+    rmsnorm_f32(*mtl_, q_a_, w.q_a_norm, q_a_n_, Hi, eps);
+    dispatch_projection_(w.q_b, q_a_n_, q_full_);
+    mtl_->dispatch("mla_q_split_rope_r1", { q_full_, q_nope_, q_rope_ },
                    { {&Dn,4},{&Dr,4},{&pos_u,4},{&th,4} },
                    HE, TG_ELT, true);
-    mtl_->commit_and_wait();
-
-    // Absorbed Q->latent: q_eff = W_uk @ q_nope  (per-head grouped GEMV).
-    grouped_gemv_f16_(w.w_uk_b, q_nope_, q_eff_, HE * Lk, Dn, Lk);
-
-    // KV-A MQA: kv_a = W_kv_a @ x_norm  -> split + norm + rope into KV cache.
-    std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_kv_a_mqa.weight", L);
-    stream_gemv_(nbuf, x_norm_, kv_a_, H, Lk + Dr);
-
-    mtl_->begin();
-    mtl_->dispatch("mla_kv_split_rope_neox",
-                   { kv_a_, w.kv_a_norm, c_kv_, k_rope_ },
-                   { {&Lk,4},{&Dr,4},{&L_u,4},{&pos_u,4},{&ms,4},{&eps,4},{&th,4} },
+    dispatch_projection_(w.kv_a, x_norm_, kv_a_);
+    mtl_->dispatch("mha_kv_norm_rope_r1",
+                   { kv_a_, w.kv_a_norm, kv_lat_, k_rope_[L] },
+                   { {&Lk,4},{&Dr,4},{&cache_layer,4},{&pos_u,4},{&ms,4},{&eps,4},{&th,4} },
                    1, TG_RED, true);
-    mtl_->commit_and_wait();
-
-    // Score + softmax + value: o_lat[h, :Lk] = attn(q_eff, q_rope, c_kv, k_rope).
-    mtl_->begin();
-    mtl_->dispatch("mla_attn_decode_f16",
-                   { q_eff_, q_rope_, c_kv_, k_rope_, o_lat_, scores_ },
-                   { {&HE,4},{&Lk,4},{&Dr,4},{&L_u,4},{&T,4},{&ms,4},{&scale,4} },
+    dispatch_projection_(w.kv_b, kv_lat_, kv_full_);
+    mtl_->dispatch("mha_kv_store_f16",
+                   { kv_full_, k_nope_[L], v_cache_[L] },
+                   { {&HE,4},{&Dn,4},{&Dv,4},{&cache_layer,4},{&pos_u,4},{&ms,4} },
+                   HE, TG_ELT, true);
+    mtl_->dispatch("mha_attn_decode_f32",
+                   { q_nope_, q_rope_, k_nope_[L], k_rope_[L], v_cache_[L], o_full_, scores_ },
+                   { {&HE,4},{&Dn,4},{&Dr,4},{&Dv,4},{&cache_layer,4},{&T,4},{&ms,4},{&scale,4} },
                    HE, TG_RED, true);
-    mtl_->commit_and_wait();
-
-    // Absorbed latent->value: o_full = W_uv @ o_lat (per-head grouped GEMV).
-    grouped_gemv_f16_(w.w_uv_b, o_lat_, o_full_, HE * Dv, Lk, Dv);
-
-    // attn_out = W_o @ o_full
-    std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_output.weight", L);
-    stream_gemv_(nbuf, o_full_, attn_out_, HE * Dv, H);
+    dispatch_projection_(w.attn_output, o_full_, attn_out_);
+    axpy_f32(*mtl_, x_, attn_out_, 1.0f, H);
+    // The following FFN is on the same dependency chain and closes this
+    // command buffer, avoiding a host round-trip at every layer boundary.
 }
 
 // ---------------------------------------------------------------------------
@@ -759,28 +811,15 @@ void GgufRuntime::ffn_dense_(uint32_t L) {
     const auto& w = lw_[L];
     const uint32_t H = cfg_.hidden;
 
-    // Probe F from blk.L.ffn_gate.weight.shape[1].
-    char nbuf[64];
-    std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_gate.weight", L);
-    const GgufTensorEntry* eg = gm_->find(nbuf);
-    if (!eg || eg->n_dims < 2) die("ffn_gate shape");
-    const uint32_t F = (uint32_t)eg->shape[1];
+    const uint32_t F = w.ffn_gate.N;
 
-    mtl_->begin();
-    rmsnorm(*mtl_, x_, w.ffn_norm, x_norm_, H, cfg_.rms_eps);
+    rmsnorm_f32(*mtl_, x_, w.ffn_norm, x_norm_, H, cfg_.rms_eps);
+    dispatch_projection_(w.ffn_gate, x_norm_, ffn_gate_);
+    dispatch_projection_(w.ffn_up, x_norm_, ffn_up_);
+    swiglu_f32(*mtl_, ffn_gate_, ffn_up_, ffn_act_, F);
+    dispatch_projection_(w.ffn_down, ffn_act_, ffn_out_);
+    axpy_f32(*mtl_, x_, ffn_out_, 1.0f, H);
     mtl_->commit_and_wait();
-
-    std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_gate.weight", L);
-    stream_gemv_(nbuf, x_norm_, ffn_gate_, H, F);
-    std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_up.weight", L);
-    stream_gemv_(nbuf, x_norm_, ffn_up_,   H, F);
-
-    mtl_->begin();
-    swiglu(*mtl_, ffn_gate_, ffn_up_, ffn_act_, F);
-    mtl_->commit_and_wait();
-
-    std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_down.weight", L);
-    stream_gemv_(nbuf, ffn_act_, ffn_out_, F, H);
 }
 
 // ---------------------------------------------------------------------------
@@ -794,89 +833,49 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
     const auto& w = lw_[L];
     const uint32_t H  = cfg_.hidden;
     const uint32_t Fe = cfg_.expert_ffn;
-    const uint32_t Fs = Fe * cfg_.n_shared;
+    const uint32_t Fs = w.ffn_gate.N;
     const uint32_t K  = cfg_.n_experts_active;
     const uint32_t Ne = cfg_.n_experts;
+    const MtlBuf& bias = w.router_bias.obj ? w.router_bias : zero_bias_;
 
-    char nbuf[64];
-
-    mtl_->begin();
-    rmsnorm(*mtl_, x_, w.ffn_norm, x_norm_, H, cfg_.rms_eps);
-    mtl_->commit_and_wait();
-
-    // Defensive zero: routed experts accumulate into ffn_out_ via axpy. If
-    // n_shared > 0 the shared-expert down-projection overwrites this, but we
-    // zero unconditionally so the path is correct for any future n_shared=0
-    // config or partial shared-expert failure.
-    std::memset(ffn_out_.contents, 0, (size_t)H * 2);
-
-    if (cfg_.n_shared > 0) {
-        // Shared expert: gate, up, swiglu, down. Result lands in ffn_out_.
-        std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_gate_shexp.weight", L);
-        stream_gemv_(nbuf, x_norm_, ffn_gate_, H, Fs);
-        std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_up_shexp.weight", L);
-        stream_gemv_(nbuf, x_norm_, ffn_up_,   H, Fs);
-        mtl_->begin();
-        swiglu(*mtl_, ffn_gate_, ffn_up_, ffn_act_, Fs);
-        mtl_->commit_and_wait();
-        std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_down_shexp.weight", L);
-        stream_gemv_(nbuf, ffn_act_, ffn_out_, Fs, H);
-    }
-
-    // Router: logits = router_inp @ x_norm.
-    std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_gate_inp.weight", L);
-    stream_gemv_(nbuf, x_norm_, router_log_, H, Ne);
-
-    // Bias buffer for the router.
-    MtlBuf bias_buf = zero_bias_;
-    std::snprintf(nbuf, sizeof(nbuf), "blk.%u.exp_probs_b.bias", L);
-    const GgufTensorEntry* be = gm_->find(nbuf);
-    MtlBuf bias_owned{};
-    bool bias_is_owned = false;
-    if (be) {
-        // Bias is f32 [Ne]; CPU-load once per dispatch (one-time per layer).
-        if (be->type != GGML_F32) {
-            std::fprintf(stderr, "exp_probs_b.bias not f32 (%u)\n", be->type);
-            std::abort();
-        }
-        if (be->nbytes != (uint64_t)Ne * 4) die("exp_probs_b.bias size");
-        bias_owned = mtl_->alloc(be->nbytes);
-        std::atomic<bool> done{false};
-        gm_->ring().submit(be->shard, be->abs_offset, be->nbytes,
-                           bias_owned.contents, &done);
-        PreadRing::wait(&done);
-        bias_buf = bias_owned;
-        bias_is_owned = true;
-    }
-
-    uint32_t mode = 0u;   // R1: V3 norm_topk_prob path
-    mtl_->begin();
+    // Router is the only serial discovery point. Keep its matrix and bias
+    // resident and publish top-8 before any routed expert read is issued.
+    rmsnorm_f32(*mtl_, x_, w.ffn_norm, x_norm_, H, cfg_.rms_eps);
+    dispatch_projection_(w.router, x_norm_, router_log_);
     if (cfg_.expert_gating_func == 2) {
-        // R1 sigmoid gating: prob=sigmoid(logit), select by prob+bias,
-        // weights = normalized sigmoid probs * routed_scaling_factor.
         float scale = cfg_.expert_weights_scale;
         uint32_t norm = cfg_.expert_weights_norm;
         const uint32_t groups = cfg_.n_expert_groups;
         const uint32_t top_groups = cfg_.n_limited_groups;
-        mtl_->dispatch("router_topk_grouped_sigmoid_f16",
-                       { router_log_, bias_buf, router_idx_, router_wts_ },
+        mtl_->dispatch("router_topk_grouped_sigmoid_f32",
+                       { router_log_, bias, router_idx_, router_wts_ },
                        { {&Ne,4},{&K,4},{&groups,4},{&top_groups,4},
                          {&scale,4},{&norm,4} },
                        1, 1, true);
     } else {
+        uint32_t mode = 0u;
         mtl_->dispatch("router_topk_f16",
-                       { router_log_, bias_buf, router_idx_, router_wts_ },
+                       { router_log_, bias, router_idx_, router_wts_ },
                        { {&Ne,4},{&K,4},{&mode,4} },
                        1, 1, true);
     }
-    mtl_->commit_and_wait();   // make router_idx_/router_wts_ host-visible
-    if (bias_is_owned) mtl_->release(bias_owned);
+    mtl_->commit_and_wait();
+
+    if (trace_ && L == 3) {
+        trace_buffer_("ffn_inp", L, x_, H);
+        trace_buffer_("ffn_norm", L, x_norm_, H);
+        trace_buffer_("router_logits", L, router_log_, Ne);
+    }
 
     const uint32_t* idxs = (const uint32_t*)router_idx_.contents;
     const float*    wts  = (const float*)   router_wts_.contents;
+    if (trace_) {
+        for (uint32_t k = 0; k < K; ++k)
+            prof::log("trace router pos=%u layer=%u rank=%u expert=%u weight=%.8g",
+                      pos_, L, k, idxs[k], wts[k]);
+    }
 
-    // Per-expert stride for the stacked exps tensors. shape[0]=K (=H or Fe),
-    // shape[1]=N (=Fe or H), shape[2]=Ne. nbytes/Ne = one expert slice.
+    char nbuf[64];
     auto per_expert_stride = [&](const std::string& name) -> uint64_t {
         const GgufTensorEntry* e = gm_->find(name);
         if (!e) { std::fprintf(stderr, "missing %s\n", name.c_str()); std::abort(); }
@@ -897,23 +896,54 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
     const uint64_t st_down = per_expert_stride(nbuf);
     std::string n_down(nbuf);
 
+    // Queue all 24 exact expert slices. The shard worker reads while the GPU
+    // evaluates the always-active shared expert.
+    expert_slot_cursor_ = 0;
+    std::vector<LoadedWeight> experts;
+    experts.reserve(K * 3);
     for (uint32_t k = 0; k < K; ++k) {
-        uint32_t e = idxs[k];
-        float    a = wts[k];
-
-        stream_gemv_(n_gate, x_norm_, ffn_gate_, H,  Fe, e, st_gate);
-        stream_gemv_(n_up,   x_norm_, ffn_up_,   H,  Fe, e, st_up);
-
-        mtl_->begin();
-        swiglu(*mtl_, ffn_gate_, ffn_up_, ffn_act_, Fe);
-        mtl_->commit_and_wait();
-
-        stream_gemv_(n_down, ffn_act_, expert_tmp_, Fe, H, e, st_down);
-
-        mtl_->begin();
-        axpy(*mtl_, ffn_out_, expert_tmp_, a, H);
-        mtl_->commit_and_wait();
+        experts.push_back(load_weight_(n_gate, H, Fe, idxs[k], st_gate));
+        experts.push_back(load_weight_(n_up, H, Fe, idxs[k], st_up));
+        experts.push_back(load_weight_(n_down, Fe, H, idxs[k], st_down));
     }
+
+    mtl_->begin();
+    dispatch_projection_(w.ffn_gate, x_norm_, ffn_gate_);
+    dispatch_projection_(w.ffn_up, x_norm_, ffn_up_);
+    swiglu_f32(*mtl_, ffn_gate_, ffn_up_, ffn_act_, Fs);
+    dispatch_projection_(w.ffn_down, ffn_act_, ffn_out_);
+    mtl_->commit_and_wait();
+    if (trace_ && L == 3) trace_buffer_("ffn_shared", L, ffn_out_, H);
+
+    for (const auto& expert : experts) wait_weight_(expert);
+    mtl_->begin();
+    for (uint32_t k = 0; k < K; ++k) {
+        const auto& gate = experts[k * 3];
+        const auto& up = experts[k * 3 + 1];
+        const auto& down = experts[k * 3 + 2];
+        if (gate.entry->type == GGML_IQ1_S &&
+            up.entry->type == GGML_IQ1_S) {
+            mtl_->dispatch("expert_gate_up_swiglu_iq1_s",
+                           {gate.buffer, up.buffer, x_norm_, ffn_act_, iq1s_grid_b_},
+                           {{&H,4}}, Fe, 32, true);
+        } else {
+            dispatch_weight_(gate, x_norm_, ffn_gate_);
+            dispatch_weight_(up, x_norm_, ffn_up_);
+            swiglu_f32(*mtl_, ffn_gate_, ffn_up_, ffn_act_, Fe);
+        }
+        if (down.entry->type == GGML_IQ1_S) {
+            mtl_->dispatch("expert_down_accum_iq1_s",
+                           {down.buffer, ffn_act_, ffn_out_, iq1s_grid_b_},
+                           {{&Fe,4},{&wts[k],4}}, H, 32, true);
+        } else {
+            dispatch_weight_(down, ffn_act_, expert_tmp_);
+            axpy_f32(*mtl_, ffn_out_, expert_tmp_, wts[k], H);
+        }
+    }
+    axpy_f32(*mtl_, x_, ffn_out_, 1.0f, H);
+    mtl_->commit_and_wait();
+    if (trace_ && L == 3) trace_buffer_("ffn_total", L, ffn_out_, H);
+    for (auto& expert : experts) release_weight_(expert);
 }
 
 // ---------------------------------------------------------------------------
@@ -923,6 +953,15 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
 // argmax sample at pos_-1.
 // ---------------------------------------------------------------------------
 void GgufRuntime::forward_one_(uint32_t tok) {
+    const long long started = prof::now_us();
+    const uint64_t available_before = mem::snapshot().available;
+    mtl_->reset_step_stats();
+    gm_->ring().reset_stats();
+    step_model_bytes_ = 0;
+    step_reads_ = 0;
+    step_allocations_ = 0;
+    step_io_wait_us_ = 0;
+
     // 1. Embedding.
     embed_lookup_(tok);
 
@@ -931,34 +970,136 @@ void GgufRuntime::forward_one_(uint32_t tok) {
     //      ffn_out  = FFN(x);  x += ffn_out
     for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
         mla_attn_(L);
-        mtl_->begin();
-        axpy(*mtl_, x_, attn_out_, 1.0f, cfg_.hidden);
-        mtl_->commit_and_wait();
         if (L < cfg_.n_dense_layers) ffn_dense_(L); else ffn_moe_(L);
-        mtl_->begin();
-        axpy(*mtl_, x_, ffn_out_, 1.0f, cfg_.hidden);
-        mtl_->commit_and_wait();
+        if (trace_) trace_hidden_(L);
     }
 
-    // 3. Final norm + lm_head (tied to token_embd) + greedy argmax.
+    // Final norm and the always-resident dedicated output projection.
     mtl_->begin();
-    rmsnorm(*mtl_, x_, output_norm_b_, x_norm_, cfg_.hidden, cfg_.rms_eps);
+    rmsnorm_f32(*mtl_, x_, output_norm_b_, x_norm_, cfg_.hidden, cfg_.rms_eps);
+    dispatch_projection_(output_projection_, x_norm_, logits_);
     mtl_->commit_and_wait();
 
-    // lm_head: R1 ships a dedicated `output.weight` (NOT tied to token_embd).
-    // Using token_embd here projects through the IQ1_S embedding instead of
-    // the trained output head -> wrong logits -> incoherent tokens. Fall back
-    // to token_embd only if output.weight is genuinely absent (tied models).
-    stream_gemv_("output.weight", x_norm_, logits_, cfg_.hidden, cfg_.vocab);
-
-    uint32_t V = cfg_.vocab;
-    mtl_->begin();
-    mtl_->dispatch("argmax_f16", { logits_, next_tok_ },
-                   { { &V, sizeof(uint32_t) } },
-                   1, 1024, true);
-    mtl_->commit_and_wait();
+    *static_cast<uint32_t*>(next_tok_.contents) = sample_logits_();
 
     pos_++;
+    const long long elapsed = prof::now_us() - started;
+    const uint64_t available_after = mem::snapshot().available;
+    const auto io = gm_->ring().stats();
+    const double io_gbps = io.elapsed_us > 0
+        ? double(io.bytes) / (io.elapsed_us * 1e3) : 0.0;
+    const int64_t memory_delta = int64_t(available_before) - int64_t(available_after);
+    const uint64_t kv_bytes = uint64_t(cfg_.n_layers) *
+        (uint64_t(cfg_.n_heads) *
+         ((cfg_.key_length - cfg_.rope_dim) + cfg_.value_length) +
+         cfg_.rope_dim) * sizeof(uint16_t);
+    prof::log(
+        "metrics pos=%u wall_us=%lld gpu_us=%lld io_wait_us=%lld model_bytes=%llu "
+        "nvme_bytes=%llu nvme_span_us=%llu nvme_gbps=%.3f useful_reads=%llu nvme_reads=%llu "
+        "cmdbufs=%d allocations=%llu kv_bytes=%llu "
+        "available_delta=%lld",
+        pos_, elapsed, mtl_->step_gpu_us, step_io_wait_us_,
+        static_cast<unsigned long long>(step_model_bytes_),
+        static_cast<unsigned long long>(io.bytes),
+        static_cast<unsigned long long>(io.elapsed_us), io_gbps,
+        static_cast<unsigned long long>(step_reads_),
+        static_cast<unsigned long long>(io.requests), mtl_->step_cmdbufs,
+        static_cast<unsigned long long>(step_allocations_),
+        static_cast<unsigned long long>(kv_bytes),
+        static_cast<long long>(memory_delta));
+}
+
+uint32_t GgufRuntime::sample_logits_() {
+    const auto* raw = static_cast<const float*>(logits_.contents);
+    if (temperature_ == 0.0f) {
+        uint32_t best = 0;
+        float best_value = -INFINITY;
+        for (uint32_t i = 0; i < cfg_.vocab; ++i) {
+            const float value = raw[i];
+            if (value > best_value) { best = i; best_value = value; }
+        }
+        prof::log("sample pos=%u mode=greedy token=%u logit=%.6g",
+                  pos_, best, best_value);
+        if (trace_) {
+            std::array<std::pair<float, uint32_t>, 8> top{};
+            for (auto& item : top) item = {-INFINITY, 0};
+            for (uint32_t token = 0; token < cfg_.vocab; ++token) {
+                const float value = raw[token];
+                size_t rank = top.size();
+                while (rank && value > top[rank - 1].first) --rank;
+                if (rank == top.size()) continue;
+                for (size_t j = top.size() - 1; j > rank; --j) top[j] = top[j - 1];
+                top[rank] = {value, token};
+            }
+            for (size_t rank = 0; rank < top.size(); ++rank)
+                prof::log("trace logit pos=%u rank=%zu token=%u value=%.7g",
+                          pos_, rank, top[rank].second, top[rank].first);
+        }
+        return best;
+    }
+
+    struct Candidate { float probability; uint32_t token; };
+    std::vector<Candidate> candidates;
+    candidates.reserve(cfg_.vocab);
+    float max_logit = -INFINITY;
+    for (uint32_t i = 0; i < cfg_.vocab; ++i)
+        max_logit = std::max(max_logit, raw[i]);
+    double sum = 0.0;
+    for (uint32_t i = 0; i < cfg_.vocab; ++i) {
+        const float p = std::exp((raw[i] - max_logit) / temperature_);
+        candidates.push_back({p, i});
+        sum += p;
+    }
+    for (auto& candidate : candidates) candidate.probability /= float(sum);
+    std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+        return a.probability > b.probability;
+    });
+    double nucleus = 0.0;
+    size_t count = 0;
+    do { nucleus += candidates[count++].probability; }
+    while (count < candidates.size() && nucleus < top_p_);
+    const uint64_t random = splitmix64(seed_ ^ uint64_t(pos_));
+    const double unit = double(random >> 11) * 0x1.0p-53;
+    const double target = unit * nucleus;
+    double cumulative = 0.0;
+    uint32_t chosen = candidates[count - 1].token;
+    for (size_t i = 0; i < count; ++i) {
+        cumulative += candidates[i].probability;
+        if (target <= cumulative) { chosen = candidates[i].token; break; }
+    }
+    prof::log("sample pos=%u temp=%.3f top_p=%.3f nucleus=%zu token=%u",
+              pos_, temperature_, top_p_, count, chosen);
+    if (trace_) {
+        const size_t show = std::min<size_t>(8, candidates.size());
+        for (size_t i = 0; i < show; ++i)
+            prof::log("trace logit rank=%zu token=%u p=%.7f", i,
+                      candidates[i].token, candidates[i].probability);
+    }
+    return chosen;
+}
+
+void GgufRuntime::trace_buffer_(const char* name, uint32_t layer,
+                                const MtlBuf& buffer, uint32_t size) const {
+    const auto* raw = static_cast<const float*>(buffer.contents);
+    double sum2 = 0.0;
+    float lo = INFINITY, hi = -INFINITY;
+    uint64_t hash = 1469598103934665603ULL;
+    uint32_t nonfinite = 0;
+    for (uint32_t i = 0; i < size; ++i) {
+        const float value = raw[i];
+        if (!std::isfinite(value)) ++nonfinite;
+        else { sum2 += double(value) * value; lo = std::min(lo, value); hi = std::max(hi, value); }
+        uint32_t bits;
+        std::memcpy(&bits, raw + i, sizeof(bits));
+        hash = (hash ^ bits) * 1099511628211ULL;
+    }
+    prof::log("trace %s pos=%u layer=%u rms=%.7g min=%.7g max=%.7g nonfinite=%u hash=%016llx",
+              name, pos_, layer, std::sqrt(sum2 / size), lo, hi, nonfinite,
+              static_cast<unsigned long long>(hash));
+}
+
+void GgufRuntime::trace_hidden_(uint32_t layer) const {
+    trace_buffer_("hidden", layer, x_, cfg_.hidden);
 }
 
 uint32_t GgufRuntime::prefill(const uint32_t* ids, uint32_t n) {
@@ -1011,19 +1152,24 @@ bool GgufRuntime::save_state(const std::string& path) const {
     const std::string partial = path + ".partial";
     FILE* f = std::fopen(partial.c_str(), "wb");
     if (!f) return false;
-    StateHeader h{{'M','B','L','K','S','T','A','T'}, 2, cfg_.n_layers,
+    StateHeader h{{'M','B','L','K','S','T','A','T'}, 3, cfg_.n_layers,
                   cfg_.max_seq, cfg_.kv_lora_rank, cfg_.rope_dim, pos_,
                   predicted_token()};
     bool ok = std::fwrite(&h, sizeof(h), 1, f) == 1;
-    const auto* kv = static_cast<const uint16_t*>(c_kv_.contents);
-    const auto* rope = static_cast<const uint16_t*>(k_rope_.contents);
+    const uint64_t key_width = uint64_t(cfg_.n_heads) *
+        (cfg_.key_length - cfg_.rope_dim);
+    const uint64_t val_width = uint64_t(cfg_.n_heads) * cfg_.value_length;
     for (uint32_t l = 0; ok && l < cfg_.n_layers; ++l) {
-        const uint64_t kv_off = uint64_t(l) * cfg_.max_seq * cfg_.kv_lora_rank;
-        const uint64_t r_off = uint64_t(l) * cfg_.max_seq * cfg_.rope_dim;
-        ok = std::fwrite(kv + kv_off, sizeof(uint16_t),
-                         uint64_t(pos_) * cfg_.kv_lora_rank, f) ==
-             uint64_t(pos_) * cfg_.kv_lora_rank;
-        if (ok) ok = std::fwrite(rope + r_off, sizeof(uint16_t),
+        const auto* key = static_cast<const uint16_t*>(k_nope_[l].contents);
+        const auto* val = static_cast<const uint16_t*>(v_cache_[l].contents);
+        const auto* rope = static_cast<const uint16_t*>(k_rope_[l].contents);
+        ok = std::fwrite(key, sizeof(uint16_t),
+                         uint64_t(pos_) * key_width, f) ==
+             uint64_t(pos_) * key_width;
+        if (ok) ok = std::fwrite(val, sizeof(uint16_t),
+                                  uint64_t(pos_) * val_width, f) ==
+                     uint64_t(pos_) * val_width;
+        if (ok) ok = std::fwrite(rope, sizeof(uint16_t),
                                   uint64_t(pos_) * cfg_.rope_dim, f) ==
                      uint64_t(pos_) * cfg_.rope_dim;
     }
@@ -1045,7 +1191,7 @@ bool GgufRuntime::load_state(const std::string& path) {
     StateHeaderV1 old{};
     bool ok = std::fread(&old, sizeof(old), 1, f) == 1 &&
               std::memcmp(old.magic, "MBLKSTAT", 8) == 0 &&
-              (old.version == 1 || old.version == 2);
+              old.version == 3;
     if (ok) {
         std::memcpy(h.magic, old.magic, sizeof(old.magic));
         h.version = old.version;
@@ -1054,22 +1200,26 @@ bool GgufRuntime::load_state(const std::string& path) {
         h.kv_rank = old.kv_rank;
         h.rope_dim = old.rope_dim;
         h.pos = old.pos;
-        if (old.version == 2)
-            ok = std::fread(&h.next_token, sizeof(h.next_token), 1, f) == 1;
+        ok = std::fread(&h.next_token, sizeof(h.next_token), 1, f) == 1;
     }
     ok = ok &&
               h.n_layers == cfg_.n_layers && h.max_seq == cfg_.max_seq &&
               h.kv_rank == cfg_.kv_lora_rank && h.rope_dim == cfg_.rope_dim &&
               h.pos <= cfg_.max_seq;
-    auto* kv = static_cast<uint16_t*>(c_kv_.contents);
-    auto* rope = static_cast<uint16_t*>(k_rope_.contents);
+    const uint64_t key_width = uint64_t(cfg_.n_heads) *
+        (cfg_.key_length - cfg_.rope_dim);
+    const uint64_t val_width = uint64_t(cfg_.n_heads) * cfg_.value_length;
     for (uint32_t l = 0; ok && l < cfg_.n_layers; ++l) {
-        const uint64_t kv_off = uint64_t(l) * cfg_.max_seq * cfg_.kv_lora_rank;
-        const uint64_t r_off = uint64_t(l) * cfg_.max_seq * cfg_.rope_dim;
-        ok = std::fread(kv + kv_off, sizeof(uint16_t),
-                        uint64_t(h.pos) * cfg_.kv_lora_rank, f) ==
-             uint64_t(h.pos) * cfg_.kv_lora_rank;
-        if (ok) ok = std::fread(rope + r_off, sizeof(uint16_t),
+        auto* key = static_cast<uint16_t*>(k_nope_[l].contents);
+        auto* val = static_cast<uint16_t*>(v_cache_[l].contents);
+        auto* rope = static_cast<uint16_t*>(k_rope_[l].contents);
+        ok = std::fread(key, sizeof(uint16_t),
+                        uint64_t(h.pos) * key_width, f) ==
+             uint64_t(h.pos) * key_width;
+        if (ok) ok = std::fread(val, sizeof(uint16_t),
+                                 uint64_t(h.pos) * val_width, f) ==
+                     uint64_t(h.pos) * val_width;
+        if (ok) ok = std::fread(rope, sizeof(uint16_t),
                                  uint64_t(h.pos) * cfg_.rope_dim, f) ==
                      uint64_t(h.pos) * cfg_.rope_dim;
     }

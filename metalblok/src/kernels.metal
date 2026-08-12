@@ -95,6 +95,21 @@ kernel void rms_norm_f16(
         y[i] = half(float(x[i]) * inv * float(gain[i]));
 }
 
+kernel void rms_norm_f32(
+    device const float* x    [[buffer(0)]],
+    device const float* gain [[buffer(1)]],
+    device       float* y    [[buffer(2)]],
+    constant uint&      H    [[buffer(3)]],
+    constant float&     eps  [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]) {
+    threadgroup float scratch[32];
+    float acc = 0.0f;
+    for (uint i = tid; i < H; i += tgs) acc += x[i] * x[i];
+    float inv = rsqrt(tg_reduce_sum(acc, tid, tgs, scratch) / float(H) + eps);
+    for (uint i = tid; i < H; i += tgs) y[i] = x[i] * inv * gain[i];
+}
+
 // ---------- FP8 GEMV: y[M] = W[M,K] @ x[ row/group_size , : ] -------------
 // One TG per output row.  Pass group_size = M for a plain (non-grouped) GEMV
 // (every row then reads x from offset 0).  Grouped form is used by the MLA
@@ -226,16 +241,29 @@ kernel void mla_kv_split_rope(
     }
 }
 
-// ---------- NEOX (split-half) RoPE variants -- GGUF path only ---------------
-// llama.cpp/Unsloth GGUF stores deepseek2 rope dims in the NEOX split-half
-// layout: the rope half is [a0,a1,...,a_{m-1}, b0,b1,...,b_{m-1}] (m = Dr/2),
-// and pairs element i with element i+m (rope_type=NEOX).  The interleaved
-// kernels above are correct for the .blade converter (which keeps HF's
-// interleaved layout) but WRONG for GGUF.  These variants pair (i, i+m).
-kernel void mla_q_split_rope_neox(
-    device const half* q_full     [[buffer(0)]],   // [HE, Dn+Dr]
-    device       half* q_nope_out [[buffer(1)]],   // [HE, Dn]
-    device       half* q_rope_out [[buffer(2)]],   // [HE, Dr]
+// ---------- DeepSeek-R1 YaRN RoPE (consecutive pairs) ----------------------
+// llama.cpp classifies DEEPSEEK2 as LLAMA_ROPE_TYPE_NORMAL: dimensions are
+// paired consecutively (0,1), (2,3), ... . This is independent of GGUF's
+// tensor layout. Split-half/NEOX pairing corrupts attention after position 0.
+// The pinned R1 GGUF also declares YaRN factor=40, original_context=4096,
+// beta_fast=32, beta_slow=1. For Dr=64 this gives correction pairs [10,23].
+// ggml's angle is theta_extrap * (0.025 + 0.975*ramp), where ramp falls
+// linearly from one to zero across that interval. Its RoPE magnitude is one:
+// the DeepSeek attention mscale is applied once in the QK softmax scale.
+inline float deepseek_r1_yarn_angle(uint pos, uint pair, uint Dr, float theta) {
+    constexpr float freq_scale = 0.025f;
+    constexpr float corr_low = 10.0f;
+    constexpr float corr_high = 23.0f;
+    float ramp = 1.0f - clamp((float(pair) - corr_low) /
+                              (corr_high - corr_low), 0.0f, 1.0f);
+    float extrap = float(pos) * pow(theta, -2.0f * float(pair) / float(Dr));
+    return extrap * (freq_scale + (1.0f - freq_scale) * ramp);
+}
+
+kernel void mla_q_split_rope_r1(
+    device const float* q_full     [[buffer(0)]],   // [HE, Dn+Dr]
+    device       float* q_nope_out [[buffer(1)]],   // [HE, Dn]
+    device       float* q_rope_out [[buffer(2)]],   // [HE, Dr]
     constant uint&  Dn            [[buffer(3)]],
     constant uint&  Dr            [[buffer(4)]],
     constant uint&  pos           [[buffer(5)]],
@@ -244,27 +272,26 @@ kernel void mla_q_split_rope_neox(
     uint tid [[thread_position_in_threadgroup]],
     uint tgs [[threads_per_threadgroup]])
 {
-    device const half* qf = q_full     + (size_t)h * (Dn + Dr);
-    device       half* qn = q_nope_out + (size_t)h * Dn;
-    device       half* qr = q_rope_out + (size_t)h * Dr;
+    device const float* qf = q_full     + (size_t)h * (Dn + Dr);
+    device       float* qn = q_nope_out + (size_t)h * Dn;
+    device       float* qr = q_rope_out + (size_t)h * Dr;
 
     for (uint i = tid; i < Dn; i += tgs) qn[i] = qf[i];
 
-    uint m = Dr / 2;   // split-half pairing: (i, i+m)
-    for (uint i = tid; i < m; i += tgs) {
-        float freq = pow(theta, -2.0f * float(i) / float(Dr));
-        float ang  = float(pos) * freq;
+    uint pairs = Dr / 2;
+    for (uint i = tid; i < pairs; i += tgs) {
+        float ang = deepseek_r1_yarn_angle(pos, i, Dr, theta);
         float c = cos(ang), s = sin(ang);
-        float a = float(qf[Dn + i]);
-        float b = float(qf[Dn + i + m]);
-        qr[i]     = half(a*c - b*s);
-        qr[i + m] = half(b*c + a*s);
+        float a = qf[Dn + 2u*i];
+        float b = qf[Dn + 2u*i + 1u];
+        qr[2u*i] = a*c - b*s;
+        qr[2u*i + 1u] = b*c + a*s;
     }
 }
 
 kernel void mla_kv_split_rope_neox(
-    device const half* kv_a         [[buffer(0)]],   // [Lk + Dr]
-    device const half* kv_a_norm    [[buffer(1)]],   // [Lk] gain
+    device const float* kv_a         [[buffer(0)]],   // [Lk + Dr]
+    device const float* kv_a_norm    [[buffer(1)]],   // [Lk] gain
     device       half* c_kv_cache   [[buffer(2)]],   // [n_layers, max_seq, Lk]
     device       half* k_rope_cache [[buffer(3)]],   // [n_layers, max_seq, Dr]
     constant uint&  Lk      [[buffer(4)]],
@@ -279,25 +306,143 @@ kernel void mla_kv_split_rope_neox(
 {
     threadgroup float scratch[32];
     float acc = 0.0f;
-    for (uint i = tid; i < Lk; i += tgs) { float v = float(kv_a[i]); acc += v*v; }
+    for (uint i = tid; i < Lk; i += tgs) { float v = kv_a[i]; acc += v*v; }
     float ss = tg_reduce_sum(acc, tid, tgs, scratch);
     float inv = rsqrt(ss / float(Lk) + eps);
 
     device half* cdst = c_kv_cache + ((size_t)L * max_seq + pos) * Lk;
     for (uint i = tid; i < Lk; i += tgs)
-        cdst[i] = half(float(kv_a[i]) * inv * float(kv_a_norm[i]));
+        cdst[i] = half(kv_a[i] * inv * kv_a_norm[i]);
 
     device half* krdst = k_rope_cache + ((size_t)L * max_seq + pos) * Dr;
     uint m = Dr / 2;   // split-half pairing: (i, i+m)
     for (uint i = tid; i < m; i += tgs) {
-        float freq = pow(theta, -2.0f * float(i) / float(Dr));
-        float ang  = float(pos) * freq;
+        float ang = deepseek_r1_yarn_angle(pos, i, Dr, theta);
         float c = cos(ang), s = sin(ang);
-        float a = float(kv_a[Lk + i]);
-        float b = float(kv_a[Lk + i + m]);
+        float a = kv_a[Lk + i];
+        float b = kv_a[Lk + i + m];
         krdst[i]     = half(a*c - b*s);
         krdst[i + m] = half(b*c + a*s);
     }
+}
+
+// Legacy combined-wkv GGUF path. Keep the normalized latent in fp32 for the
+// quantized wkv_b GEMV, while caching the shared rotary key in fp16.
+kernel void mha_kv_norm_rope_r1(
+    device const float* kv_a         [[buffer(0)]],
+    device const float* kv_a_norm    [[buffer(1)]],
+    device       float* kv_lat       [[buffer(2)]],
+    device       half*  k_rope_cache [[buffer(3)]],
+    constant uint&  Lk      [[buffer(4)]],
+    constant uint&  Dr      [[buffer(5)]],
+    constant uint&  L       [[buffer(6)]],
+    constant uint&  pos     [[buffer(7)]],
+    constant uint&  max_seq [[buffer(8)]],
+    constant float& eps     [[buffer(9)]],
+    constant float& theta   [[buffer(10)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float scratch[32];
+    float acc = 0.0f;
+    for (uint i = tid; i < Lk; i += tgs) acc += kv_a[i] * kv_a[i];
+    float inv = rsqrt(tg_reduce_sum(acc, tid, tgs, scratch) / float(Lk) + eps);
+    for (uint i = tid; i < Lk; i += tgs)
+        kv_lat[i] = kv_a[i] * inv * kv_a_norm[i];
+
+    device half* krdst = k_rope_cache + ((size_t)L * max_seq + pos) * Dr;
+    uint pairs = Dr / 2;
+    for (uint i = tid; i < pairs; i += tgs) {
+        float ang = deepseek_r1_yarn_angle(pos, i, Dr, theta);
+        float c = cos(ang), s = sin(ang);
+        float a = kv_a[Lk + 2u*i], b = kv_a[Lk + 2u*i + 1u];
+        krdst[2u*i] = half(a*c - b*s);
+        krdst[2u*i + 1u] = half(b*c + a*s);
+    }
+}
+
+kernel void mha_kv_store_f16(
+    device const float* kv_full [[buffer(0)]], // [HE, Dn+Dv]
+    device       half*  k_cache [[buffer(1)]], // [L,max_seq,HE,Dn]
+    device       half*  v_cache [[buffer(2)]], // [L,max_seq,HE,Dv]
+    constant uint& HE      [[buffer(3)]],
+    constant uint& Dn      [[buffer(4)]],
+    constant uint& Dv      [[buffer(5)]],
+    constant uint& L       [[buffer(6)]],
+    constant uint& pos     [[buffer(7)]],
+    constant uint& max_seq [[buffer(8)]],
+    uint h   [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]])
+{
+    device const float* src = kv_full + (size_t)h * (Dn + Dv);
+    device half* kd = k_cache + (((size_t)L * max_seq + pos) * HE + h) * Dn;
+    device half* vd = v_cache + (((size_t)L * max_seq + pos) * HE + h) * Dv;
+    for (uint i = tid; i < Dn; i += tgs) kd[i] = half(src[i]);
+    for (uint i = tid; i < Dv; i += tgs) vd[i] = half(src[Dn + i]);
+}
+
+// Exact MHA decode for the legacy combined-wkv graph. One threadgroup owns a
+// head; global score scratch is reused across layers and tokens.
+kernel void mha_attn_decode_f32(
+    device const float* q_nope      [[buffer(0)]],
+    device const float* q_rope      [[buffer(1)]],
+    device const half*  k_cache     [[buffer(2)]],
+    device const half*  k_rope      [[buffer(3)]],
+    device const half*  v_cache     [[buffer(4)]],
+    device       float* out         [[buffer(5)]],
+    device       float* scores      [[buffer(6)]],
+    constant uint& HE      [[buffer(7)]],
+    constant uint& Dn      [[buffer(8)]],
+    constant uint& Dr      [[buffer(9)]],
+    constant uint& Dv      [[buffer(10)]],
+    constant uint& L       [[buffer(11)]],
+    constant uint& T       [[buffer(12)]],
+    constant uint& max_seq [[buffer(13)]],
+    constant float& scale  [[buffer(14)]],
+    uint h   [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float scratch[32];
+    device const float* qn = q_nope + (size_t)h * Dn;
+    device const float* qr = q_rope + (size_t)h * Dr;
+    device float* sc = scores + (size_t)h * max_seq;
+    const size_t layer_k = (size_t)L * max_seq * HE * Dn;
+    const size_t layer_v = (size_t)L * max_seq * HE * Dv;
+    const size_t layer_r = (size_t)L * max_seq * Dr;
+
+    float local_max = -INFINITY;
+    for (uint t = tid; t < T; t += tgs) {
+        device const half* kh = k_cache + layer_k + ((size_t)t * HE + h) * Dn;
+        device const half* kr = k_rope + layer_r + (size_t)t * Dr;
+        float s = 0.0f;
+        for (uint i = 0; i < Dn; ++i) s += qn[i] * float(kh[i]);
+        for (uint i = 0; i < Dr; ++i) s += qr[i] * float(kr[i]);
+        s *= scale;
+        sc[t] = s;
+        local_max = max(local_max, s);
+    }
+    float gmax = tg_reduce_max(local_max, tid, tgs, scratch);
+    float local_sum = 0.0f;
+    for (uint t = tid; t < T; t += tgs) {
+        float e = exp(sc[t] - gmax);
+        sc[t] = e;
+        local_sum += e;
+    }
+    float inv = 1.0f / tg_reduce_sum(local_sum, tid, tgs, scratch);
+
+    threadgroup float oacc[128];
+    for (uint i = tid; i < Dv; i += tgs) oacc[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    for (uint t = 0; t < T; ++t) {
+        device const half* vh = v_cache + layer_v + ((size_t)t * HE + h) * Dv;
+        float wt = sc[t];
+        for (uint i = tid; i < Dv; i += tgs) oacc[i] += wt * float(vh[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device float* oh = out + (size_t)h * Dv;
+    for (uint i = tid; i < Dv; i += tgs) oh[i] = oacc[i] * inv;
 }
 
 // ---------- MLA decode attention (one TG per head) -------------------------
@@ -312,12 +457,12 @@ kernel void mla_kv_split_rope_neox(
 // Three-pass softmax with global scratch[h, t] of size T fp32.
 // Total bandwidth: ~2 * Lk * T fp16 reads of c_kv (shared across heads via
 // L1/L2) plus ~2 * Dr * T fp16 reads of k_rope.  Memory-bound at long T.
-kernel void mla_attn_decode_f16(
-    device const half*  q_eff        [[buffer(0)]],   // [HE, Lk]
-    device const half*  q_rope       [[buffer(1)]],   // [HE, Dr]
+kernel void mla_attn_decode_f32(
+    device const float* q_eff        [[buffer(0)]],   // [HE, Lk]
+    device const float* q_rope       [[buffer(1)]],   // [HE, Dr]
     device const half*  c_kv_cache   [[buffer(2)]],   // [n_layers, max_seq, Lk]
     device const half*  k_rope_cache [[buffer(3)]],   // [n_layers, max_seq, Dr]
-    device       half*  o_lat        [[buffer(4)]],   // [HE, Lk]
+    device       float* o_lat        [[buffer(4)]],   // [HE, Lk]
     device       float* scores       [[buffer(5)]],   // [HE, max_seq]
     constant uint&  HE      [[buffer(6)]],
     constant uint&  Lk      [[buffer(7)]],
@@ -331,8 +476,8 @@ kernel void mla_attn_decode_f16(
     uint tgs [[threads_per_threadgroup]])
 {
     threadgroup float scratch[32];
-    device const half* qe = q_eff   + (size_t)h * Lk;
-    device const half* qr = q_rope  + (size_t)h * Dr;
+    device const float* qe = q_eff   + (size_t)h * Lk;
+    device const float* qr = q_rope  + (size_t)h * Dr;
     device       float* sc = scores + (size_t)h * max_seq;
     device const half* ck0 = c_kv_cache   + (size_t)L * max_seq * Lk;
     device const half* kr0 = k_rope_cache + (size_t)L * max_seq * Dr;
@@ -343,8 +488,8 @@ kernel void mla_attn_decode_f16(
         device const half* ck = ck0 + (size_t)t * Lk;
         device const half* kr = kr0 + (size_t)t * Dr;
         float s = 0.0f;
-        for (uint i = 0; i < Lk; ++i) s += float(qe[i]) * float(ck[i]);
-        for (uint i = 0; i < Dr; ++i) s += float(qr[i]) * float(kr[i]);
+        for (uint i = 0; i < Lk; ++i) s += qe[i] * float(ck[i]);
+        for (uint i = 0; i < Dr; ++i) s += qr[i] * float(kr[i]);
         s *= scale;
         sc[t] = s;
         local_max = max(local_max, s);
@@ -388,6 +533,57 @@ kernel void mla_attn_decode_f16(
             oacc[i] += wt * float(ck0[(size_t)t * Lk + i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    device float* oh = o_lat + (size_t)h * Lk;
+    for (uint i = tid; i < Lk; i += tgs) oh[i] = oacc[i] * inv;
+}
+
+// Legacy .blade/HF path; the GGUF parity path above keeps activations f32.
+kernel void mla_attn_decode_f16(
+    device const half* q_eff [[buffer(0)]],
+    device const half* q_rope [[buffer(1)]],
+    device const half* c_kv_cache [[buffer(2)]],
+    device const half* k_rope_cache [[buffer(3)]],
+    device half* o_lat [[buffer(4)]],
+    device float* scores [[buffer(5)]],
+    constant uint& HE [[buffer(6)]], constant uint& Lk [[buffer(7)]],
+    constant uint& Dr [[buffer(8)]], constant uint& L [[buffer(9)]],
+    constant uint& T [[buffer(10)]], constant uint& max_seq [[buffer(11)]],
+    constant float& scale [[buffer(12)]],
+    uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]) {
+    threadgroup float scratch[32];
+    device const half* qe = q_eff + (size_t)h * Lk;
+    device const half* qr = q_rope + (size_t)h * Dr;
+    device float* sc = scores + (size_t)h * max_seq;
+    device const half* ck0 = c_kv_cache + (size_t)L * max_seq * Lk;
+    device const half* kr0 = k_rope_cache + (size_t)L * max_seq * Dr;
+    float local_max = -INFINITY;
+    for (uint t = tid; t < T; t += tgs) {
+        device const half* ck = ck0 + (size_t)t * Lk;
+        device const half* kr = kr0 + (size_t)t * Dr;
+        float s = 0.0f;
+        for (uint i = 0; i < Lk; ++i) s += float(qe[i]) * float(ck[i]);
+        for (uint i = 0; i < Dr; ++i) s += float(qr[i]) * float(kr[i]);
+        sc[t] = s * scale;
+        local_max = max(local_max, sc[t]);
+    }
+    float gmax = tg_reduce_max(local_max, tid, tgs, scratch);
+    float local_sum = 0.0f;
+    for (uint t = tid; t < T; t += tgs) {
+        sc[t] = exp(sc[t] - gmax);
+        local_sum += sc[t];
+    }
+    float inv = 1.0f / tg_reduce_sum(local_sum, tid, tgs, scratch);
+    threadgroup float oacc[1024];
+    for (uint i = tid; i < Lk; i += tgs) oacc[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    for (uint t = 0; t < T; ++t) {
+        float wt = sc[t];
+        for (uint i = tid; i < Lk; i += tgs)
+            oacc[i] += wt * float(ck0[(size_t)t * Lk + i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     device half* oh = o_lat + (size_t)h * Lk;
     for (uint i = tid; i < Lk; i += tgs) oh[i] = half(oacc[i] * inv);
 }
@@ -404,6 +600,15 @@ kernel void swiglu_f16(
     float g = float(gate[i]);
     float s = g / (1.0f + exp(-g));
     y[i] = half(s * float(up[i]));
+}
+
+kernel void swiglu_f32(
+    device const float* gate [[buffer(0)]],
+    device const float* up   [[buffer(1)]],
+    device       float* y    [[buffer(2)]],
+    constant uint& N         [[buffer(3)]],
+    uint i [[thread_position_in_grid]]) {
+    if (i < N) y[i] = (gate[i] / (1.0f + exp(-gate[i]))) * up[i];
 }
 
 // ---------- Router top-K (fp16 logits, fp32 bias) --------------------------
@@ -509,8 +714,8 @@ kernel void router_topk_sigmoid_f16(
 // 256 experts -> 8 contiguous groups; score each group by its two highest
 // corrected scores; retain 4 groups; then select 8 experts. Mixture weights
 // use the uncorrected sigmoid probabilities.
-kernel void router_topk_grouped_sigmoid_f16(
-    device const half*  logits    [[buffer(0)]],
+kernel void router_topk_grouped_sigmoid_f32(
+    device const float* logits    [[buffer(0)]],
     device const float* bias      [[buffer(1)]],
     device       uint*  idx       [[buffer(2)]],
     device       float* wts       [[buffer(3)]],
@@ -529,7 +734,7 @@ kernel void router_topk_grouped_sigmoid_f16(
     float prob[256];
     float corrected[256];
     for (uint e = 0; e < N; ++e) {
-        float p = 1.0f / (1.0f + exp(-float(logits[e])));
+        float p = 1.0f / (1.0f + exp(-logits[e]));
         prob[e] = p;
         corrected[e] = p + bias[e];
     }
@@ -606,6 +811,15 @@ kernel void axpy_f16(
 {
     if (i >= N) return;
     y[i] = half(float(y[i]) + alpha * float(x[i]));
+}
+
+kernel void axpy_f32(
+    device       float* y     [[buffer(0)]],
+    device const float* x     [[buffer(1)]],
+    constant float& alpha     [[buffer(2)]],
+    constant uint& N          [[buffer(3)]],
+    uint i [[thread_position_in_grid]]) {
+    if (i < N) y[i] += alpha * x[i];
 }
 
 // ---------- Embedding lookup (FP8 -> fp16) --------------------------------
@@ -1165,10 +1379,10 @@ kernel void scatter_add_weighted_f16(
 //     (same ql byte, different shift).  The 2-bit qh expansion likewise
 //     shares one qh byte across all four sub-quads.
 
-kernel void gemv_q6_K_f16(
+kernel void gemv_q6_K_f32(
     device const uchar*  W       [[buffer(0)]],   // raw bytes, 210 * nblk per row
-    device const half*   x       [[buffer(1)]],   // length K
-    device       half*   y       [[buffer(2)]],   // length n_rows
+    device const float*  x       [[buffer(1)]],   // length K
+    device       float*  y       [[buffer(2)]],   // length n_rows
     constant uint&       K       [[buffer(3)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
@@ -1186,14 +1400,14 @@ kernel void gemv_q6_K_f16(
         ushort d_h = ((device const ushort*)(blk + 208))[0];
         float d = float(as_type<half>(d_h));
 
-        device const half* xb = x + (size_t)b * 256;
+        device const float* xb = x + (size_t)b * 256;
 
         // Two outer halves of 128 weights each.
         for (uint n = 0; n < 2; ++n) {
             device const uchar* ql = ql_base + n * 64;
             device const uchar* qh = qh_base + n * 32;
             device const char*  sc = sc_base + n * 8;
-            device const half*  xs = xb     + n * 128;
+            device const float* xs = xb + n * 128;
 
             float local = 0.0f;
             for (uint l = 0; l < 32; ++l) {
@@ -1205,10 +1419,10 @@ kernel void gemv_q6_K_f16(
                 int q3 = int((ql0 >>   4) | (((qhb >> 4) & 3) << 4)) - 32;
                 int q4 = int((ql1 >>   4) | (((qhb >> 6) & 3) << 4)) - 32;
                 uint is = l >> 4;
-                local += float(sc[is + 0]) * float(q1) * float(xs[l +  0])
-                       + float(sc[is + 2]) * float(q2) * float(xs[l + 32])
-                       + float(sc[is + 4]) * float(q3) * float(xs[l + 64])
-                       + float(sc[is + 6]) * float(q4) * float(xs[l + 96]);
+                local += float(sc[is + 0]) * float(q1) * xs[l +  0]
+                       + float(sc[is + 2]) * float(q2) * xs[l + 32]
+                       + float(sc[is + 4]) * float(q3) * xs[l + 64]
+                       + float(sc[is + 6]) * float(q4) * xs[l + 96];
             }
             acc += d * local;
         }
@@ -1216,7 +1430,7 @@ kernel void gemv_q6_K_f16(
 
     threadgroup float scratch[32];
     float v = tg_reduce_sum(acc, tid, tgs, scratch);
-    if (tid == 0) y[row] = half(v);
+    if (tid == 0) y[row] = v;
 }
 
 // ---------------------------------------------------------------------------
@@ -1243,10 +1457,10 @@ inline void k_get_scale_min_k4(int j, device const uchar* q,
     }
 }
 
-kernel void gemv_q4_K_f16(
+kernel void gemv_q4_K_f32(
     device const uchar*  W       [[buffer(0)]],   // 144 * nblk per row
-    device const half*   x       [[buffer(1)]],
-    device       half*   y       [[buffer(2)]],
+    device const float*  x       [[buffer(1)]],
+    device       float*  y       [[buffer(2)]],
     constant uint&       K       [[buffer(3)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
@@ -1265,7 +1479,7 @@ kernel void gemv_q4_K_f16(
 
         device const uchar* scales = blk + 4;
         device const uchar* qs     = blk + 16;
-        device const half*  xb     = x   + (size_t)b * 256;
+        device const float* xb     = x   + (size_t)b * 256;
 
         // Four 64-weight strips per super-block (is = 0,2,4,6).
         for (uint strip = 0; strip < 4; ++strip) {
@@ -1278,14 +1492,14 @@ kernel void gemv_q4_K_f16(
             float m2 = dmin * float(m2c);
 
             device const uchar* q  = qs + strip * 32;
-            device const half*  xs = xb + strip * 64;
+            device const float* xs = xb + strip * 64;
 
             float local = 0.0f;
             for (uint l = 0; l < 32; ++l) {
                 uchar  qb = q[l];
                 float  w_lo = d1 * float(qb & 0x0F) - m1;
                 float  w_hi = d2 * float(qb >>   4) - m2;
-                local += w_lo * float(xs[l]) + w_hi * float(xs[l + 32]);
+                local += w_lo * xs[l] + w_hi * xs[l + 32];
             }
             acc += local;
         }
@@ -1293,7 +1507,7 @@ kernel void gemv_q4_K_f16(
 
     threadgroup float scratch[32];
     float v = tg_reduce_sum(acc, tid, tgs, scratch);
-    if (tid == 0) y[row] = half(v);
+    if (tid == 0) y[row] = v;
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,10 +1534,40 @@ kernel void gemv_q4_K_f16(
 
 constant float IQ1S_DELTA = 0.125f;
 
-kernel void gemv_iq1_s_f16(
+inline float iq1s_partial(device const uchar* Wrow,
+                          device const float* x,
+                          device const ulong* grid,
+                          uint nblk, uint tid, uint tgs) {
+    float acc = 0.0f;
+    for (uint b = tid; b < nblk; b += tgs) {
+        device const uchar* blk = Wrow + (size_t)b * 50;
+        float d = float(as_type<half>(((device const ushort*)blk)[0]));
+        device const uchar* qs = blk + 2;
+        device const ushort* qh = (device const ushort*)(blk + 34);
+        device const float* xb = x + (size_t)b * 256;
+        for (uint sub = 0; sub < 8; ++sub) {
+            ushort q = qh[sub];
+            float dl = d * float(2u * uint((q >> 12) & 7u) + 1u);
+            float delta = (q & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
+            for (uint g = 0; g < 4; ++g) {
+                uint idx = uint(qs[sub * 4 + g]) | (uint((q >> (3 * g)) & 7u) << 8);
+                ulong code = grid[idx];
+                device const float* xv = xb + sub * 32 + g * 8;
+                float local = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < 8; ++j)
+                    local += (float(int(char((code >> (8 * j)) & 0xff))) + delta) * xv[j];
+                acc += dl * local;
+            }
+        }
+    }
+    return acc;
+}
+
+kernel void gemv_iq1_s_f32(
     device const uchar*    W    [[buffer(0)]],  // 50 * nblk per row
-    device const half*     x    [[buffer(1)]],
-    device       half*     y    [[buffer(2)]],
+    device const float*    x    [[buffer(1)]],
+    device       float*    y    [[buffer(2)]],
     device const ulong*    grid [[buffer(3)]],  // 2048 entries
     constant uint&         K    [[buffer(4)]],
     uint row [[threadgroup_position_in_grid]],
@@ -1333,42 +1577,54 @@ kernel void gemv_iq1_s_f16(
     const uint nblk = K / 256;
     device const uchar* Wrow = W + (size_t)row * nblk * 50;
 
-    float acc = 0.0f;
-    for (uint b = tid; b < nblk; b += tgs) {
-        device const uchar*  blk = Wrow + (size_t)b * 50;
-        ushort d_h = ((device const ushort*)(blk + 0))[0];
-        float  d   = float(as_type<half>(d_h));
-        device const uchar*  qs = blk + 2;
-        device const ushort* qh = (device const ushort*)(blk + 34);
-        device const half*   xb = x + (size_t)b * 256;
-
-        for (uint sub = 0; sub < 8; ++sub) {
-            ushort qhv   = qh[sub];
-            uint   sbits = uint((qhv >> 12) & 0x7);
-            float  dl    = d * float(2u * sbits + 1u);
-            float  delta = (qhv & 0x8000) ? -IQ1S_DELTA : +IQ1S_DELTA;
-
-            device const half* xs = xb + sub * 32;
-            for (uint g = 0; g < 4; ++g) {
-                uint  lo  = uint(qs[sub * 4 + g]);
-                uint  hi  = uint((qhv >> (3 * g)) & 0x7);
-                uint  idx = lo | (hi << 8);
-                ulong bytes = grid[idx];
-                device const half* xg = xs + g * 8;
-                float local = 0.0f;
-                #pragma clang loop unroll(full)
-                for (uint j = 0; j < 8; ++j) {
-                    int sj = int(char((bytes >> (8 * j)) & 0xff));  // signed
-                    local += (float(sj) + delta) * float(xg[j]);
-                }
-                acc += dl * local;
-            }
-        }
-    }
-
     threadgroup float scratch[32];
-    float v = tg_reduce_sum(acc, tid, tgs, scratch);
-    if (tid == 0) y[row] = half(v);
+    float v = tg_reduce_sum(iq1s_partial(Wrow, x, grid, nblk, tid, tgs),
+                            tid, tgs, scratch);
+    if (tid == 0) y[row] = v;
+}
+
+// DeepSeek-R1 routed SwiGLU: reuse x while computing the IQ1_S gate/up pair,
+// then round at the same fp16 boundaries as the unfused graph.
+kernel void expert_gate_up_swiglu_iq1_s(
+    device const uchar* Wg [[buffer(0)]],
+    device const uchar* Wu [[buffer(1)]],
+    device const float* x [[buffer(2)]],
+    device float* y [[buffer(3)]],
+    device const ulong* grid [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]) {
+    const uint nblk = K / 256;
+    const size_t stride = (size_t)nblk * 50;
+    threadgroup float scratch[32];
+    float gate = tg_reduce_sum(iq1s_partial(Wg + row * stride, x, grid, nblk, tid, tgs),
+                               tid, tgs, scratch);
+    float up = tg_reduce_sum(iq1s_partial(Wu + row * stride, x, grid, nblk, tid, tgs),
+                             tid, tgs, scratch);
+    if (tid == 0) {
+        y[row] = (gate / (1.0f + exp(-gate))) * up;
+    }
+}
+
+// DeepSeek-R1 routed down projection plus weighted expert accumulation.
+kernel void expert_down_accum_iq1_s(
+    device const uchar* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    device const ulong* grid [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant float& alpha [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]) {
+    const uint nblk = K / 256;
+    device const uchar* Wrow = W + (size_t)row * nblk * 50;
+    threadgroup float scratch[32];
+    float value = tg_reduce_sum(iq1s_partial(Wrow, x, grid, nblk, tid, tgs),
+                                tid, tgs, scratch);
+    if (tid == 0)
+        y[row] += alpha * value;
 }
 
 // ---------------------------------------------------------------------------
@@ -1388,10 +1644,10 @@ kernel void gemv_iq1_s_f16(
 //
 // CPU oracle: dequantize_q5_K_block in src/gguf_dequant.cpp.
 
-kernel void gemv_q5_K_f16(
+kernel void gemv_q5_K_f32(
     device const uchar*  W       [[buffer(0)]],   // 176 * nblk per row
-    device const half*   x       [[buffer(1)]],
-    device       half*   y       [[buffer(2)]],
+    device const float*  x       [[buffer(1)]],
+    device       float*  y       [[buffer(2)]],
     constant uint&       K       [[buffer(3)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
@@ -1411,7 +1667,7 @@ kernel void gemv_q5_K_f16(
         device const uchar* scales = blk + 4;
         device const uchar* qh     = blk + 16;
         device const uchar* qs     = blk + 48;
-        device const half*  xb     = x   + (size_t)b * 256;
+        device const float* xb     = x   + (size_t)b * 256;
 
         uchar u1 = 1, u2 = 2;
         for (uint strip = 0; strip < 4; ++strip) {
@@ -1424,7 +1680,7 @@ kernel void gemv_q5_K_f16(
             float m2 = dmin * float(m2c);
 
             device const uchar* q  = qs + strip * 32;
-            device const half*  xs = xb + strip * 64;
+            device const float* xs = xb + strip * 64;
 
             float local = 0.0f;
             for (uint l = 0; l < 32; ++l) {
@@ -1432,7 +1688,7 @@ kernel void gemv_q5_K_f16(
                 uchar  qhb = qh[l];
                 float  w_lo = d1 * float((qb & 0x0F) + ((qhb & u1) ? 16 : 0)) - m1;
                 float  w_hi = d2 * float((qb >>   4) + ((qhb & u2) ? 16 : 0)) - m2;
-                local += w_lo * float(xs[l]) + w_hi * float(xs[l + 32]);
+                local += w_lo * xs[l] + w_hi * xs[l + 32];
             }
             acc += local;
             u1 <<= 2;
@@ -1442,7 +1698,7 @@ kernel void gemv_q5_K_f16(
 
     threadgroup float scratch[32];
     float v = tg_reduce_sum(acc, tid, tgs, scratch);
-    if (tid == 0) y[row] = half(v);
+    if (tid == 0) y[row] = v;
 }
 
 // ---------------------------------------------------------------------------
@@ -1480,10 +1736,10 @@ constant uchar IQ2XXS_KSIGNS[128] = {
     240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
 };
 
-kernel void gemv_iq2_xxs_f16(
+kernel void gemv_iq2_xxs_f32(
     device const uchar*    W    [[buffer(0)]],   // 66 * nblk per row
-    device const half*     x    [[buffer(1)]],
-    device       half*     y    [[buffer(2)]],
+    device const float*    x    [[buffer(1)]],
+    device       float*    y    [[buffer(2)]],
     device const ulong*    grid [[buffer(3)]],   // iq2xxs_grid[256]
     constant uint&         K    [[buffer(4)]],
     uint row [[threadgroup_position_in_grid]],
@@ -1499,7 +1755,7 @@ kernel void gemv_iq2_xxs_f16(
         ushort d_h = ((device const ushort*)(blk + 0))[0];
         float  d   = float(as_type<half>(d_h));
         device const uchar*  qs = blk + 2;
-        device const half*   xb = x + (size_t)b * 256;
+        device const float*  xb = x + (size_t)b * 256;
 
         for (uint sub = 0; sub < 8; ++sub) {
             device const uchar* sub_bytes = qs + 8 * sub;
@@ -1512,19 +1768,19 @@ kernel void gemv_iq2_xxs_f16(
                     | (uint(sub_bytes[6]) <<16) | (uint(sub_bytes[7]) << 24);
             float db = d * (0.5f + float(a1 >> 28)) * 0.25f;
 
-            device const half* xs = xb + sub * 32;
+            device const float* xs = xb + sub * 32;
             for (uint g = 0; g < 4; ++g) {
                 uint  gi    = (a0 >> (8 * g)) & 0xff;
                 ulong gbits = grid[gi];
                 uchar signs = IQ2XXS_KSIGNS[(a1 >> (7 * g)) & 0x7f];
 
-                device const half* xg = xs + g * 8;
+                device const float* xg = xs + g * 8;
                 float local = 0.0f;
                 #pragma clang loop unroll(full)
                 for (uint j = 0; j < 8; ++j) {
                     float gv = float((gbits >> (8 * j)) & 0xff);
                     float s  = (signs & IQ2XXS_KMASK[j]) ? -1.0f : +1.0f;
-                    local += gv * s * float(xg[j]);
+                    local += gv * s * xg[j];
                 }
                 acc += db * local;
             }
@@ -1533,7 +1789,7 @@ kernel void gemv_iq2_xxs_f16(
 
     threadgroup float scratch[32];
     float v = tg_reduce_sum(acc, tid, tgs, scratch);
-    if (tid == 0) y[row] = half(v);
+    if (tid == 0) y[row] = v;
 }
 
 // ---------------------------------------------------------------------------
@@ -1551,10 +1807,10 @@ kernel void gemv_iq2_xxs_f16(
 // hoisted into the same calling convention so kernel_name_for(GGML_F32)
 // returns a real PSO and metal_ctx.mm:81 stops aborting.
 // ---------------------------------------------------------------------------
-kernel void gemv_f32_f16(
+kernel void gemv_f32_f32(
     device const float*  W       [[buffer(0)]],   // K floats per row, row-major
-    device const half*   x       [[buffer(1)]],
-    device       half*   y       [[buffer(2)]],
+    device const float*  x       [[buffer(1)]],
+    device       float*  y       [[buffer(2)]],
     constant uint&       K       [[buffer(3)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
@@ -1564,12 +1820,48 @@ kernel void gemv_f32_f16(
 
     float acc = 0.0f;
     for (uint i = tid; i < K; i += tgs) {
-        acc += Wrow[i] * float(x[i]);
+        acc += Wrow[i] * x[i];
     }
 
     threadgroup float scratch[32];
     float v = tg_reduce_sum(acc, tid, tgs, scratch);
-    if (tid == 0) y[row] = half(v);
+    if (tid == 0) y[row] = v;
+}
+
+kernel void gemv_f32_f32_grouped(
+    device const float* W          [[buffer(0)]],
+    device const float* x          [[buffer(1)]],
+    device       float* y          [[buffer(2)]],
+    constant uint& K               [[buffer(3)]],
+    constant uint& group_size      [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]) {
+    device const float* wr = W + (size_t)row * K;
+    device const float* xr = x + (size_t)(row / group_size) * K;
+    float acc = 0.0f;
+    for (uint i = tid; i < K; i += tgs) acc += wr[i] * xr[i];
+    threadgroup float scratch[32];
+    float v = tg_reduce_sum(acc, tid, tgs, scratch);
+    if (tid == 0) y[row] = v;
+}
+
+kernel void gemv_f16_f32_grouped(
+    device const half* W          [[buffer(0)]],
+    device const float* x         [[buffer(1)]],
+    device       float* y         [[buffer(2)]],
+    constant uint& K              [[buffer(3)]],
+    constant uint& group_size     [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]) {
+    device const half* wr = W + (size_t)row * K;
+    device const float* xr = x + (size_t)(row / group_size) * K;
+    float acc = 0.0f;
+    for (uint i = tid; i < K; i += tgs) acc += float(wr[i]) * xr[i];
+    threadgroup float scratch[32];
+    float v = tg_reduce_sum(acc, tid, tgs, scratch);
+    if (tid == 0) y[row] = v;
 }
 
 // ---------------------------------------------------------------------------
