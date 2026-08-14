@@ -80,7 +80,8 @@ copy” means one shared allocation, not zero bytes moved.
 ### 2.3 Storage
 
 V0 controls file offsets and request ordering, not NAND pages, FTL placement,
-ECC, or NVMe firmware. Each shard is opened on four independent lanes with:
+ECC, or NVMe firmware. Each shard is opened on eight measured independent
+lanes by default, with a bounded `--io-lanes {2,4,8}` control. Every lane uses:
 
 ```text
 O_RDONLY
@@ -430,7 +431,7 @@ contention and the first/last bubbles.
 
 ### 8.3 Priority reader
 
-Each of 12 workers owns two SPSC queues:
+Each of the default 24 workers owns two SPSC queues:
 
 - background: unconditional next-layer fixed projections;
 - urgent: current router-selected gate/up/down slices.
@@ -546,7 +547,7 @@ fixed(L) ready
 
 There are four distinct forms of parallel work:
 
-1. The reader has 12 workers, so independent shard ranges can be in flight at
+1. The reader has 24 default workers, so independent shard ranges can be in flight at
    once. Urgent and background queues determine priority, not arithmetic.
 2. Fixed layer `L+1` I/O overlaps GPU execution of layer `L` through the second
    slab. It is legal because fixed addresses are unconditional.
@@ -741,7 +742,7 @@ it is already overlapped. Removing 262 MB of model traffic and improving
 request priority reduced steady wall time by roughly 16–22% in the compared
 anchors.
 
-`io_service_us` is summed across 12 workers and can exceed wall time; it is a
+`io_service_us` is summed across all reader workers and can exceed wall time; it is a
 work measure, not latency. `nvme_span_us` is first-start to last-completion and
 is the correct denominator for effective aggregate GB/s. `io_wait_us` counts
 only explicit producer blocking and can be smaller than the I/O span because
@@ -783,10 +784,10 @@ a compact representation passes layer/logit/token parity.
 ### 13.3 A large fixed cache
 
 A 2 GiB cache reduced per-token model traffic to 11.710 GB, but consumed
-headroom needed by 8.2 GB KV capacity and macOS. Compression increased and the
-risk-adjusted result was worse for a long proof. V0 uses 256 MiB by default and
-keeps the larger setting explicit rather than pretending maximum caching is
-always optimal.
+headroom needed by 8.2 GB KV capacity and macOS. Compact MLA now computes a
+live cache budget from available memory after exact KV, slabs, activations,
+host reserve, and a 2 GiB guard; `METALBLOK_FIXED_CACHE_MB` remains a bounded
+override. Nominal maximum caching is never assumed safe.
 
 ### 13.4 Next-layer expert prediction
 
@@ -826,6 +827,15 @@ attention, FFN, expert I/O, GPU time, requests, command buffers, and
 dispatches. `--trace` hashes residuals and reports RMS/min/max/non-finite values
 plus top logits and routing. These modes turn a divergence into the earliest
 layer/stage where it becomes observable.
+
+`--profile-ops` adds individual normalization, projection, MLA, routing,
+shared-expert, routed-group, and representative per-expert boundaries.
+Per-reader `profile-io` records expose shard/lane imbalance, bytes, reads,
+urgent work, service time, and tail latency. The 2026-08-14 strict pass used
+these measurements to batch router/top-k and MLA preparation exactly, select
+eight balanced readers per shard, and reject slower or drifting kernels. The
+full before/after ledger is in
+[the strict M5 performance closeout](PERFORMANCE_CLOSEOUT_2026-08-14.md).
 
 ## 15. Acceptance and scale boundary
 

@@ -119,6 +119,22 @@ For layer attribution:
 ./run_blok.py "profile this" -n 32 --profile-layers
 ```
 
+For synchronization-heavy operation attribution:
+
+```sh
+./run_blok.py "profile this" -n 32 --mla --profile-ops
+```
+
+`--profile-ops` logs individual projection/attention/MoE boundaries and a
+representative per-expert gate/up/down split. It intentionally perturbs the
+command-buffer schedule and is for diagnosis, not headline throughput.
+`--profile-layers` also logs per-shard/per-reader I/O work. The measured M5
+default is eight readers per shard; compare safely with `--io-lanes 4`.
+
+`--tensorops` enables an experimental M5 MPP QMM prefill path. It is faster,
+but it reassociates FP32 reductions and has not passed strict logit/routing
+parity. Do not use it for strict acceptance runs.
+
 For numerical fingerprints and top logits:
 
 ```sh
@@ -154,11 +170,11 @@ metalblok/build/metalblok --validate-router
   shard before reading payload.
 - The memory ledger refuses a context that cannot preserve host headroom.
 - Model payload reads use `F_NOCACHE`, no read-ahead, reusable aligned shared
-  buffers, and fail the process on any short or failed read.
+  buffers, eight measured readers per shard, and fail the process on any short
+  or failed read. `--io-lanes {2,4,8}` is the bounded fallback/tuning control.
 - Metal command-buffer faults abort with the last kernel name.
 - Checkpoints use `.partial`, flush, `fsync`, and atomic rename. A partial file
   is never silently treated as authoritative.
 - One wrapper lock prevents concurrent runs from competing for the 24 GB
   unified-memory and SSD working set. Multi-request scheduling is future work,
   not a V0 claim.
-

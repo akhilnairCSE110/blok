@@ -2249,9 +2249,8 @@ kernel void expert_gate_up_swiglu_iq1_s_b(
     device float* y [[buffer(3)]],
     device const ulong* grid [[buffer(4)]],
     constant uint* tokens [[buffer(5)]],
-    constant uint& count [[buffer(6)]],
-    constant uint& H [[buffer(7)]],
-    constant uint& Fe [[buffer(8)]],
+    constant uint& H [[buffer(6)]],
+    constant uint& Fe [[buffer(7)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]) {
     constexpr uint tgs = 32;
@@ -2266,90 +2265,6 @@ kernel void expert_gate_up_swiglu_iq1_s_b(
                                           nblk, tid, tgs), tid, tgs, scratch);
     if (tid == 0) y[(size_t)item * Fe + row] =
         (gate / (1.0f + exp(-gate))) * up;
-}
-
-inline float4 iq1s_partial_b4(device const uchar* Wrow,
-                              device const float* x0,
-                              device const float* x1,
-                              device const float* x2,
-                              device const float* x3,
-                              device const ulong* grid,
-                              uint nblk, uint tid) {
-    float4 acc = 0.0f;
-    for (uint b = tid; b < nblk; b += 32) {
-        device const uchar* blk = Wrow + (size_t)b * 50;
-        const float d = float(as_type<half>(((device const ushort*)blk)[0]));
-        device const uchar* qs = blk + 2;
-        device const ushort* qh = (device const ushort*)(blk + 34);
-        const size_t xb = (size_t)b * 256;
-        for (uint sub = 0; sub < 8; ++sub) {
-            const ushort q = qh[sub];
-            const float dl = d * float(2u * uint((q >> 12) & 7u) + 1u);
-            const float delta = (q & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
-            for (uint g = 0; g < 4; ++g) {
-                const uint idx = uint(qs[sub * 4 + g]) |
-                    (uint((q >> (3 * g)) & 7u) << 8);
-                const ulong code = grid[idx];
-                const size_t base = xb + sub * 32 + g * 8;
-                float4 local = 0.0f;
-                #pragma clang loop unroll(full)
-                for (uint j = 0; j < 8; ++j) {
-                    const float weight =
-                        float(int(char((code >> (8 * j)) & 0xff))) + delta;
-                    local += weight * float4(x0[base + j], x1[base + j],
-                                              x2[base + j], x3[base + j]);
-                }
-                acc += dl * local;
-            }
-        }
-    }
-    return acc;
-}
-
-kernel void expert_gate_up_swiglu_iq1_s_b4(
-    device const uchar* Wg [[buffer(0)]],
-    device const uchar* Wu [[buffer(1)]],
-    device const float* x [[buffer(2)]],
-    device float* y [[buffer(3)]],
-    device const ulong* grid [[buffer(4)]],
-    constant uint* tokens [[buffer(5)]],
-    constant uint& count [[buffer(6)]],
-    constant uint& H [[buffer(7)]],
-    constant uint& Fe [[buffer(8)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]]) {
-    const uint row = group.x, item = group.y * 4;
-    const uint i1 = min(item + 1, count - 1);
-    const uint i2 = min(item + 2, count - 1);
-    const uint i3 = min(item + 3, count - 1);
-    device const float* x0 = x + (size_t)tokens[item] * H;
-    device const float* x1 = x + (size_t)tokens[i1] * H;
-    device const float* x2 = x + (size_t)tokens[i2] * H;
-    device const float* x3 = x + (size_t)tokens[i3] * H;
-    const uint nblk = H / 256;
-    const size_t stride = (size_t)nblk * 50;
-    const float4 gate_partial = iq1s_partial_b4(
-        Wg + row * stride, x0, x1, x2, x3, grid, nblk, tid);
-    threadgroup float scratch[32];
-    float4 gate;
-    gate.x = tg_reduce_sum(gate_partial.x, tid, 32, scratch);
-    gate.y = tg_reduce_sum(gate_partial.y, tid, 32, scratch);
-    gate.z = tg_reduce_sum(gate_partial.z, tid, 32, scratch);
-    gate.w = tg_reduce_sum(gate_partial.w, tid, 32, scratch);
-    const float4 up_partial = iq1s_partial_b4(
-        Wu + row * stride, x0, x1, x2, x3, grid, nblk, tid);
-    float4 up;
-    up.x = tg_reduce_sum(up_partial.x, tid, 32, scratch);
-    up.y = tg_reduce_sum(up_partial.y, tid, 32, scratch);
-    up.z = tg_reduce_sum(up_partial.z, tid, 32, scratch);
-    up.w = tg_reduce_sum(up_partial.w, tid, 32, scratch);
-    if (tid == 0) {
-        const float4 value = (gate / (1.0f + exp(-gate))) * up;
-        y[(size_t)item * Fe + row] = value.x;
-        if (item + 1 < count) y[(size_t)(item + 1) * Fe + row] = value.y;
-        if (item + 2 < count) y[(size_t)(item + 2) * Fe + row] = value.z;
-        if (item + 3 < count) y[(size_t)(item + 3) * Fe + row] = value.w;
-    }
 }
 
 kernel void expert_down_iq1_s_b(

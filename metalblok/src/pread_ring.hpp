@@ -1,8 +1,8 @@
 // src/pread_ring.hpp
 // ---------------------------------------------------------------------------
-// Async pread ring: 1 worker thread per shard, each owning an F_NOCACHE fd
-// and an SPSC request queue. Caller supplies the destination buffer; the
-// worker pread()s directly into it and flips *done to true on completion.
+// Async pread ring: a measured number of worker lanes per shard, each owning
+// an F_NOCACHE fd and two SPSC request queues. Caller supplies the destination
+// buffer; the worker pread()s directly into it and publishes completion.
 //
 // Design contract (matches IO_PROBE_FINDINGS.md: pread+F_NOCACHE into a
 // reused aligned buffer = 5.8 GB/s, 0 pageouts):
@@ -31,7 +31,7 @@ public:
     // Per-shard outstanding request capacity. 64 lets the runtime overlap
     // many expert fetches without ever blocking on submit().
     static constexpr size_t kQueueCapacity = 64;
-    static constexpr size_t kDefaultLanesPerShard = 4;
+    static constexpr size_t kDefaultLanesPerShard = 8;
 
     // Open one fd per shard (O_RDONLY, then fcntl F_NOCACHE=1, F_RDAHEAD=0)
     // and spawn one worker thread per shard. On any failure, no fds remain

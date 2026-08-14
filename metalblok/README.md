@@ -43,6 +43,9 @@ For persistent chat and interruption recovery, read the
   complete output, checkpoint arithmetic, performance, and limitations.
 - [V0 closeout](docs/V0_CLOSEOUT.md): implemented schedule, rejected
   optimizations, measured deltas, logging contract, and acceptance artifacts.
+- [Strict M5 performance closeout](docs/PERFORMANCE_CLOSEOUT_2026-08-14.md):
+  accepted exact speedups, operation/I/O profiles, rejected kernels, and the
+  measured remaining wall-time floor.
 - [Tensor/hardware specification](docs/TENSOR_HARDWARE_SPEC.md): normative
   shapes, exact expanded-KV contract, buffer ownership, and kernels.
 - [Evidence ledger](docs/EVIDENCE_AND_REPRODUCIBILITY.md): commands, saved

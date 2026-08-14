@@ -101,9 +101,7 @@ def arguments() -> argparse.Namespace:
                         help="use explicit compact MLA mode for long context")
     parser.add_argument("--tensorops", action="store_true",
                         help="experimental faster prefill with reassociated TensorOps reductions")
-    parser.add_argument("--expert-tile", type=int, choices=(1, 4), default=1,
-                        help="routed IQ1 token-reuse tile (default: 1)")
-    parser.add_argument("--io-lanes", type=int, choices=(2, 4, 8), default=4,
+    parser.add_argument("--io-lanes", type=int, choices=(2, 4, 8), default=8,
                         help="independent F_NOCACHE readers per model shard")
     parser.add_argument("--validate-mla", action="store_true",
                         help="dual-run reference/online MLA at context 1024 and log error")
@@ -176,7 +174,6 @@ def run(args: argparse.Namespace) -> int:
         env["METALBLOK_PROFILE_OPS"] = "1"
     if args.tensorops:
         env["METALBLOK_TENSOROPS"] = "1"
-    env["METALBLOK_EXPERT_TILE"] = str(args.expert_tile)
     env["METALBLOK_IO_LANES"] = str(args.io_lanes)
     if args.validate_mla:
         if not args.mla:

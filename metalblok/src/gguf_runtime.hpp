@@ -173,7 +173,6 @@ private:
     Metal*       mtl_ = nullptr;
     GgufConfig   cfg_{};
     uint32_t     pos_ = 0;       // KV-cache position counter
-    uint32_t     expert_tile_ = 1;
     float        temperature_ = 0.0f;
     float        top_p_ = 0.95f;
     uint64_t     seed_ = 3407;

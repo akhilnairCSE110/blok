@@ -27,3 +27,10 @@ The exact artifacts and complete implementation record are in
 
 The full prompt, decoded output, segment arithmetic, metrics, quality judgment,
 and limitations are in [`docs/PROOF_1K_REPORT.md`](docs/PROOF_1K_REPORT.md).
+
+The 2026-08-14 strict M5 pass preserved token `33001` and reference-scale
+logits while reducing the 128-token/128K-capacity probe from 37.444 to 35.148
+seconds (3.418 to 3.642 token/s). It cut dispatches by 29.2% and exposed I/O
+wait by 10.0%. This is a measured 6.1% wall-time improvement, not a 10x claim.
+Exact accepted/rejected evidence is in
+[`docs/PERFORMANCE_CLOSEOUT_2026-08-14.md`](docs/PERFORMANCE_CLOSEOUT_2026-08-14.md).

@@ -155,11 +155,6 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
     profile_ops_ = std::getenv("METALBLOK_PROFILE_OPS") != nullptr;
     profile_layers_ |= profile_ops_;
     tensorops_ = std::getenv("METALBLOK_TENSOROPS") != nullptr;
-    if (const char* s = std::getenv("METALBLOK_EXPERT_TILE")) {
-        expert_tile_ = uint32_t(std::strtoul(s, nullptr, 10));
-        if (expert_tile_ != 1 && expert_tile_ != 4)
-            die("expert tile must be 1 or 4");
-    }
     compact_mla_ = std::getenv("METALBLOK_MLA") != nullptr;
     validate_mla_ = std::getenv("METALBLOK_VALIDATE_MLA") != nullptr;
     if (validate_mla_ && !compact_mla_) die("MLA validation requires compact MLA");
@@ -1707,13 +1702,11 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
             long long kernel_gpu = mtl_->step_gpu_us;
             int kernel_dispatches = mtl_->step_dispatches;
             if (gate.entry->type == GGML_IQ1_S && up.entry->type == GGML_IQ1_S) {
-                const bool tile4 = expert_tile_ == 4 && n >= 4;
-                mtl_->dispatch2d(tile4 ? "expert_gate_up_swiglu_iq1_s_b4" :
-                                        "expert_gate_up_swiglu_iq1_s_b",
+                mtl_->dispatch2d("expert_gate_up_swiglu_iq1_s_b",
                                  {gate.buffer, up.buffer, xn_b_, fa_b_, iq1s_grid_b_},
                                  {{tokens.data() + offset, size_t(n) * 4},
-                                  {&n,4},{&H,4},{&Fe,4}}, Fe,
-                                 tile4 ? (n + 3) / 4 : n, 32);
+                                  {&H,4},{&Fe,4}}, Fe,
+                                 n, 32);
             } else {
                 for (uint32_t item = 0; item < n; ++item) {
                     const auto input = row(xn_b_, tokens[offset + item], H);
