@@ -4,11 +4,11 @@
 // a 24-slot urgent arena. The output head, norms, codebooks, and a bounded
 // subset of small fixed projections remain resident.
 //
-// Activations and reductions are FP32. The v3 checkpoint stores the combined
-// attn_kv_b graph's expanded FP16 non-RoPE K, V, and shared RoPE K exactly.
-// This costs 4,005,504 bytes per committed sequence position. Real-arithmetic
-// latent absorption is deliberately not used because its finite-precision
-// reassociation failed the token-parity release contract for this checkpoint.
+// Activations and reductions are FP32. The default v3 checkpoint stores the
+// combined attn_kv_b graph's expanded FP16 K/V. Explicit --mla mode keeps the
+// normalized 512-wide latent plus 64 rotary values and applies the same fixed
+// KV-B matrix on the query/value sides. The modes have distinct state formats;
+// the accepted expanded path remains the finite-precision oracle.
 #pragma once
 
 #include "gguf.hpp"
@@ -91,6 +91,8 @@ public:
 
     const GgufConfig& cfg() const { return cfg_; }
     uint32_t          pos() const { return pos_; }
+    // The measured 128-token tile balances routed-expert reuse against GPU
+    // occupancy and a 192 MB activation workspace on the 24 GB M5 target.
     static constexpr uint32_t kPrefillBatch = 128;
     static constexpr uint32_t prefill_batch_size() { return kPrefillBatch; }
 
@@ -140,6 +142,9 @@ private:
     Projection load_projection_(const std::string& name, uint32_t K, uint32_t N);
     void dispatch_projection_(const Projection& projection,
                               const MtlBuf& x, const MtlBuf& y);
+    void dispatch_projection_batch_(const Projection& projection,
+                                    const MtlBuf& x, const MtlBuf& y,
+                                    uint32_t count);
 
     // Resolve one quantized embedding row into an FP32 activation. The pinned
     // Q4_K embedding row is 4,032 stored bytes.
@@ -173,6 +178,8 @@ private:
     uint64_t     seed_ = 3407;
     bool         trace_ = false;
     bool         profile_layers_ = false;
+    bool         compact_mla_ = false;
+    bool         validate_mla_ = false;
 
     // Per-layer resident FP32 weights plus projection descriptors.
     struct LayerResident {
@@ -192,10 +199,12 @@ private:
     std::array<MtlBuf, 2> layer_stage_{};
     std::array<std::array<std::atomic<bool>, 9>, 2> layer_ready_{};
     std::array<long long, 2> layer_stage_started_{};
-    static constexpr uint32_t kExpertSlots = 24;
+    static constexpr uint32_t kDecodeExpertSlots = 24;
+    static constexpr uint32_t kExpertSlots = 48;
     std::array<MtlBuf, kExpertSlots> expert_slots_{};
     std::array<std::atomic<bool>, kExpertSlots> expert_ready_{};
     uint32_t expert_slot_cursor_ = 0;
+    size_t expert_slot_bytes_ = 0;
 
     // Global resident output norm (f32).
     MtlBuf output_norm_b_;
@@ -203,9 +212,9 @@ private:
     // Activations and scratch are FP32 unless noted.
     MtlBuf x_, x_norm_;
     MtlBuf q_a_, q_a_n_;
-    MtlBuf q_full_, q_nope_, q_rope_;
+    MtlBuf q_full_, q_nope_, q_rope_, q_eff_;
     MtlBuf kv_a_, kv_lat_, kv_full_;
-    MtlBuf o_full_, attn_out_;
+    MtlBuf o_lat_, o_lat_ref_, o_full_, attn_out_;
     MtlBuf ffn_gate_, ffn_up_, ffn_act_, ffn_out_, expert_tmp_;
     MtlBuf router_log_;     // [Ne]    f32
     MtlBuf router_idx_;     // [K]     u32
@@ -213,10 +222,10 @@ private:
     MtlBuf logits_;         // [V]     f32
     MtlBuf next_tok_;       // [1]     u32
 
-    // DeepSeek-R1 layer-major prefill tile. At 128 tokens nearly every
-    // expert selected by the tile is loaded once instead of once per token.
+    // DeepSeek-R1 layer-major prefill tile. Tokens selecting the same expert
+    // share one exact weight load within the tile.
     MtlBuf x_b_, xn_b_, qa_b_, qan_b_, qf_b_, qn_b_, qr_b_;
-    MtlBuf kva_b_, kvlat_b_, kvfull_b_, ofull_b_, attnout_b_;
+    MtlBuf kva_b_, kvlat_b_, kvfull_b_, qeff_b_, olat_b_, ofull_b_, attnout_b_;
     MtlBuf fg_b_, fu_b_, fa_b_, fo_b_, rlog_b_, ridx_b_, rwts_b_, routed_b_;
 
     // KV cache + scores scratch.
@@ -224,8 +233,11 @@ private:
     // cache resident whenever one layer binds it.
     std::vector<MtlBuf> k_nope_;  // each [max_seq, HE, Dn] f16
     std::vector<MtlBuf> v_cache_; // each [max_seq, HE, Dv] f16
+    std::vector<MtlBuf> c_kv_;    // --mla: each [max_seq, Lk] f16
     std::vector<MtlBuf> k_rope_;  // each [max_seq, Dr]     f16
     MtlBuf scores_;         // [HE, max_seq]             f32
+    MtlBuf attn_partials_;  // --mla long path: [HE, 32, Lk] f32
+    MtlBuf attn_stats_;     // --mla long path: [HE, 32, 2]  f32
 
     // Vendored codebook grids copied once into Metal-owned shared buffers.
     MtlBuf iq1s_grid_b_;
@@ -240,6 +252,12 @@ private:
     uint64_t step_reads_ = 0;
     uint64_t step_allocations_ = 0;
     long long step_io_wait_us_ = 0;
+
+    void build_absorbed_kv_();
+    void mla_attn_compact_(uint32_t layer);
+    void attention_batch_compact_(uint32_t layer, uint32_t count);
+    void validate_mla_output_(uint32_t layer, uint32_t context,
+                              const MtlBuf& reference, const MtlBuf& candidate) const;
 };
 
 } // namespace blade

@@ -47,8 +47,10 @@ inline void swiglu(Metal& g, const MtlBuf& gate, const MtlBuf& up, const MtlBuf&
 }
 
 inline void rmsnorm_f32(Metal& g, const MtlBuf& x, const MtlBuf& gain,
-                        const MtlBuf& y, uint32_t H, float eps) {
-    g.dispatch("rms_norm_f32", {x, gain, y}, {{&H,4},{&eps,4}}, 1, TG_RED, true);
+                        const MtlBuf& y, uint32_t H, float eps,
+                        uint32_t B = 1) {
+    g.dispatch(B == 1 ? "rms_norm_f32" : "rms_norm_f32_b",
+               {x, gain, y}, {{&H,4},{&eps,4}}, B, TG_RED, true);
 }
 inline void axpy_f32(Metal& g, const MtlBuf& y, const MtlBuf& x,
                      float a, uint32_t N) {

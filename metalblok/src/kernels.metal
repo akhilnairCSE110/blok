@@ -110,6 +110,26 @@ kernel void rms_norm_f32(
     for (uint i = tid; i < H; i += tgs) y[i] = x[i] * inv * gain[i];
 }
 
+// The same reduction tree as rms_norm_f32, with one independent threadgroup
+// per prompt row. Batching changes submission only, never arithmetic order.
+kernel void rms_norm_f32_b(
+    device const float* x    [[buffer(0)]],
+    device const float* gain [[buffer(1)]],
+    device       float* y    [[buffer(2)]],
+    constant uint&      H    [[buffer(3)]],
+    constant float&     eps  [[buffer(4)]],
+    uint b   [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]) {
+    threadgroup float scratch[32];
+    device const float* xb = x + (size_t)b * H;
+    device float* yb = y + (size_t)b * H;
+    float acc = 0.0f;
+    for (uint i = tid; i < H; i += tgs) acc += xb[i] * xb[i];
+    float inv = rsqrt(tg_reduce_sum(acc, tid, tgs, scratch) / float(H) + eps);
+    for (uint i = tid; i < H; i += tgs) yb[i] = xb[i] * inv * gain[i];
+}
+
 // ---------- FP8 GEMV: y[M] = W[M,K] @ x[ row/group_size , : ] -------------
 // One TG per output row.  Pass group_size = M for a plain (non-grouped) GEMV
 // (every row then reads x from offset 0).  Grouped form is used by the MLA
@@ -361,6 +381,41 @@ kernel void mha_kv_norm_rope_r1(
     }
 }
 
+// Compact --mla path. Normalize and commit the latent directly, avoiding the
+// 32,768-wide KV-B expansion and its 4,005,504-byte/position expanded cache.
+// This is a distinct opt-in graph; the default kernel above remains unchanged.
+kernel void mla_kv_norm_rope_store_r1(
+    device const float* kv_a         [[buffer(0)]],
+    device const float* kv_a_norm    [[buffer(1)]],
+    device       half*  c_kv_cache   [[buffer(2)]],
+    device       half*  k_rope_cache [[buffer(3)]],
+    constant uint& Lk      [[buffer(4)]],
+    constant uint& Dr      [[buffer(5)]],
+    constant uint& pos     [[buffer(6)]],
+    constant uint& max_seq [[buffer(7)]],
+    constant float& eps    [[buffer(8)]],
+    constant float& theta  [[buffer(9)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float scratch[32];
+    float acc = 0.0f;
+    for (uint i = tid; i < Lk; i += tgs) acc += kv_a[i] * kv_a[i];
+    float inv = rsqrt(tg_reduce_sum(acc, tid, tgs, scratch) / float(Lk) + eps);
+    device half* latent = c_kv_cache + (size_t)pos * Lk;
+    for (uint i = tid; i < Lk; i += tgs)
+        latent[i] = half(kv_a[i] * inv * kv_a_norm[i]);
+
+    device half* rope = k_rope_cache + (size_t)pos * Dr;
+    for (uint pair = tid; pair < Dr / 2; pair += tgs) {
+        float angle = deepseek_r1_yarn_angle(pos, pair, Dr, theta);
+        float c = cos(angle), s = sin(angle);
+        float a = kv_a[Lk + 2u * pair], b = kv_a[Lk + 2u * pair + 1u];
+        rope[2u * pair] = half(a * c - b * s);
+        rope[2u * pair + 1u] = half(b * c + a * s);
+    }
+}
+
 kernel void mha_kv_store_f16(
     device const float* kv_full [[buffer(0)]], // [HE, Dn+Dv]
     device       half*  k_cache [[buffer(1)]], // [L,max_seq,HE,Dn]
@@ -535,6 +590,213 @@ kernel void mla_attn_decode_f32(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device float* oh = o_lat + (size_t)h * Lk;
     for (uint i = tid; i < Lk; i += tgs) oh[i] = oacc[i] * inv;
+}
+
+// Exact short-prefill specialization for the pinned R1 geometry. Four causal
+// queries share every compact KV load, while each query retains the scalar
+// dot-product order, 256-lane softmax reduction tree, and ascending-T value
+// accumulation of mla_attn_decode_f32.
+kernel void mla_attn_prefill_r1_q4(
+    device const float* q_eff [[buffer(0)]],
+    device const float* q_rope [[buffer(1)]],
+    device const half* c_kv [[buffer(2)]],
+    device const half* k_rope [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint& HE [[buffer(5)]],
+    constant uint& B [[buffer(6)]],
+    constant uint& pos [[buffer(7)]],
+    constant uint& max_seq [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    constexpr uint Lk = 512, Dr = 64, BQ = 4, MAX_T = 1024, tgs = 256;
+    const uint head = group.x, b0 = group.y * BQ;
+    device const half* ck0 = c_kv;
+    device const half* kr0 = k_rope;
+    threadgroup float scratch[32];
+    threadgroup float scores[BQ * MAX_T];
+    threadgroup float numerators[BQ * Lk];
+    float inverse[BQ];
+    float local_max[BQ];
+#pragma unroll
+    for (uint q = 0; q < BQ; ++q) local_max[q] = -INFINITY;
+
+    const uint last_b = min(b0 + BQ, B) - 1;
+    const uint max_T = pos + last_b + 1;
+    for (uint t = tid; t < max_T; t += tgs) {
+        device const half* ck = ck0 + (size_t)t * Lk;
+        device const half* kr = kr0 + (size_t)t * Dr;
+        float score[BQ] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint i = 0; i < Lk; ++i) {
+            const float key = float(ck[i]);
+#pragma unroll
+            for (uint q = 0; q < BQ; ++q) {
+                const uint b = b0 + q;
+                if (b < B && t <= pos + b)
+                    score[q] += q_eff[((size_t)b * HE + head) * Lk + i] * key;
+            }
+        }
+        for (uint i = 0; i < Dr; ++i) {
+            const float key = float(kr[i]);
+#pragma unroll
+            for (uint q = 0; q < BQ; ++q) {
+                const uint b = b0 + q;
+                if (b < B && t <= pos + b)
+                    score[q] += q_rope[((size_t)b * HE + head) * Dr + i] * key;
+            }
+        }
+#pragma unroll
+        for (uint q = 0; q < BQ; ++q) {
+            const uint b = b0 + q;
+            if (b < B && t <= pos + b) {
+                score[q] *= scale;
+                scores[q * MAX_T + t] = score[q];
+                local_max[q] = max(local_max[q], score[q]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (uint q = 0; q < BQ; ++q) {
+        const uint b = b0 + q;
+        if (b >= B) { inverse[q] = 0.0f; continue; }
+        const uint T = pos + b + 1;
+        threadgroup float* sc = scores + q * MAX_T;
+        const float global_max = tg_reduce_max(local_max[q], tid, tgs, scratch);
+        float local_sum = 0.0f;
+        for (uint t = tid; t < T; t += tgs) {
+            const float value = exp(sc[t] - global_max);
+            sc[t] = value;
+            local_sum += value;
+        }
+        inverse[q] = 1.0f / tg_reduce_sum(local_sum, tid, tgs, scratch);
+    }
+
+    for (uint q = 0; q < BQ; ++q)
+        for (uint i = tid; i < Lk; i += tgs)
+            numerators[q * Lk + i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint t = 0; t < max_T; ++t) {
+        device const half* cv = ck0 + (size_t)t * Lk;
+        for (uint i = tid; i < Lk; i += tgs) {
+            const float value = float(cv[i]);
+#pragma unroll
+            for (uint q = 0; q < BQ; ++q) {
+                const uint b = b0 + q;
+                if (b < B && t <= pos + b)
+                    numerators[q * Lk + i] += scores[q * MAX_T + t] * value;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+    for (uint q = 0; q < BQ; ++q) {
+        const uint b = b0 + q;
+        if (b >= B) continue;
+        device float* dst = out + ((size_t)b * HE + head) * Lk;
+        for (uint i = tid; i < Lk; i += tgs)
+            dst[i] = numerators[q * Lk + i] * inverse[q];
+    }
+}
+
+// DeepSeek-R1 long-context MLA. The pinned geometry (latent 512, RoPE 64)
+// maps exactly to one SIMD-group: every lane keeps 16 latent values in
+// registers, contributes two RoPE values, and reuses the latent load for the
+// value accumulation. Thirty-two temporal blocks expose enough independent
+// work to saturate M5 while bounding global scratch independently of context.
+// Pass 1 uses the exact online-softmax recurrence per block:
+//   m' = max(m,s), l' = exp(m-m')l + exp(s-m')
+//   o' = exp(m-m')o + exp(s-m')v.
+kernel void mla_attn_online_r1_pass1(
+    device const float* q_eff [[buffer(0)]],
+    device const float* q_rope [[buffer(1)]],
+    device const half* c_kv [[buffer(2)]],
+    device const half* k_rope [[buffer(3)]],
+    device float* partials [[buffer(4)]],
+    device float* stats [[buffer(5)]],
+    constant uint& T [[buffer(6)]],
+    constant uint& max_seq [[buffer(7)]],
+    constant float& scale [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    constexpr uint Lk = 512;
+    constexpr uint Dr = 64;
+    constexpr uint blocks = 32;
+    const uint block = group.x;
+    const uint head = group.y;
+    const uint begin = uint((ulong(T) * block) / blocks);
+    const uint end = uint((ulong(T) * (block + 1)) / blocks);
+    device const float* qe = q_eff + (size_t)head * Lk;
+    device const float* qr = q_rope + (size_t)head * Dr;
+    float out[16];
+#pragma unroll
+    for (uint j = 0; j < 16; ++j) out[j] = 0.0f;
+    float block_max = -INFINITY;
+    float block_sum = 0.0f;
+
+    for (uint t = begin; t < end; ++t) {
+        device const half* cv = c_kv + (size_t)t * Lk;
+        device const half* rv = k_rope + (size_t)t * Dr;
+        half values[16];
+        float dot = qr[lane] * float(rv[lane])
+                  + qr[lane + 32] * float(rv[lane + 32]);
+#pragma unroll
+        for (uint j = 0; j < 16; ++j) {
+            const uint i = lane + j * 32;
+            values[j] = cv[i];
+            dot += qe[i] * float(values[j]);
+        }
+        const float score = simd_sum(dot) * scale;
+        const float next_max = max(block_max, score);
+        const float old_scale = exp(block_max - next_max);
+        const float new_scale = exp(score - next_max);
+#pragma unroll
+        for (uint j = 0; j < 16; ++j)
+            out[j] = old_scale * out[j] + new_scale * float(values[j]);
+        block_sum = old_scale * block_sum + new_scale;
+        block_max = next_max;
+    }
+
+    device float* dst = partials + ((size_t)head * blocks + block) * Lk;
+#pragma unroll
+    for (uint j = 0; j < 16; ++j) dst[lane + j * 32] = out[j];
+    if (lane == 0) {
+        const size_t stat = ((size_t)head * blocks + block) * 2;
+        stats[stat] = block_max;
+        stats[stat + 1] = block_sum;
+    }
+}
+
+// Merge the block-local (max, denominator, numerator) triples with the same
+// log-sum-exp identity. One SIMD-group owns a head and writes 512 outputs.
+kernel void mla_attn_online_r1_pass2(
+    device const float* partials [[buffer(0)]],
+    device const float* stats [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    constexpr uint Lk = 512;
+    constexpr uint blocks = 32;
+    const size_t stats_base = (size_t)head * blocks * 2;
+    const float global_max = simd_max(stats[stats_base + lane * 2]);
+    const float local_sum = stats[stats_base + lane * 2 + 1] *
+                            exp(stats[stats_base + lane * 2] - global_max);
+    const float denominator = simd_sum(local_sum);
+    float merged[16];
+#pragma unroll
+    for (uint j = 0; j < 16; ++j) merged[j] = 0.0f;
+    for (uint block = 0; block < blocks; ++block) {
+        const float factor = exp(stats[stats_base + block * 2] - global_max);
+        device const float* src = partials +
+            ((size_t)head * blocks + block) * Lk;
+#pragma unroll
+        for (uint j = 0; j < 16; ++j)
+            merged[j] += factor * src[lane + j * 32];
+    }
+    device float* dst = out + (size_t)head * Lk;
+#pragma unroll
+    for (uint j = 0; j < 16; ++j)
+        dst[lane + j * 32] = merged[j] / denominator;
 }
 
 // Legacy .blade/HF path; the GGUF parity path above keeps activations f32.
@@ -1379,18 +1641,9 @@ kernel void scatter_add_weighted_f16(
 //     (same ql byte, different shift).  The 2-bit qh expansion likewise
 //     shares one qh byte across all four sub-quads.
 
-kernel void gemv_q6_K_f32(
-    device const uchar*  W       [[buffer(0)]],   // raw bytes, 210 * nblk per row
-    device const float*  x       [[buffer(1)]],   // length K
-    device       float*  y       [[buffer(2)]],   // length n_rows
-    constant uint&       K       [[buffer(3)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tgs [[threads_per_threadgroup]])
-{
-    const uint nblk = K / 256;
-    device const uchar* Wrow = W + (size_t)row * nblk * 210;
-
+inline float q6_k_partial(device const uchar* Wrow,
+                          device const float* x,
+                          uint nblk, uint tid, uint tgs) {
     float acc = 0.0f;
     for (uint b = tid; b < nblk; b += tgs) {
         device const uchar* blk = Wrow + (size_t)b * 210;
@@ -1427,10 +1680,161 @@ kernel void gemv_q6_K_f32(
             acc += d * local;
         }
     }
+    return acc;
+}
+
+kernel void gemv_q6_K_f32(
+    device const uchar*  W       [[buffer(0)]],   // raw bytes, 210 * nblk per row
+    device const float*  x       [[buffer(1)]],   // length K
+    device       float*  y       [[buffer(2)]],   // length n_rows
+    constant uint&       K       [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]])
+{
+    const uint nblk = K / 256;
+    device const uchar* Wrow = W + (size_t)row * nblk * 210;
+    const float acc = q6_k_partial(Wrow, x, nblk, tid, tgs);
 
     threadgroup float scratch[32];
     float v = tg_reduce_sum(acc, tid, tgs, scratch);
     if (tid == 0) y[row] = v;
+}
+
+// R1 shared-expert down specialization: K=2048 is exactly eight Q6_K
+// blocks. Four rows share one SIMD-group, eliminating the 24 idle lanes in
+// the generic one-row mapping while reading the identical quantized bytes.
+kernel void gemv_q6_K_f32_r4(
+    device const uchar* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    uint row4 [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    const uint lane = tid & 7u;
+    const uint row = row4 * 4u + (tid >> 3);
+    constexpr uint nblk = 8;
+    device const uchar* Wrow = W + (size_t)row * nblk * 210;
+    float value = q6_k_partial(Wrow, x, nblk, lane, 8);
+    value += simd_shuffle_down(value, 4);
+    value += simd_shuffle_down(value, 2);
+    value += simd_shuffle_down(value, 1);
+    if (lane == 0) y[row] = value;
+}
+
+// Prefill submission variants. Each (prompt,row) threadgroup executes the
+// identical dot product and reduction as its decode counterpart; the 2-D grid
+// lets Metal schedule adjacent prompt rows against the same resident weights.
+kernel void gemv_q6_K_f32_b(
+    device const uchar* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    constexpr uint tgs = 32;
+    const uint row = group.x, batch = group.y;
+    const uint nblk = K / 256;
+    device const uchar* Wrow = W + (size_t)row * nblk * 210;
+    device const float* xb = x + (size_t)batch * K;
+    threadgroup float scratch[32];
+    const float value = tg_reduce_sum(q6_k_partial(Wrow, xb, nblk, tid, tgs),
+                                      tid, tgs, scratch);
+    if (tid == 0) y[(size_t)batch * N + row] = value;
+}
+
+kernel void gemv_q6_K_f32_r4_b(
+    device const uchar* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    const uint lane = tid & 7u;
+    const uint row = group.x * 4u + (tid >> 3);
+    const uint batch = group.y;
+    constexpr uint nblk = 8;
+    device const uchar* Wrow = W + (size_t)row * nblk * 210;
+    device const float* xb = x + (size_t)batch * K;
+    float value = q6_k_partial(Wrow, xb, nblk, lane, 8);
+    value += simd_shuffle_down(value, 4);
+    value += simd_shuffle_down(value, 2);
+    value += simd_shuffle_down(value, 1);
+    if (lane == 0) y[(size_t)batch * N + row] = value;
+}
+
+// Read one coefficient from a Q6_K row without expanding the tensor.  The
+// R1 KV-B matrix is fixed at K=Lk=512, so its two absorbed MLA products can
+// operate on the original 0.82-byte/weight representation held in UMA.
+inline float q6_k_value(device const uchar* row, uint column) {
+    device const uchar* blk = row + (size_t)(column >> 8) * 210;
+    const uint index = column & 255u;
+    const uint half_index = index >> 7;
+    const uint within = index & 127u;
+    const uint quarter = within >> 5;
+    const uint lane = within & 31u;
+    device const uchar* ql = blk + half_index * 64;
+    const uchar qlb = ql[lane + ((quarter & 1u) << 5)];
+    const uchar qhb = blk[128 + half_index * 32 + lane];
+    const uint low = quarter < 2 ? (qlb & 15u) : (qlb >> 4);
+    const uint high = (qhb >> (quarter * 2)) & 3u;
+    const int q = int(low | (high << 4)) - 32;
+    const char scale = ((device const char*)(blk + 192))[half_index * 8 +
+                                                              quarter * 2 + (lane >> 4)];
+    const ushort dh = ((device const ushort*)(blk + 208))[0];
+    return float(as_type<half>(dh)) * float(scale) * float(q);
+}
+
+// q_eff[h,k] = sum_d W_kv_b[h,d,k] * q_nope[h,d].  Reading the transposed
+// product directly from compressed Q6_K removes the former 4.09 GB FP32
+// expansion and its 4.09 GB/token UMA read.  One TG owns one (head,latent)
+// output, so accumulation and reduction order are deterministic.
+kernel void mla_q6_kv_b_query_r1(
+    device const uchar* W      [[buffer(0)]],
+    device const float* q      [[buffer(1)]],
+    device       float* y      [[buffer(2)]],
+    constant uint& Lk          [[buffer(3)]],
+    constant uint& Dn          [[buffer(4)]],
+    constant uint& Dv          [[buffer(5)]],
+    uint output [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]) {
+    const uint head = output / Lk;
+    const uint latent = output - head * Lk;
+    const uint row_bytes = (Lk >> 8) * 210;
+    device const float* qh = q + (size_t)head * Dn;
+    const uint row0 = head * (Dn + Dv);
+    float acc = 0.0f;
+    for (uint d = tid; d < Dn; d += tgs)
+        acc += q6_k_value(W + (size_t)(row0 + d) * row_bytes, latent) * qh[d];
+    threadgroup float scratch[32];
+    const float result = tg_reduce_sum(acc, tid, tgs, scratch);
+    if (tid == 0) y[output] = result;
+}
+
+// o_full[h,d] = sum_k W_kv_b[h,Dn+d,k] * o_lat[h,k].
+kernel void mla_q6_kv_b_value_r1(
+    device const uchar* W      [[buffer(0)]],
+    device const float* o_lat  [[buffer(1)]],
+    device       float* y      [[buffer(2)]],
+    constant uint& Lk          [[buffer(3)]],
+    constant uint& Dn          [[buffer(4)]],
+    constant uint& Dv          [[buffer(5)]],
+    uint output [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]) {
+    const uint head = output / Dv;
+    const uint dim = output - head * Dv;
+    const uint row_bytes = (Lk >> 8) * 210;
+    device const uchar* wr = W + (size_t)(head * (Dn + Dv) + Dn + dim) * row_bytes;
+    device const float* oh = o_lat + (size_t)head * Lk;
+    float acc = 0.0f;
+    for (uint k = tid; k < Lk; k += tgs) acc += q6_k_value(wr, k) * oh[k];
+    threadgroup float scratch[32];
+    const float result = tg_reduce_sum(acc, tid, tgs, scratch);
+    if (tid == 0) y[output] = result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1583,6 +1987,26 @@ kernel void gemv_iq1_s_f32(
     if (tid == 0) y[row] = v;
 }
 
+kernel void gemv_iq1_s_f32_b(
+    device const uchar* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    device const ulong* grid [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    constexpr uint tgs = 32;
+    const uint row = group.x, batch = group.y;
+    const uint nblk = K / 256;
+    device const uchar* Wrow = W + (size_t)row * nblk * 50;
+    device const float* xb = x + (size_t)batch * K;
+    threadgroup float scratch[32];
+    const float value = tg_reduce_sum(iq1s_partial(Wrow, xb, grid, nblk, tid, tgs),
+                                      tid, tgs, scratch);
+    if (tid == 0) y[(size_t)batch * N + row] = value;
+}
+
 // DeepSeek-R1 routed SwiGLU: reuse x while computing the IQ1_S gate/up pair,
 // then round at the same fp16 boundaries as the unfused graph.
 kernel void expert_gate_up_swiglu_iq1_s(
@@ -1625,6 +2049,29 @@ kernel void expert_down_accum_iq1_s(
                                 tid, tgs, scratch);
     if (tid == 0)
         y[row] += alpha * value;
+}
+
+// R1 routed-down specialization: Fe=2048 is exactly eight IQ1_S blocks.
+// Four independent output rows share one 32-lane SIMD-group, so all lanes
+// perform useful work while retaining the same 8-value reduction tree.
+kernel void expert_down_accum_iq1_s_r4(
+    device const uchar* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    device const ulong* grid [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant float& alpha [[buffer(5)]],
+    uint row4 [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    const uint lane = tid & 7u;
+    const uint row = row4 * 4u + (tid >> 3);
+    const uint nblk = K / 256;
+    device const uchar* Wrow = W + (size_t)row * nblk * 50;
+    float value = iq1s_partial(Wrow, x, grid, nblk, lane, 8);
+    value += simd_shuffle_down(value, 4);
+    value += simd_shuffle_down(value, 2);
+    value += simd_shuffle_down(value, 1);
+    if (lane == 0) y[row] += alpha * value;
 }
 
 // Blocked prefill variants. Assignments sharing one expert execute together,
@@ -1676,6 +2123,29 @@ kernel void expert_down_iq1_s_b(
                                 tid, tgs, scratch);
     if (tid == 0)
         y[(size_t)slots[item] * H + row] = value;
+}
+
+kernel void expert_down_iq1_s_b_r4(
+    device const uchar* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    device const ulong* grid [[buffer(3)]],
+    constant uint* slots [[buffer(4)]],
+    constant uint& Fe [[buffer(5)]],
+    constant uint& H [[buffer(6)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    const uint lane = tid & 7u;
+    const uint row = group.x * 4u + (tid >> 3);
+    const uint item = group.y;
+    const uint nblk = Fe / 256;
+    device const uchar* Wrow = W + (size_t)row * nblk * 50;
+    device const float* input = x + (size_t)item * Fe;
+    float value = iq1s_partial(Wrow, input, grid, nblk, lane, 8);
+    value += simd_shuffle_down(value, 4);
+    value += simd_shuffle_down(value, 2);
+    value += simd_shuffle_down(value, 1);
+    if (lane == 0) y[(size_t)slots[item] * H + row] = value;
 }
 
 kernel void moe_residual_merge_f32(

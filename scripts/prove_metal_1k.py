@@ -33,7 +33,7 @@ def token_count(model: Path, prompt: str) -> int:
     return match.group(1).count(",") + 1
 
 
-def exact_prompt(model: Path) -> str:
+def exact_prompt(model: Path, target: int = TARGET) -> str:
     prefix = """Write a complete, production-quality Python 3 program named jsonl_report.py.
 It must use only the standard library, stream an arbitrarily large JSON Lines input file without loading it into memory, reject malformed records with line-numbered diagnostics, group valid records by a required string field named category, and compute count, sum, minimum, maximum, and numerically stable mean for a required finite numeric field named value. Add argparse options for input path, output path, and strict mode. Emit deterministic UTF-8 JSON with sorted categories and keys. Use compensated summation, explicit type checks that reject booleans as numbers, atomic output replacement, useful exit codes, type hints, docstrings, and a main guard. Include self-contained unittest cases runnable with python -m unittest, covering empty input, malformed JSON, missing fields, boolean values, non-finite values, strict mode, Unicode, deterministic ordering, and a successful multi-category file. Avoid third-party packages and network access.
 
@@ -46,25 +46,29 @@ Additional review constraints follow. Each repeated constraint is intentional an
     suffix = """
 Return one concise explanation followed by one complete Python code block. Do not omit tests, use placeholders, or claim behavior the code does not implement.
 """
+    if token_count(model, prefix + suffix) > target:
+        prefix = "Write a correct, typed Python function that returns the nth Fibonacci number.\n"
+        constraint = "Constraint: handle invalid input deterministically and use no dependencies.\n"
+        suffix = "\nReturn only the complete function.\n"
     prompt = prefix
-    while token_count(model, prompt + constraint + suffix) <= TARGET:
+    while token_count(model, prompt + constraint + suffix) <= target:
         prompt += constraint
 
     atoms = (" reliable", " typed", " tested", " clear", " safe", " exact", ".", "\n")
-    while (current := token_count(model, prompt + suffix)) < TARGET:
+    while (current := token_count(model, prompt + suffix)) < target:
         choices = [
             (token_count(model, prompt + atom + suffix), atom)
             for atom in atoms
         ]
-        choices = [choice for choice in choices if current < choice[0] <= TARGET]
+        choices = [choice for choice in choices if current < choice[0] <= target]
         if not choices:
             raise RuntimeError(f"could not pad prompt exactly from {current} tokens")
         _, atom = max(choices)
         prompt += atom
     prompt += suffix
     actual = token_count(model, prompt)
-    if actual != TARGET:
-        raise RuntimeError(f"constructed {actual}, not {TARGET}, input tokens")
+    if actual != target:
+        raise RuntimeError(f"constructed {actual}, not {target}, input tokens")
     return prompt
 
 
@@ -84,6 +88,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=MODEL)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--input-tokens", type=int, default=TARGET,
+                        help="exact prompt length (non-1000 values require --dry-run)")
+    parser.add_argument("--prompt-out", type=Path,
+                        help="write the exact 1,000-token prompt for another acceptance run")
     parser.add_argument("--resume-state", type=Path,
                         help="resume an exact checkpoint at position 1000..1998")
     args = parser.parse_args()
@@ -91,8 +99,12 @@ def main() -> int:
         subprocess.run(["cmake", "-S", str(ROOT / "metalblok"), "-B", str(BINARY.parent)], check=True)
         subprocess.run(["cmake", "--build", str(BINARY.parent), "-j", "8"], check=True)
 
-    prompt = exact_prompt(args.model)
+    if args.input_tokens != TARGET and not args.dry_run:
+        parser.error("non-1000 --input-tokens requires --dry-run")
+    prompt = exact_prompt(args.model, args.input_tokens)
     print(f"proof input: {token_count(args.model, prompt)} native tokens", file=sys.stderr)
+    if args.prompt_out:
+        args.prompt_out.write_text(prompt, encoding="utf-8")
     if args.dry_run:
         return 0
 

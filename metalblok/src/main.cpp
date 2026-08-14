@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -636,9 +637,11 @@ static void usage() {
 "metalblok -m <model-path> -p <prompt> [options]\n"
 "  -m, --model      <path>  .blade dir, HF checkpoint dir, or .gguf shard 0\n"
 "  -p, --prompt     <str>   prompt text\n"
+"      --prompt-file <path>  read prompt directly (required beyond shell ARG_MAX)\n"
 "  -t, --tokenizer  <file>  tokenizer.bin (default: <model-dir>/tokenizer.bin)\n"
 "  -n, --max-tokens <N>     max new tokens to generate           (default 128)\n"
 "      --context    <N>     KV capacity; default 64 for safe bring-up\n"
+"      --mla               compact absorbed-MLA mode (explicit opt-in)\n"
 "      --raw-prompt          bypass the DeepSeek-R1 user/assistant template\n"
 "      --tokenize-only       print formatted prompt token IDs and exit\n"
 "      --decode-ids  <csv>   decode comma-separated token IDs and exit\n"
@@ -672,6 +675,7 @@ static void usage() {
 int main(int argc, char** argv) {
     const char* model_dir = nullptr;
     const char* prompt    = nullptr;
+    const char* prompt_path = nullptr;
     const char* tok_path  = nullptr;
     const char* stop_str  = nullptr;
     const char* kv_dir    = nullptr;
@@ -686,6 +690,7 @@ int main(int argc, char** argv) {
     bool        validate_router_flag = false;
     bool        raw_prompt = false;
     bool        tokenize_only = false;
+    bool        compact_mla = false;
     const char* decode_ids = nullptr;
     const char* state_path = nullptr;
     bool        single_step = false;
@@ -702,6 +707,7 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         if      ((a == "-m" || a == "--model")      && i+1 < argc) model_dir = argv[++i];
         else if ((a == "-p" || a == "--prompt")     && i+1 < argc) prompt    = argv[++i];
+        else if ( a == "--prompt-file"               && i+1 < argc) prompt_path = argv[++i];
         else if ((a == "-t" || a == "--tokenizer")  && i+1 < argc) tok_path  = argv[++i];
         else if ((a == "-n" || a == "--max-tokens") && i+1 < argc) n_predict = std::atoi(argv[++i]);
         else if ( a == "--context"                   && i+1 < argc) context = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
@@ -722,6 +728,7 @@ int main(int argc, char** argv) {
         else if ( a == "--validate-router")                         validate_router_flag = true;
         else if ( a == "--raw-prompt")                              raw_prompt = true;
         else if ( a == "--tokenize-only")                            tokenize_only = true;
+        else if ( a == "--mla")                                      compact_mla = true;
         else if ( a == "--decode-ids" && i+1 < argc)                 decode_ids = argv[++i];
         else if ( a == "--state" && i+1 < argc)                      state_path = argv[++i];
         else if ( a == "--single-step-token" && i+1 < argc) {
@@ -755,6 +762,37 @@ int main(int argc, char** argv) {
     if (ginfo) return gguf_info(ginfo);
     if (probe_t_path && probe_t_name) return probe_tensor(probe_t_path, probe_t_name);
     if (vgemv_path && vgemv_name)     return validate_gemv(vgemv_path, vgemv_name, force);
+    std::string prompt_storage;
+    if (prompt_path) {
+        if (prompt) {
+            std::fprintf(stderr, "metalblok: choose one of --prompt or --prompt-file\n");
+            return 2;
+        }
+        int fd = ::open(prompt_path, O_RDONLY);
+        struct stat st{};
+        if (fd < 0 || ::fstat(fd, &st) != 0 || st.st_size <= 0) {
+            if (fd >= 0) ::close(fd);
+            std::fprintf(stderr, "metalblok: cannot read nonempty prompt file: %s\n",
+                         prompt_path);
+            return 2;
+        }
+        prompt_storage.resize(static_cast<size_t>(st.st_size));
+        size_t done = 0;
+        while (done < prompt_storage.size()) {
+            ssize_t n = ::read(fd, prompt_storage.data() + done,
+                               prompt_storage.size() - done);
+            if (n > 0) done += static_cast<size_t>(n);
+            else if (n < 0 && errno == EINTR) continue;
+            else break;
+        }
+        ::close(fd);
+        if (done != prompt_storage.size()) {
+            std::fprintf(stderr, "metalblok: short read from prompt file: %s\n",
+                         prompt_path);
+            return 2;
+        }
+        prompt = prompt_storage.c_str();
+    }
     if (!model_dir || (!prompt && !decode_ids)) usage();
     if (n_predict <= 0) n_predict = 128;
     if (continue_state && resume_turn) {
@@ -770,14 +808,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "metalblok: checkpoint interval must be in [1,4096]\n");
         return 2;
     }
-    if (context < 64 || context > 65536) {
-        std::fprintf(stderr, "metalblok: --context must be in [64, 65536]\n");
+    if (context < 64 || context > 163840) {
+        std::fprintf(stderr, "metalblok: --context must be in [64, 163840]\n");
         return 2;
     }
     {
         char context_buf[32];
         std::snprintf(context_buf, sizeof(context_buf), "%u", context);
         ::setenv("METALBLOK_MAX_SEQ", context_buf, 1);
+        if (compact_mla) ::setenv("METALBLOK_MLA", "1", 1);
     }
 
     // -----------------------------------------------------------------------

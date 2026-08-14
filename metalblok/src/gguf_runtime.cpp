@@ -152,6 +152,9 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
     pos_ = 0;
     trace_ = std::getenv("METALBLOK_TRACE") != nullptr;
     profile_layers_ = std::getenv("METALBLOK_PROFILE_LAYERS") != nullptr;
+    compact_mla_ = std::getenv("METALBLOK_MLA") != nullptr;
+    validate_mla_ = std::getenv("METALBLOK_VALIDATE_MLA") != nullptr;
+    if (validate_mla_ && !compact_mla_) die("MLA validation requires compact MLA");
     parse_config_(g);
     verify_tensor_table_(gm);
 
@@ -159,23 +162,31 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
     // this from --context before initialization.
     if (const char* s = std::getenv("METALBLOK_MAX_SEQ")) {
         unsigned long v = std::strtoul(s, nullptr, 10);
-        if (v >= 64 && v <= 65536) cfg_.max_seq = (uint32_t)v;
+        if (v >= 64 && v <= cfg_.context_length) cfg_.max_seq = (uint32_t)v;
     }
     if (cfg_.max_seq > cfg_.context_length && cfg_.context_length > 0)
         cfg_.max_seq = cfg_.context_length;
 
-    // Full pre-allocation ledger. This legacy GGUF contains the combined
-    // attn_kv_b tensor, so exact parity requires expanded per-head K/V state.
-    // Only the output head is permanently resident. Per-layer fixed weights
-    // use two bounded slabs; pinning all 61 layers competes with the exact KV
-    // cache and triggers macOS compression at 1K context.
+    // Full pre-allocation ledger. Default mode retains expanded per-head K/V.
+    // --mla keeps the latent plus the immutable compressed KV-B tensors.
     const uint64_t Dn = cfg_.key_length - cfg_.rope_dim;
-    const uint64_t kv = uint64_t(cfg_.n_layers) * cfg_.max_seq *
-        (cfg_.n_heads * (Dn + cfg_.value_length) + cfg_.rope_dim) * 2ULL;
+    const uint64_t kv_width = compact_mla_
+        ? cfg_.kv_lora_rank + cfg_.rope_dim
+        : cfg_.n_heads * (Dn + cfg_.value_length) + cfg_.rope_dim;
+    const uint64_t kv = uint64_t(cfg_.n_layers) * cfg_.max_seq * kv_width * 2ULL;
+    uint64_t absorbed = 0;
+    if (compact_mla_) {
+        char kv_name[96];
+        for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
+            std::snprintf(kv_name, sizeof(kv_name), "blk.%u.attn_kv_b.weight", L);
+            absorbed += gm.find(kv_name)->nbytes;
+        }
+    }
     const uint64_t scores = uint64_t(cfg_.n_heads) * cfg_.max_seq * 4ULL;
     const auto align16k = [](uint64_t n) { return (n + 16383) & ~uint64_t(16383); };
     const uint64_t output_head = gm.find("output.weight")->nbytes;
     uint64_t layer_stage = 0;
+    uint64_t fixed_payload = 0;
     uint64_t largest_transient = 0;
     char fixed_name[96];
     for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
@@ -183,6 +194,8 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
         for (const char* suffix : {"attn_q_a.weight", "attn_q_b.weight",
                                    "attn_kv_a_mqa.weight", "attn_kv_b.weight",
                                    "attn_output.weight"}) {
+            if (compact_mla_ && std::strcmp(suffix, "attn_kv_b.weight") == 0)
+                continue;
             std::snprintf(fixed_name, sizeof(fixed_name), "blk.%u.%s", L, suffix);
             layer_bytes += align16k(gm.find(fixed_name)->nbytes);
         }
@@ -207,6 +220,7 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
             }
         }
         layer_stage = std::max(layer_stage, layer_bytes);
+        fixed_payload += layer_bytes;
     }
     const uint64_t fixed = output_head + 2 * layer_stage;
     uint32_t dense_ffn = 0;
@@ -221,21 +235,26 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
         2ULL * cfg_.kv_lora_rank + cfg_.rope_dim +
         3ULL * std::max(dense_ffn, cfg_.expert_ffn * cfg_.n_shared) +
         cfg_.n_experts + uint64_t(cfg_.n_experts_active) * cfg_.hidden);
-    const uint64_t batch_scratch = batch_elems * sizeof(float) +
+    const uint64_t compact_batch = compact_mla_ ? uint64_t(kPrefillBatch) *
+        2ULL * cfg_.n_heads * cfg_.kv_lora_rank : 0;
+    const uint64_t batch_scratch = (batch_elems + compact_batch) * sizeof(float) +
         uint64_t(kPrefillBatch) * cfg_.n_experts_active *
             (sizeof(uint32_t) + sizeof(float));
     const uint64_t runtime_margin = 32ULL << 20;
     const uint64_t expert_batch = largest_transient * cfg_.n_experts_active * 3;
-    const uint64_t base_estimated = fixed + kv + scores + expert_batch +
+    const uint64_t base_estimated = fixed + kv + absorbed + scores + expert_batch +
                                     batch_scratch + runtime_margin;
-    const uint64_t host_reserve = cfg_.max_seq <= 2048 ? 1ULL << 30 : 3ULL << 30;
+    const uint64_t host_reserve = cfg_.max_seq <= 2048 ? 1ULL << 30 : 2ULL << 30;
     const auto memory = mem::snapshot();
-    uint64_t desired_cache = 256ULL << 20;
+    // In compact mode the Q6_K absorption removes 3.25 GB of avoidable
+    // resident expansion. Spend that headroom on the deterministic fixed
+    // stream: every cached byte removes one SSD byte from every decode step.
+    uint64_t desired_cache = compact_mla_ ? fixed_payload : 256ULL << 20;
     if (const char* value = std::getenv("METALBLOK_FIXED_CACHE_MB")) {
         char* end = nullptr;
         const unsigned long mb = std::strtoul(value, &end, 10);
-        if (!end || *end != '\0' || mb > 2048)
-            die("METALBLOK_FIXED_CACHE_MB must be in [0,2048]");
+        if (!end || *end != '\0' || mb > 12288)
+            die("METALBLOK_FIXED_CACHE_MB must be in [0,12288]");
         desired_cache = uint64_t(mb) << 20;
     }
     const uint64_t cache_guard = 2ULL << 30;
@@ -244,13 +263,16 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
         ? memory.available - base_estimated - host_reserve - cache_guard : 0;
     fixed_cache_budget_ = std::min(desired_cache, cache_headroom);
     const uint64_t estimated = base_estimated + fixed_cache_budget_;
-    prof::log("memory-ledger: output=%.2fGB layer_slabs=%.2fGB fixed_cache=%.2fGB "
-        "kv=%.2fGB expert_batch=%.2fMB batch=%.2fMB margin=%.2fMB "
-        "estimated=%.2fGB available=%.2fGB reserve=%.2fGB cache_guard=%.2fGB",
-              output_head / 1e9, 2 * layer_stage / 1e9,
-              fixed_cache_budget_ / 1e9, kv / 1e9, expert_batch / 1e6,
+    prof::log("memory-ledger: mode=%s output=%.2fGB layer_slabs=%.2fGB fixed_cache=%.2fGB "
+        "kv=%.2fGB absorbed=%.2fGB expert_batch=%.2fMB batch=%.2fMB margin=%.2fMB "
+        "fixed_set=%.2fGB estimated=%.2fGB available=%.2fGB reserve=%.2fGB "
+        "cache_guard=%.2fGB",
+              compact_mla_ ? "mla" : "expanded", output_head / 1e9,
+              2 * layer_stage / 1e9, fixed_cache_budget_ / 1e9, kv / 1e9,
+              absorbed / 1e9, expert_batch / 1e6,
               batch_scratch / 1e6,
-              runtime_margin / 1e6, estimated / 1e9, memory.available / 1e9,
+              runtime_margin / 1e6, fixed_payload / 1e9,
+              estimated / 1e9, memory.available / 1e9,
               host_reserve / 1e9, cache_guard / 1e9);
     if (memory.available < estimated + host_reserve) {
         std::fprintf(stderr,
@@ -264,12 +286,13 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
     alloc_kv_cache_();
     load_resident_norms_();
     load_fixed_projections_();
+    if (compact_mla_) build_absorbed_kv_();
     alloc_expert_slots_();
     build_grids_();
 
-    prof::log("gguf_runtime: init n_layers=%u hidden=%u vocab=%u "
+    prof::log("gguf_runtime: init mode=%s n_layers=%u hidden=%u vocab=%u "
               "n_experts=%u active=%u kv_lora=%u rope_dim=%u max_seq=%u rss=%zuMB",
-              cfg_.n_layers, cfg_.hidden, cfg_.vocab,
+              compact_mla_ ? "mla" : "expanded", cfg_.n_layers, cfg_.hidden, cfg_.vocab,
               cfg_.n_experts, cfg_.n_experts_active,
               cfg_.kv_lora_rank, cfg_.rope_dim, cfg_.max_seq, prof::rss_mb());
 }
@@ -463,9 +486,12 @@ void GgufRuntime::alloc_activations_() {
     q_full_    = fp32((size_t)HE * (Dn + Dr));
     q_nope_    = fp32((size_t)HE * Dn);
     q_rope_    = fp32((size_t)HE * Dr);
+    if (compact_mla_) q_eff_ = fp32((size_t)HE * Lk);
     kv_a_      = fp32((size_t)Lk + Dr);
     kv_lat_    = fp32(Lk);
     kv_full_   = fp32((size_t)HE * (Dn + Dv));
+    if (compact_mla_) o_lat_ = fp32((size_t)HE * Lk);
+    if (validate_mla_) o_lat_ref_ = fp32((size_t)HE * Lk);
     o_full_    = fp32((size_t)HE * Dv);
     attn_out_  = fp32(H);
     ffn_gate_  = fp32(F_max);
@@ -487,9 +513,11 @@ void GgufRuntime::alloc_activations_() {
     qf_b_      = fp32(B * HE * (Dn + Dr));
     qn_b_      = fp32(B * HE * Dn);
     qr_b_      = fp32(B * HE * Dr);
+    if (compact_mla_) qeff_b_ = fp32(B * HE * Lk);
     kva_b_     = fp32(B * (Lk + Dr));
     kvlat_b_   = fp32(B * Lk);
     kvfull_b_  = fp32(B * HE * (Dn + Dv));
+    if (compact_mla_) olat_b_ = fp32(B * HE * Lk);
     ofull_b_   = fp32(B * HE * Dv);
     attnout_b_ = fp32(B * H);
     fg_b_      = fp32(B * F_max);
@@ -501,28 +529,46 @@ void GgufRuntime::alloc_activations_() {
     rwts_b_    = fp32(B * cfg_.n_experts_active);
     routed_b_  = fp32(B * cfg_.n_experts_active * H);
 
+    if (compact_mla_) {
+        constexpr size_t kAttentionBlocks = 32;
+        attn_partials_ = fp32(size_t(HE) * kAttentionBlocks * Lk);
+        attn_stats_ = fp32(size_t(HE) * kAttentionBlocks * 2);
+    }
+
 }
 
 void GgufRuntime::alloc_kv_cache_() {
     const uint32_t HE = cfg_.n_heads;
     const uint32_t Dn = cfg_.key_length - cfg_.rope_dim;
     const uint32_t Dv = cfg_.value_length, Dr = cfg_.rope_dim;
-    k_nope_.resize(cfg_.n_layers);
-    v_cache_.resize(cfg_.n_layers);
+    if (compact_mla_) c_kv_.resize(cfg_.n_layers);
+    else {
+        k_nope_.resize(cfg_.n_layers);
+        v_cache_.resize(cfg_.n_layers);
+    }
     k_rope_.resize(cfg_.n_layers);
     const size_t key_bytes = (size_t)cfg_.max_seq * HE * Dn * 2;
     const size_t val_bytes = (size_t)cfg_.max_seq * HE * Dv * 2;
     const size_t rope_bytes = (size_t)cfg_.max_seq * Dr * 2;
     for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
-        k_nope_[L] = mtl_->alloc_lazy(key_bytes);
-        v_cache_[L] = mtl_->alloc_lazy(val_bytes);
+        if (compact_mla_) c_kv_[L] = mtl_->alloc_lazy(
+            (size_t)cfg_.max_seq * cfg_.kv_lora_rank * 2);
+        else {
+            k_nope_[L] = mtl_->alloc_lazy(key_bytes);
+            v_cache_[L] = mtl_->alloc_lazy(val_bytes);
+        }
         k_rope_[L] = mtl_->alloc_lazy(rope_bytes);
     }
     scores_ = mtl_->alloc((size_t)HE * cfg_.max_seq * 4);
-    prof::log("gguf_runtime: exact KV cache k=%.3fGB v=%.3fGB rope=%.2fMB scores=%.2fMB",
-              key_bytes * cfg_.n_layers / 1e9,
-              val_bytes * cfg_.n_layers / 1e9,
-              rope_bytes * cfg_.n_layers / 1e6, scores_.length / 1e6);
+    if (compact_mla_)
+        prof::log("gguf_runtime: MLA cache latent=%.3fGB rope=%.3fGB scores=%.2fMB",
+                  uint64_t(cfg_.max_seq) * cfg_.kv_lora_rank * 2 * cfg_.n_layers / 1e9,
+                  rope_bytes * cfg_.n_layers / 1e9, scores_.length / 1e6);
+    else
+        prof::log("gguf_runtime: exact KV cache k=%.3fGB v=%.3fGB rope=%.2fMB scores=%.2fMB",
+                  key_bytes * cfg_.n_layers / 1e9,
+                  val_bytes * cfg_.n_layers / 1e9,
+                  rope_bytes * cfg_.n_layers / 1e6, scores_.length / 1e6);
 }
 
 uint64_t GgufRuntime::cpu_dequant_to_f16_(const GgufTensorEntry& e, uint16_t* dst) {
@@ -565,6 +611,38 @@ uint64_t GgufRuntime::cpu_dequant_to_f16_(const GgufTensorEntry& e, uint16_t* ds
         for (uint32_t i = 0; i < 256; ++i) dst[b * 256 + i] = f32_to_f16(tmp[i]);
     }
     return n_elems;
+}
+
+void GgufRuntime::build_absorbed_kv_() {
+    const uint32_t HE = cfg_.n_heads;
+    const uint32_t Lk = cfg_.kv_lora_rank;
+    const uint32_t Dn = cfg_.key_length - cfg_.rope_dim;
+    const uint32_t Dv = cfg_.value_length;
+    const long long started = prof::now_us();
+    uint64_t source_bytes = 0;
+    char name[96];
+
+    for (uint32_t layer = 0; layer < cfg_.n_layers; ++layer) {
+        std::snprintf(name, sizeof(name), "blk.%u.attn_kv_b.weight", layer);
+        const auto* entry = gm_->find(name);
+        if (!entry || entry->shape[0] != Lk ||
+            entry->shape[1] != HE * (Dn + Dv))
+            die("invalid KV-B tensor for MLA absorption");
+        if (entry->type != GGML_Q6_K)
+            die("--mla requires the DeepSeek-R1 UD-IQ1_S Q6_K KV-B tensors");
+
+        auto& resident = lw_[layer];
+        resident.kv_b.buffer = mtl_->alloc(entry->nbytes);
+        std::atomic<bool> done{false};
+        gm_->ring().submit(entry->shard, entry->abs_offset, entry->nbytes,
+                           resident.kv_b.buffer.contents, &done);
+        PreadRing::wait(&done);
+        source_bytes += entry->nbytes;
+        resident.kv_b.resident = true;
+    }
+    const long long elapsed = prof::now_us() - started;
+    prof::log("gguf_runtime: MLA resident Q6_K KV-B loaded %.3fGB in %.3fs",
+              source_bytes / 1e9, elapsed / 1e6);
 }
 
 void GgufRuntime::load_resident_norms_() {
@@ -701,7 +779,12 @@ GgufRuntime::Projection GgufRuntime::load_projection_(
 void GgufRuntime::dispatch_projection_(const Projection& projection,
                                        const MtlBuf& x, const MtlBuf& y) {
     const char* kernel = kernel_name_for(projection.entry->type);
-    if (projection.entry->type == GGML_IQ1_S)
+    if (projection.entry->type == GGML_Q6_K && projection.K == 2048 &&
+        projection.N % 4 == 0)
+        mtl_->dispatch("gemv_q6_K_f32_r4", {projection.buffer, x, y},
+                       {{&projection.K, sizeof(projection.K)}}, projection.N / 4,
+                       32, true);
+    else if (projection.entry->type == GGML_IQ1_S)
         mtl_->dispatch(kernel, {projection.buffer, x, y, iq1s_grid_b_},
                        {{&projection.K, sizeof(projection.K)}}, projection.N, 32, true);
     else if (projection.entry->type == GGML_IQ2_XXS)
@@ -710,6 +793,28 @@ void GgufRuntime::dispatch_projection_(const Projection& projection,
     else
         mtl_->dispatch(kernel, {projection.buffer, x, y},
                        {{&projection.K, sizeof(projection.K)}}, projection.N, 32, true);
+}
+
+void GgufRuntime::dispatch_projection_batch_(const Projection& projection,
+                                             const MtlBuf& x, const MtlBuf& y,
+                                             uint32_t count) {
+    if (count == 1) {
+        dispatch_projection_(projection, x, y);
+        return;
+    }
+    const uint32_t K = projection.K, N = projection.N;
+    if (projection.entry->type == GGML_IQ1_S) {
+        mtl_->dispatch2d("gemv_iq1_s_f32_b",
+                         {projection.buffer, x, y, iq1s_grid_b_},
+                         {{&K,4},{&N,4}}, N, count, 32);
+        return;
+    }
+    for (uint32_t i = 0; i < count; ++i)
+        dispatch_projection_(projection,
+                             view(x, size_t(i) * K * sizeof(float),
+                                  size_t(K) * sizeof(float)),
+                             view(y, size_t(i) * N * sizeof(float),
+                                  size_t(N) * sizeof(float)));
 }
 
 void GgufRuntime::load_fixed_projections_() {
@@ -725,18 +830,20 @@ void GgufRuntime::load_fixed_projections_() {
     char name[96];
     for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
         uint64_t layer_bytes = 0;
-        auto index = [&](Projection& dst, const char* suffix, uint32_t K, uint32_t N) {
+        auto index = [&](Projection& dst, const char* suffix, uint32_t K, uint32_t N,
+                         bool streamed = true) {
             std::snprintf(name, sizeof(name), "blk.%u.%s", L, suffix);
             const auto* entry = gm_->find(name);
             if (!entry || !kernel_name_for(entry->type))
                 die("fixed projection is missing or unsupported");
             dst = {{}, entry, K, N, false};
-            layer_bytes += align16k(entry->nbytes);
+            if (streamed) layer_bytes += align16k(entry->nbytes);
         };
         index(lw_[L].q_a, "attn_q_a.weight", H, Hi);
         index(lw_[L].q_b, "attn_q_b.weight", Hi, HE * (Dn + Dr));
         index(lw_[L].kv_a, "attn_kv_a_mqa.weight", H, Lk + Dr);
-        index(lw_[L].kv_b, "attn_kv_b.weight", Lk, HE * (Dn + Dv));
+        index(lw_[L].kv_b, "attn_kv_b.weight", Lk, HE * (Dn + Dv),
+              !compact_mla_);
         index(lw_[L].attn_output, "attn_output.weight", HE * Dv, H);
         if (L < cfg_.n_dense_layers) {
             std::snprintf(name, sizeof(name), "blk.%u.ffn_gate.weight", L);
@@ -760,7 +867,8 @@ void GgufRuntime::load_fixed_projections_() {
                  &layer.q_a, &layer.q_b, &layer.kv_a, &layer.kv_b,
                  &layer.attn_output, &layer.ffn_gate, &layer.ffn_up,
                  &layer.ffn_down, &layer.router})
-            if (projection->entry) candidates.push_back(projection);
+            if (projection->entry && (!compact_mla_ || projection != &layer.kv_b))
+                candidates.push_back(projection);
     }
     std::stable_sort(candidates.begin(), candidates.end(),
                      [](const Projection* a, const Projection* b) {
@@ -790,12 +898,28 @@ void GgufRuntime::load_fixed_projections_() {
         }
         for (size_t i = 0; i < cache_count; ++i) PreadRing::wait(&ready[i]);
     }
-    for (auto& slab : layer_stage_) slab = mtl_->alloc(largest_layer);
+    // Cache selection can make the conservative pre-ledger slab size obsolete.
+    // Allocate only what the largest remaining streamed layer actually needs.
+    uint64_t streamed_layer = 0;
+    for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
+        const auto& layer = lw_[L];
+        uint64_t bytes = 0;
+        for (const Projection* projection : {
+                 &layer.q_a, &layer.q_b, &layer.kv_a, &layer.kv_b,
+                 &layer.attn_output, &layer.ffn_gate, &layer.ffn_up,
+                 &layer.ffn_down, &layer.router})
+            if (projection->entry && !projection->resident &&
+                (!compact_mla_ || projection != &layer.kv_b))
+                bytes += align16k(projection->entry->nbytes);
+        streamed_layer = std::max(streamed_layer, bytes);
+    }
+    streamed_layer = std::max<uint64_t>(streamed_layer, 16384);
+    for (auto& slab : layer_stage_) slab = mtl_->alloc(streamed_layer);
     output_projection_ = load_projection_("output.weight", H, cfg_.vocab);
     prof::log("gguf_runtime: fixed tier output=%.3fGB cache=%.3fGB/%zu projections "
               "layer_slabs=2x%.3fGB",
               output_projection_.buffer.length / 1e9, cache_bytes / 1e9, cache_count,
-              layer_stage_[0].length / 1e9);
+              streamed_layer / 1e9);
 }
 
 void GgufRuntime::begin_stage_layer_(uint32_t L, uint32_t slot) {
@@ -853,9 +977,12 @@ void GgufRuntime::alloc_expert_slots_() {
             largest = std::max(largest, gm_->find(name)->nbytes / cfg_.n_experts);
         }
     }
-    for (auto& slot : expert_slots_) slot = mtl_->alloc(largest);
+    expert_slot_bytes_ = largest;
+    for (uint32_t i = 0; i < kDecodeExpertSlots; ++i)
+        expert_slots_[i] = mtl_->alloc(largest);
     prof::log("gguf_runtime: expert arena %u x %.3f MB = %.3f MB",
-              kExpertSlots, largest / 1e6, kExpertSlots * largest / 1e6);
+              kDecodeExpertSlots, largest / 1e6,
+              kDecodeExpertSlots * largest / 1e6);
 }
 
 // ---------------------------------------------------------------------------
@@ -914,7 +1041,63 @@ void GgufRuntime::embed_lookup_into_(uint32_t tok, const MtlBuf& output) {
 // non-MLA compatibility graph. Algebraic absorption is not interchangeable
 // after the cache's fp16 rounding and fails token parity on this GGUF.
 // ---------------------------------------------------------------------------
+void GgufRuntime::mla_attn_compact_(uint32_t L) {
+    const auto& w = lw_[L];
+    const uint32_t H = cfg_.hidden, Dn = cfg_.key_length - cfg_.rope_dim;
+    const uint32_t Dr = cfg_.rope_dim, Dv = cfg_.value_length;
+    const uint32_t HE = cfg_.n_heads, Lk = cfg_.kv_lora_rank, Hi = cfg_.q_lora_rank;
+    const uint32_t layer = 0, ms = cfg_.max_seq, T = pos_ + 1;
+    const uint32_t position = pos_;
+    const float theta = cfg_.rope_freq_base, eps = cfg_.rms_eps;
+    const float scale = cfg_.yarn_mscale / std::sqrt(float(Dn + Dr));
+
+    mtl_->begin();
+    rmsnorm_f32(*mtl_, x_, w.attn_norm, x_norm_, H, eps);
+    dispatch_projection_(w.q_a, x_norm_, q_a_);
+    rmsnorm_f32(*mtl_, q_a_, w.q_a_norm, q_a_n_, Hi, eps);
+    dispatch_projection_(w.q_b, q_a_n_, q_full_);
+    mtl_->dispatch("mla_q_split_rope_r1", {q_full_, q_nope_, q_rope_},
+                   {{&Dn,4},{&Dr,4},{&position,4},{&theta,4}}, HE, TG_ELT, true);
+    mtl_->dispatch("mla_q6_kv_b_query_r1", {w.kv_b.buffer, q_nope_, q_eff_},
+                   {{&Lk,4},{&Dn,4},{&Dv,4}}, HE * Lk, 32, true);
+
+    dispatch_projection_(w.kv_a, x_norm_, kv_a_);
+    mtl_->dispatch("mla_kv_norm_rope_store_r1",
+                   {kv_a_, w.kv_a_norm, c_kv_[L], k_rope_[L]},
+                   {{&Lk,4},{&Dr,4},{&position,4},{&ms,4},{&eps,4},{&theta,4}},
+                   1, TG_RED, true);
+    if (T >= 1024) {
+        constexpr uint32_t blocks = 32;
+        if (validate_mla_ && T == 1024)
+            mtl_->dispatch("mla_attn_decode_f32",
+                           {q_eff_, q_rope_, c_kv_[L], k_rope_[L],
+                            o_lat_ref_, scores_},
+                           {{&HE,4},{&Lk,4},{&Dr,4},{&layer,4},{&T,4},{&ms,4},{&scale,4}},
+                           HE, TG_RED, true);
+        mtl_->dispatch2d("mla_attn_online_r1_pass1",
+                         {q_eff_, q_rope_, c_kv_[L], k_rope_[L],
+                          attn_partials_, attn_stats_},
+                         {{&T,4},{&ms,4},{&scale,4}}, blocks, HE, 32);
+        mtl_->dispatch("mla_attn_online_r1_pass2",
+                       {attn_partials_, attn_stats_, o_lat_}, {}, HE, 32, true);
+        if (validate_mla_ && T == 1024) {
+            mtl_->flush();
+            validate_mla_output_(L, T, o_lat_ref_, o_lat_);
+        }
+    } else {
+        mtl_->dispatch("mla_attn_decode_f32",
+                       {q_eff_, q_rope_, c_kv_[L], k_rope_[L], o_lat_, scores_},
+                       {{&HE,4},{&Lk,4},{&Dr,4},{&layer,4},{&T,4},{&ms,4},{&scale,4}},
+                       HE, TG_RED, true);
+    }
+    mtl_->dispatch("mla_q6_kv_b_value_r1", {w.kv_b.buffer, o_lat_, o_full_},
+                   {{&Lk,4},{&Dn,4},{&Dv,4}}, HE * Dv, 32, true);
+    dispatch_projection_(w.attn_output, o_full_, attn_out_);
+    axpy_f32(*mtl_, x_, attn_out_, 1.0f, H);
+}
+
 void GgufRuntime::mla_attn_(uint32_t L) {
+    if (compact_mla_) { mla_attn_compact_(L); return; }
     const auto& w  = lw_[L];
     const uint32_t H  = cfg_.hidden;
     const uint32_t Dn = cfg_.key_length - cfg_.rope_dim;
@@ -1001,6 +1184,7 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
                      {&scale,4},{&norm,4} },
                    1, 1, true);
     mtl_->commit_and_wait();
+    const long long route_gpu_us = mtl_->last_gpu_us();
 
     if (trace_ && L == 3) {
         trace_buffer_("ffn_inp", L, x_, H);
@@ -1054,40 +1238,186 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
     swiglu_f32(*mtl_, ffn_gate_, ffn_up_, ffn_act_, Fs);
     dispatch_projection_(w.ffn_down, ffn_act_, ffn_out_);
     mtl_->commit_and_wait();
+    const long long shared_gpu_us = mtl_->last_gpu_us();
     if (trace_ && L == 3) trace_buffer_("ffn_shared", L, ffn_out_, H);
 
-    for (const auto& expert : experts) wait_weight_(expert);
-    mtl_->begin();
-    for (uint32_t k = 0; k < K; ++k) {
-        const auto& gate = experts[k * 3];
-        const auto& up = experts[k * 3 + 1];
-        const auto& down = experts[k * 3 + 2];
-        if (gate.entry->type == GGML_IQ1_S &&
-            up.entry->type == GGML_IQ1_S) {
-            mtl_->dispatch("expert_gate_up_swiglu_iq1_s",
-                           {gate.buffer, up.buffer, x_norm_, ffn_act_, iq1s_grid_b_},
-                           {{&H,4}}, Fe, 32, true);
-        } else {
-            dispatch_weight_(gate, x_norm_, ffn_gate_);
-            dispatch_weight_(up, x_norm_, ffn_up_);
-            swiglu_f32(*mtl_, ffn_gate_, ffn_up_, ffn_act_, Fe);
+    uint32_t ready_after_shared = 0;
+    for (const auto& expert : experts)
+        ready_after_shared += expert.ready->load(std::memory_order_acquire);
+    long long group_wait_us[2]{}, group_gpu_us[2]{};
+    constexpr uint32_t group_size = 4;
+    for (uint32_t base = 0; base < K; base += group_size) {
+        const uint32_t group = base / group_size;
+        const uint32_t end = std::min(K, base + group_size);
+        const long long wait_started = prof::now_us();
+        for (uint32_t k = base; k < end; ++k) {
+            wait_weight_(experts[k * 3]);
+            wait_weight_(experts[k * 3 + 1]);
+            wait_weight_(experts[k * 3 + 2]);
         }
-        if (down.entry->type == GGML_IQ1_S) {
-            mtl_->dispatch("expert_down_accum_iq1_s",
-                           {down.buffer, ffn_act_, ffn_out_, iq1s_grid_b_},
-                           {{&Fe,4},{&wts[k],4}}, H, 32, true);
-        } else {
-            dispatch_weight_(down, ffn_act_, expert_tmp_);
-            axpy_f32(*mtl_, ffn_out_, expert_tmp_, wts[k], H);
+        group_wait_us[group] = prof::now_us() - wait_started;
+        mtl_->begin();
+        for (uint32_t k = base; k < end; ++k) {
+            const auto& gate = experts[k * 3];
+            const auto& up = experts[k * 3 + 1];
+            const auto& down = experts[k * 3 + 2];
+            if (gate.entry->type == GGML_IQ1_S &&
+                up.entry->type == GGML_IQ1_S) {
+                mtl_->dispatch("expert_gate_up_swiglu_iq1_s",
+                               {gate.buffer, up.buffer, x_norm_, ffn_act_, iq1s_grid_b_},
+                               {{&H,4}}, Fe, 32, true);
+            } else {
+                dispatch_weight_(gate, x_norm_, ffn_gate_);
+                dispatch_weight_(up, x_norm_, ffn_up_);
+                swiglu_f32(*mtl_, ffn_gate_, ffn_up_, ffn_act_, Fe);
+            }
+            if (down.entry->type == GGML_IQ1_S) {
+                mtl_->dispatch("expert_down_accum_iq1_s_r4",
+                               {down.buffer, ffn_act_, ffn_out_, iq1s_grid_b_},
+                               {{&Fe,4},{&wts[k],4}}, H / 4, 32, true);
+            } else {
+                dispatch_weight_(down, ffn_act_, expert_tmp_);
+                axpy_f32(*mtl_, ffn_out_, expert_tmp_, wts[k], H);
+            }
+        }
+        if (end == K) axpy_f32(*mtl_, x_, ffn_out_, 1.0f, H);
+        mtl_->commit_and_wait();
+        group_gpu_us[group] = mtl_->last_gpu_us();
+        for (uint32_t k = base; k < end; ++k) {
+            release_weight_(experts[k * 3]);
+            release_weight_(experts[k * 3 + 1]);
+            release_weight_(experts[k * 3 + 2]);
         }
     }
-    axpy_f32(*mtl_, x_, ffn_out_, 1.0f, H);
-    mtl_->commit_and_wait();
+    if (profile_layers_)
+        prof::log("moe-pipeline pos=%u layer=%u ready_after_shared=%u/24 "
+                  "route_gpu_us=%lld shared_gpu_us=%lld group_size=4 "
+                  "g0_wait_us=%lld g0_gpu_us=%lld g1_wait_us=%lld g1_gpu_us=%lld",
+                  pos_, L, ready_after_shared, route_gpu_us, shared_gpu_us,
+                  group_wait_us[0], group_gpu_us[0],
+                  group_wait_us[1], group_gpu_us[1]);
     if (trace_ && L == 3) trace_buffer_("ffn_total", L, ffn_out_, H);
-    for (auto& expert : experts) release_weight_(expert);
+}
+
+void GgufRuntime::attention_batch_compact_(uint32_t L, uint32_t count) {
+    const long long started = prof::now_us();
+    const int dispatches_before = mtl_->step_dispatches;
+    const auto& w = lw_[L];
+    const uint32_t H = cfg_.hidden, Dn = cfg_.key_length - cfg_.rope_dim;
+    const uint32_t Dr = cfg_.rope_dim, Dv = cfg_.value_length;
+    const uint32_t HE = cfg_.n_heads, Lk = cfg_.kv_lora_rank, Hi = cfg_.q_lora_rank;
+    const uint32_t layer = 0, ms = cfg_.max_seq;
+    const float theta = cfg_.rope_freq_base, eps = cfg_.rms_eps;
+    const float scale = cfg_.yarn_mscale / std::sqrt(float(Dn + Dr));
+    auto row = [](const MtlBuf& b, uint32_t i, size_t n) {
+        return view(b, size_t(i) * n * sizeof(float), n * sizeof(float));
+    };
+
+    mtl_->begin();
+    rmsnorm_f32(*mtl_, x_b_, w.attn_norm, xn_b_, H, eps, count);
+    dispatch_projection_batch_(w.q_a, xn_b_, qa_b_, count);
+    rmsnorm_f32(*mtl_, qa_b_, w.q_a_norm, qan_b_, Hi, eps, count);
+    dispatch_projection_batch_(w.q_b, qan_b_, qf_b_, count);
+    dispatch_projection_batch_(w.kv_a, xn_b_, kva_b_, count);
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t position = pos_ + i;
+        mtl_->dispatch("mla_q_split_rope_r1",
+                       {row(qf_b_, i, size_t(HE) * (Dn + Dr)),
+                        row(qn_b_, i, size_t(HE) * Dn),
+                        row(qr_b_, i, size_t(HE) * Dr)},
+                       {{&Dn,4},{&Dr,4},{&position,4},{&theta,4}},
+                       HE, TG_ELT, true);
+        mtl_->dispatch("mla_q6_kv_b_query_r1",
+                       {w.kv_b.buffer, row(qn_b_, i, size_t(HE) * Dn),
+                        row(qeff_b_, i, size_t(HE) * Lk)},
+                       {{&Lk,4},{&Dn,4},{&Dv,4}}, HE * Lk, 32, true);
+        mtl_->dispatch("mla_kv_norm_rope_store_r1",
+                       {row(kva_b_, i, Lk + Dr), w.kv_a_norm,
+                        c_kv_[L], k_rope_[L]},
+                       {{&Lk,4},{&Dr,4},{&position,4},{&ms,4},{&eps,4},{&theta,4}},
+                       1, TG_RED, true);
+    }
+    if (pos_ + count < 1024) {
+        mtl_->dispatch2d("mla_attn_prefill_r1_q4",
+                         {qeff_b_, qr_b_, c_kv_[L], k_rope_[L], olat_b_},
+                         {{&HE,4},{&count,4},{&pos_,4},{&ms,4},{&scale,4}},
+                         HE, (count + 3) / 4, TG_RED);
+    } else for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t T = pos_ + i + 1;
+        constexpr uint32_t blocks = 32;
+        if (validate_mla_ && T == 1024)
+            mtl_->dispatch("mla_attn_decode_f32",
+                           {row(qeff_b_, i, size_t(HE) * Lk),
+                            row(qr_b_, i, size_t(HE) * Dr), c_kv_[L],
+                            k_rope_[L], o_lat_ref_, scores_},
+                           {{&HE,4},{&Lk,4},{&Dr,4},{&layer,4},{&T,4},{&ms,4},{&scale,4}},
+                           HE, TG_RED, true);
+        mtl_->dispatch2d("mla_attn_online_r1_pass1",
+                         {row(qeff_b_, i, size_t(HE) * Lk),
+                          row(qr_b_, i, size_t(HE) * Dr), c_kv_[L], k_rope_[L],
+                          attn_partials_, attn_stats_},
+                         {{&T,4},{&ms,4},{&scale,4}}, blocks, HE, 32);
+        mtl_->dispatch("mla_attn_online_r1_pass2",
+                       {attn_partials_, attn_stats_, row(olat_b_, i, size_t(HE) * Lk)},
+                       {}, HE, 32, true);
+        if (validate_mla_ && T == 1024) {
+            mtl_->flush();
+            validate_mla_output_(L, T, o_lat_ref_,
+                                 row(olat_b_, i, size_t(HE) * Lk));
+        }
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        mtl_->dispatch("mla_q6_kv_b_value_r1",
+                       {w.kv_b.buffer, row(olat_b_, i, size_t(HE) * Lk),
+                        row(ofull_b_, i, size_t(HE) * Dv)},
+                       {{&Lk,4},{&Dn,4},{&Dv,4}}, HE * Dv, 32, true);
+    }
+    dispatch_projection_batch_(w.attn_output, ofull_b_, attnout_b_, count);
+    axpy_f32(*mtl_, x_b_, attnout_b_, 1.0f, count * H);
+    mtl_->commit_and_wait();
+    if (profile_layers_)
+        prof::log("prefill-stage layer=%u name=attention tokens=%u wall_us=%lld "
+                  "gpu_us=%lld dispatches=%d", L, count, prof::now_us() - started,
+                  mtl_->last_gpu_us(), mtl_->step_dispatches - dispatches_before);
+}
+
+void GgufRuntime::validate_mla_output_(uint32_t layer, uint32_t context,
+                                       const MtlBuf& reference,
+                                       const MtlBuf& candidate) const {
+    const size_t count = size_t(cfg_.n_heads) * cfg_.kv_lora_rank;
+    const auto* ref = static_cast<const float*>(reference.contents);
+    const auto* got = static_cast<const float*>(candidate.contents);
+    double diff2 = 0.0, ref2 = 0.0, got2 = 0.0, dot = 0.0;
+    float max_abs = 0.0f, max_rel = 0.0f;
+    size_t worst = 0;
+    uint32_t nonfinite = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (!std::isfinite(ref[i]) || !std::isfinite(got[i])) {
+            ++nonfinite;
+            continue;
+        }
+        const float error = std::abs(got[i] - ref[i]);
+        const float relative = error / std::max(std::abs(ref[i]), 1e-6f);
+        if (error > max_abs) { max_abs = error; worst = i; }
+        max_rel = std::max(max_rel, relative);
+        diff2 += double(error) * error;
+        ref2 += double(ref[i]) * ref[i];
+        got2 += double(got[i]) * got[i];
+        dot += double(ref[i]) * got[i];
+    }
+    const double rms = std::sqrt(diff2 / count);
+    const double relative_l2 = std::sqrt(diff2 / std::max(ref2, 1e-30));
+    const double cosine = dot / std::sqrt(std::max(ref2 * got2, 1e-30));
+    prof::log("accuracy-mla layer=%u context=%u count=%zu max_abs=%.9g "
+              "max_rel=%.9g rms=%.9g relative_l2=%.9g cosine=%.12g "
+              "worst=%zu ref=%.9g candidate=%.9g nonfinite=%u",
+              layer, context, count, max_abs, max_rel, rms, relative_l2,
+              cosine, worst, ref[worst], got[worst], nonfinite);
+    if (nonfinite) die("nonfinite MLA validation output");
 }
 
 void GgufRuntime::attention_batch_(uint32_t L, uint32_t count) {
+    if (compact_mla_) { attention_batch_compact_(L, count); return; }
     const auto& w = lw_[L];
     const uint32_t H = cfg_.hidden, Dn = cfg_.key_length - cfg_.rope_dim;
     const uint32_t Dr = cfg_.rope_dim, Dv = cfg_.value_length;
@@ -1100,17 +1430,10 @@ void GgufRuntime::attention_batch_(uint32_t L, uint32_t count) {
     };
 
     mtl_->begin();
-    for (uint32_t i = 0; i < count; ++i)
-        rmsnorm_f32(*mtl_, row(x_b_, i, H), w.attn_norm,
-                    row(xn_b_, i, H), H, eps);
-    for (uint32_t i = 0; i < count; ++i)
-        dispatch_projection_(w.q_a, row(xn_b_, i, H), row(qa_b_, i, Hi));
-    for (uint32_t i = 0; i < count; ++i)
-        rmsnorm_f32(*mtl_, row(qa_b_, i, Hi), w.q_a_norm,
-                    row(qan_b_, i, Hi), Hi, eps);
-    for (uint32_t i = 0; i < count; ++i)
-        dispatch_projection_(w.q_b, row(qan_b_, i, Hi),
-                             row(qf_b_, i, size_t(HE) * (Dn + Dr)));
+    rmsnorm_f32(*mtl_, x_b_, w.attn_norm, xn_b_, H, eps, count);
+    dispatch_projection_batch_(w.q_a, xn_b_, qa_b_, count);
+    rmsnorm_f32(*mtl_, qa_b_, w.q_a_norm, qan_b_, Hi, eps, count);
+    dispatch_projection_batch_(w.q_b, qan_b_, qf_b_, count);
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t position = pos_ + i;
         mtl_->dispatch("mla_q_split_rope_r1",
@@ -1120,9 +1443,7 @@ void GgufRuntime::attention_batch_(uint32_t L, uint32_t count) {
                        {{&Dn,4},{&Dr,4},{&position,4},{&theta,4}},
                        HE, TG_ELT, true);
     }
-    for (uint32_t i = 0; i < count; ++i)
-        dispatch_projection_(w.kv_a, row(xn_b_, i, H),
-                             row(kva_b_, i, Lk + Dr));
+    dispatch_projection_batch_(w.kv_a, xn_b_, kva_b_, count);
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t position = pos_ + i;
         mtl_->dispatch("mha_kv_norm_rope_r1",
@@ -1131,9 +1452,7 @@ void GgufRuntime::attention_batch_(uint32_t L, uint32_t count) {
                        {{&Lk,4},{&Dr,4},{&cache_layer,4},{&position,4},
                         {&ms,4},{&eps,4},{&theta,4}}, 1, TG_RED, true);
     }
-    for (uint32_t i = 0; i < count; ++i)
-        dispatch_projection_(w.kv_b, row(kvlat_b_, i, Lk),
-                             row(kvfull_b_, i, size_t(HE) * (Dn + Dv)));
+    dispatch_projection_batch_(w.kv_b, kvlat_b_, kvfull_b_, count);
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t position = pos_ + i;
         mtl_->dispatch("mha_kv_store_f16",
@@ -1152,36 +1471,33 @@ void GgufRuntime::attention_batch_(uint32_t L, uint32_t count) {
                        {{&HE,4},{&Dn,4},{&Dr,4},{&Dv,4},{&cache_layer,4},
                         {&T,4},{&ms,4},{&scale,4}}, HE, TG_RED, true);
     }
-    for (uint32_t i = 0; i < count; ++i)
-        dispatch_projection_(w.attn_output,
-                             row(ofull_b_, i, size_t(HE) * Dv),
-                             row(attnout_b_, i, H));
+    dispatch_projection_batch_(w.attn_output, ofull_b_, attnout_b_, count);
     axpy_f32(*mtl_, x_b_, attnout_b_, 1.0f, count * H);
     mtl_->commit_and_wait();
 }
 
 void GgufRuntime::dense_batch_(uint32_t L, uint32_t count) {
+    const long long started = prof::now_us();
+    const int dispatches_before = mtl_->step_dispatches;
     const auto& w = lw_[L];
     const uint32_t H = cfg_.hidden, F = w.ffn_gate.N;
-    auto row = [](const MtlBuf& b, uint32_t i, size_t n) {
-        return view(b, size_t(i) * n * sizeof(float), n * sizeof(float));
-    };
     mtl_->begin();
-    for (uint32_t i = 0; i < count; ++i)
-        rmsnorm_f32(*mtl_, row(x_b_, i, H), w.ffn_norm,
-                    row(xn_b_, i, H), H, cfg_.rms_eps);
-    for (uint32_t i = 0; i < count; ++i)
-        dispatch_projection_(w.ffn_gate, row(xn_b_, i, H), row(fg_b_, i, F));
-    for (uint32_t i = 0; i < count; ++i)
-        dispatch_projection_(w.ffn_up, row(xn_b_, i, H), row(fu_b_, i, F));
+    rmsnorm_f32(*mtl_, x_b_, w.ffn_norm, xn_b_, H, cfg_.rms_eps, count);
+    dispatch_projection_batch_(w.ffn_gate, xn_b_, fg_b_, count);
+    dispatch_projection_batch_(w.ffn_up, xn_b_, fu_b_, count);
     swiglu_f32(*mtl_, fg_b_, fu_b_, fa_b_, count * F);
-    for (uint32_t i = 0; i < count; ++i)
-        dispatch_projection_(w.ffn_down, row(fa_b_, i, F), row(fo_b_, i, H));
+    dispatch_projection_batch_(w.ffn_down, fa_b_, fo_b_, count);
     axpy_f32(*mtl_, x_b_, fo_b_, 1.0f, count * H);
     mtl_->commit_and_wait();
+    if (profile_layers_)
+        prof::log("prefill-stage layer=%u name=dense tokens=%u wall_us=%lld "
+                  "gpu_us=%lld dispatches=%d", L, count, prof::now_us() - started,
+                  mtl_->last_gpu_us(), mtl_->step_dispatches - dispatches_before);
 }
 
 void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
+    const long long fixed_started = prof::now_us();
+    const int fixed_dispatches = mtl_->step_dispatches;
     const auto& w = lw_[L];
     const uint32_t H = cfg_.hidden, Fe = cfg_.expert_ffn;
     const uint32_t Fs = w.ffn_gate.N, K = cfg_.n_experts_active;
@@ -1191,11 +1507,8 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
     };
 
     mtl_->begin();
-    for (uint32_t i = 0; i < count; ++i)
-        rmsnorm_f32(*mtl_, row(x_b_, i, H), w.ffn_norm,
-                    row(xn_b_, i, H), H, cfg_.rms_eps);
-    for (uint32_t i = 0; i < count; ++i)
-        dispatch_projection_(w.router, row(xn_b_, i, H), row(rlog_b_, i, Ne));
+    rmsnorm_f32(*mtl_, x_b_, w.ffn_norm, xn_b_, H, cfg_.rms_eps, count);
+    dispatch_projection_batch_(w.router, xn_b_, rlog_b_, count);
     const float route_scale = cfg_.expert_weights_scale;
     const uint32_t route_norm = cfg_.expert_weights_norm;
     const uint32_t groups = cfg_.n_expert_groups, top_groups = cfg_.n_limited_groups;
@@ -1206,14 +1519,14 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
                         view(rwts_b_, size_t(i) * K * 4, size_t(K) * 4)},
                        {{&Ne,4},{&K,4},{&groups,4},{&top_groups,4},
                         {&route_scale,4},{&route_norm,4}}, 1, 1, true);
-    for (uint32_t i = 0; i < count; ++i)
-        dispatch_projection_(w.ffn_gate, row(xn_b_, i, H), row(fg_b_, i, Fs));
-    for (uint32_t i = 0; i < count; ++i)
-        dispatch_projection_(w.ffn_up, row(xn_b_, i, H), row(fu_b_, i, Fs));
+    dispatch_projection_batch_(w.ffn_gate, xn_b_, fg_b_, count);
+    dispatch_projection_batch_(w.ffn_up, xn_b_, fu_b_, count);
     swiglu_f32(*mtl_, fg_b_, fu_b_, fa_b_, count * Fs);
-    for (uint32_t i = 0; i < count; ++i)
-        dispatch_projection_(w.ffn_down, row(fa_b_, i, Fs), row(fo_b_, i, H));
+    dispatch_projection_batch_(w.ffn_down, fa_b_, fo_b_, count);
     mtl_->commit_and_wait();
+    const long long fixed_wall_us = prof::now_us() - fixed_started;
+    const long long fixed_gpu_us = mtl_->last_gpu_us();
+    const int fixed_dispatch_count = mtl_->step_dispatches - fixed_dispatches;
 
     constexpr size_t assignments = size_t(kPrefillBatch) * 256;
     std::array<uint32_t, assignments> tokens{};
@@ -1249,24 +1562,34 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
     const uint64_t gate_stride = stride(gate_name), up_stride = stride(up_name);
     const uint64_t down_stride = stride(down_name);
 
-    for (uint32_t base = 0; base < active_count; base += 8) {
+    std::array<std::array<LoadedWeight, 24>, 2> loaded{};
+    auto queue_group = [&](uint32_t base, uint32_t bank) {
         const uint32_t group_count = std::min(8u, active_count - base);
-        std::array<LoadedWeight, 24> loaded{};
-        expert_slot_cursor_ = 0;
+        expert_slot_cursor_ = bank * kDecodeExpertSlots;
         for (uint32_t j = 0; j < group_count; ++j) {
             const uint32_t expert = active[base + j];
-            loaded[j * 3] = load_weight_(gate_name, H, Fe, expert, gate_stride);
-            loaded[j * 3 + 1] = load_weight_(up_name, H, Fe, expert, up_stride);
-            loaded[j * 3 + 2] = load_weight_(down_name, Fe, H, expert, down_stride);
+            loaded[bank][j * 3] = load_weight_(gate_name, H, Fe, expert, gate_stride);
+            loaded[bank][j * 3 + 1] = load_weight_(up_name, H, Fe, expert, up_stride);
+            loaded[bank][j * 3 + 2] = load_weight_(down_name, Fe, H, expert, down_stride);
         }
-        for (uint32_t j = 0; j < group_count * 3; ++j) wait_weight_(loaded[j]);
+    };
+    long long pipeline_wait_us = 0, pipeline_gpu_us = 0;
+    queue_group(0, 0);
+    for (uint32_t base = 0; base < active_count; base += 8) {
+        const uint32_t bank = (base / 8) & 1u;
+        const uint32_t group_count = std::min(8u, active_count - base);
+        const long long wait_started = prof::now_us();
+        for (uint32_t j = 0; j < group_count * 3; ++j)
+            wait_weight_(loaded[bank][j]);
+        pipeline_wait_us += prof::now_us() - wait_started;
+        if (base + 8 < active_count) queue_group(base + 8, bank ^ 1u);
         mtl_->begin();
         for (uint32_t j = 0; j < group_count; ++j) {
             const uint32_t expert = active[base + j], n = counts[expert];
             const size_t offset = size_t(expert) * kPrefillBatch;
-            auto& gate = loaded[j * 3];
-            auto& up = loaded[j * 3 + 1];
-            auto& down = loaded[j * 3 + 2];
+            auto& gate = loaded[bank][j * 3];
+            auto& up = loaded[bank][j * 3 + 1];
+            auto& down = loaded[bank][j * 3 + 2];
             if (gate.entry->type == GGML_IQ1_S && up.entry->type == GGML_IQ1_S) {
                 mtl_->dispatch2d("expert_gate_up_swiglu_iq1_s_b",
                                  {gate.buffer, up.buffer, xn_b_, fa_b_, iq1s_grid_b_},
@@ -1282,10 +1605,10 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
                 }
             }
             if (down.entry->type == GGML_IQ1_S) {
-                mtl_->dispatch2d("expert_down_iq1_s_b",
+                mtl_->dispatch2d("expert_down_iq1_s_b_r4",
                                  {down.buffer, fa_b_, routed_b_, iq1s_grid_b_},
                                  {{slots.data() + offset, size_t(n) * 4},
-                                  {&Fe,4},{&H,4}}, H, n, 32);
+                                  {&Fe,4},{&H,4}}, H / 4, n, 32);
             } else {
                 for (uint32_t item = 0; item < n; ++item)
                     dispatch_weight_(down, row(fa_b_, item, Fe),
@@ -1293,14 +1616,21 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
             }
         }
         mtl_->commit_and_wait();
-        for (uint32_t j = 0; j < group_count * 3; ++j) release_weight_(loaded[j]);
+        pipeline_gpu_us += mtl_->last_gpu_us();
+        for (uint32_t j = 0; j < group_count * 3; ++j)
+            release_weight_(loaded[bank][j]);
     }
     mtl_->begin();
     mtl_->dispatch("moe_residual_merge_f32", {x_b_, fo_b_, routed_b_, rwts_b_},
                    {{&H,4},{&K,4}}, count * H, TG_ELT, false);
     mtl_->commit_and_wait();
-    prof::log("prefill-moe layer=%u tokens=%u expert_union=%u selections=%u",
-              L, count, active_count, count * K);
+    const long long merge_gpu_us = mtl_->last_gpu_us();
+    prof::log("prefill-moe layer=%u tokens=%u expert_union=%u selections=%u "
+              "fixed_wall_us=%lld fixed_gpu_us=%lld fixed_dispatches=%d "
+              "pipeline_wait_us=%lld pipeline_gpu_us=%lld merge_gpu_us=%lld",
+              L, count, active_count, count * K,
+              fixed_wall_us, fixed_gpu_us, fixed_dispatch_count,
+              pipeline_wait_us, pipeline_gpu_us, merge_gpu_us);
 }
 
 void GgufRuntime::prefill_chunk_(const uint32_t* ids, uint32_t count) {
@@ -1317,12 +1647,29 @@ void GgufRuntime::prefill_chunk_(const uint32_t* ids, uint32_t count) {
                                         size_t(cfg_.hidden) * 4));
     begin_stage_layer_(0, 0);
     for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
+        const long long layer_started = prof::now_us();
+        const long long gpu_before = mtl_->step_gpu_us;
+        const int cmdbufs_before = mtl_->step_cmdbufs;
+        const int dispatches_before = mtl_->step_dispatches;
+        const auto io_before = profile_layers_ ? gm_->ring().stats() : PreadRing::Stats{};
         const uint32_t slot = L & 1u;
         wait_stage_layer_(L, slot);
         if (L + 1 < cfg_.n_layers) begin_stage_layer_(L + 1, slot ^ 1u);
         attention_batch_(L, count);
         if (L < cfg_.n_dense_layers) dense_batch_(L, count);
         else moe_batch_(L, count);
+        if (profile_layers_) {
+            const auto io_after = gm_->ring().stats();
+            prof::log("prefill-layer begin=%u layer=%u tokens=%u wall_us=%lld "
+                      "gpu_us=%lld nvme_bytes=%llu nvme_reads=%llu cmdbufs=%d "
+                      "dispatches=%d",
+                      pos_, L, count, prof::now_us() - layer_started,
+                      mtl_->step_gpu_us - gpu_before,
+                      static_cast<unsigned long long>(io_after.bytes - io_before.bytes),
+                      static_cast<unsigned long long>(io_after.requests - io_before.requests),
+                      mtl_->step_cmdbufs - cmdbufs_before,
+                      mtl_->step_dispatches - dispatches_before);
+        }
     }
     const auto last_x = view(x_b_, size_t(count - 1) * cfg_.hidden * 4,
                              size_t(cfg_.hidden) * 4);
@@ -1438,10 +1785,12 @@ void GgufRuntime::forward_one_(uint32_t tok) {
         ? double(io.bytes) / (io.elapsed_us * 1e3) : 0.0;
     const int64_t memory_delta = int64_t(memory_before.available) -
                                  int64_t(memory_after.available);
-    const uint64_t kv_bytes = uint64_t(cfg_.n_layers) *
-        (uint64_t(cfg_.n_heads) *
-         ((cfg_.key_length - cfg_.rope_dim) + cfg_.value_length) +
-         cfg_.rope_dim) * sizeof(uint16_t);
+    const uint64_t kv_width = compact_mla_
+        ? uint64_t(cfg_.kv_lora_rank) + cfg_.rope_dim
+        : uint64_t(cfg_.n_heads) *
+              ((cfg_.key_length - cfg_.rope_dim) + cfg_.value_length) +
+              cfg_.rope_dim;
+    const uint64_t kv_bytes = uint64_t(cfg_.n_layers) * kv_width * sizeof(uint16_t);
     prof::log(
         "metrics pos=%u wall_us=%lld gpu_us=%lld io_wait_us=%lld model_bytes=%llu "
         "nvme_bytes=%llu nvme_span_us=%llu nvme_gbps=%.3f useful_reads=%llu nvme_reads=%llu "
@@ -1476,12 +1825,23 @@ uint32_t GgufRuntime::sample_logits_() {
     if (temperature_ == 0.0f) {
         uint32_t best = 0;
         float best_value = -INFINITY;
+        float second_value = -INFINITY;
+        uint32_t nonfinite = 0;
         for (uint32_t i = 0; i < cfg_.vocab; ++i) {
             const float value = raw[i];
-            if (value > best_value) { best = i; best_value = value; }
+            if (!std::isfinite(value)) { ++nonfinite; continue; }
+            if (value > best_value) {
+                second_value = best_value;
+                best = i;
+                best_value = value;
+            } else if (value > second_value) {
+                second_value = value;
+            }
         }
-        prof::log("sample pos=%u mode=greedy token=%u logit=%.6g",
-                  pos_, best, best_value);
+        if (nonfinite) die("nonfinite output logits");
+        prof::log("sample pos=%u mode=greedy token=%u logit=%.6g "
+                  "runner_up=%.6g margin=%.6g nonfinite=0",
+                  pos_, best, best_value, second_value, best_value - second_value);
         if (trace_) {
             std::array<std::pair<float, uint32_t>, 8> top{};
             for (auto& item : top) item = {-INFINITY, 0};
@@ -1566,6 +1926,12 @@ void GgufRuntime::trace_hidden_(uint32_t layer) const {
 
 uint32_t GgufRuntime::prefill(const uint32_t* ids, uint32_t n) {
     if (n == 0) die("prefill: empty prompt");
+    if (n > 1) {
+        for (uint32_t i = kDecodeExpertSlots; i < kExpertSlots; ++i)
+            expert_slots_[i] = mtl_->alloc(expert_slot_bytes_);
+        prof::log("gguf_runtime: prefill expert bank +%.3f MB",
+                  kDecodeExpertSlots * expert_slot_bytes_ / 1e6);
+    }
     long long t0 = prof::now_us();
     for (uint32_t i = 0; i < n;) {
         const uint32_t count = std::min(kPrefillBatch, n - i);
@@ -1573,6 +1939,9 @@ uint32_t GgufRuntime::prefill(const uint32_t* ids, uint32_t n) {
         else prefill_chunk_(ids + i, count);
         i += count;
     }
+    if (n > 1)
+        for (uint32_t i = kDecodeExpertSlots; i < kExpertSlots; ++i)
+            mtl_->release(expert_slots_[i]);
     long long us = prof::now_us() - t0;
     prof::log("gguf_runtime: prefill %u tok in %lld us (%.2f tok/s) rss=%zuMB",
               n, us, n * 1e6 / (us ? us : 1), prof::rss_mb());
@@ -1616,7 +1985,8 @@ bool GgufRuntime::save_state(const std::string& path) const {
     const std::string partial = path + ".partial";
     FILE* f = std::fopen(partial.c_str(), "wb");
     if (!f) return false;
-    StateHeader h{{'M','B','L','K','S','T','A','T'}, 3, cfg_.n_layers,
+    StateHeader h{{'M','B','L','K','S','T','A','T'}, compact_mla_ ? 4u : 3u,
+                  cfg_.n_layers,
                   cfg_.max_seq, cfg_.kv_lora_rank, cfg_.rope_dim, pos_,
                   predicted_token()};
     bool ok = std::fwrite(&h, sizeof(h), 1, f) == 1;
@@ -1624,15 +1994,21 @@ bool GgufRuntime::save_state(const std::string& path) const {
         (cfg_.key_length - cfg_.rope_dim);
     const uint64_t val_width = uint64_t(cfg_.n_heads) * cfg_.value_length;
     for (uint32_t l = 0; ok && l < cfg_.n_layers; ++l) {
-        const auto* key = static_cast<const uint16_t*>(k_nope_[l].contents);
-        const auto* val = static_cast<const uint16_t*>(v_cache_[l].contents);
         const auto* rope = static_cast<const uint16_t*>(k_rope_[l].contents);
-        ok = std::fwrite(key, sizeof(uint16_t),
-                         uint64_t(pos_) * key_width, f) ==
-             uint64_t(pos_) * key_width;
-        if (ok) ok = std::fwrite(val, sizeof(uint16_t),
-                                  uint64_t(pos_) * val_width, f) ==
-                     uint64_t(pos_) * val_width;
+        if (compact_mla_) {
+            const auto* latent = static_cast<const uint16_t*>(c_kv_[l].contents);
+            ok = std::fwrite(latent, sizeof(uint16_t),
+                             uint64_t(pos_) * cfg_.kv_lora_rank, f) ==
+                 uint64_t(pos_) * cfg_.kv_lora_rank;
+        } else {
+            const auto* key = static_cast<const uint16_t*>(k_nope_[l].contents);
+            const auto* val = static_cast<const uint16_t*>(v_cache_[l].contents);
+            ok = std::fwrite(key, sizeof(uint16_t), uint64_t(pos_) * key_width, f) ==
+                 uint64_t(pos_) * key_width;
+            if (ok) ok = std::fwrite(val, sizeof(uint16_t),
+                                      uint64_t(pos_) * val_width, f) ==
+                         uint64_t(pos_) * val_width;
+        }
         if (ok) ok = std::fwrite(rope, sizeof(uint16_t),
                                   uint64_t(pos_) * cfg_.rope_dim, f) ==
                      uint64_t(pos_) * cfg_.rope_dim;
@@ -1653,9 +2029,10 @@ bool GgufRuntime::load_state(const std::string& path) {
     if (!f) return false;
     StateHeader h{};
     StateHeaderV1 old{};
+    const uint32_t expected_version = compact_mla_ ? 4u : 3u;
     bool ok = std::fread(&old, sizeof(old), 1, f) == 1 &&
               std::memcmp(old.magic, "MBLKSTAT", 8) == 0 &&
-              old.version == 3;
+              old.version == expected_version;
     if (ok) {
         std::memcpy(h.magic, old.magic, sizeof(old.magic));
         h.version = old.version;
@@ -1674,15 +2051,21 @@ bool GgufRuntime::load_state(const std::string& path) {
         (cfg_.key_length - cfg_.rope_dim);
     const uint64_t val_width = uint64_t(cfg_.n_heads) * cfg_.value_length;
     for (uint32_t l = 0; ok && l < cfg_.n_layers; ++l) {
-        auto* key = static_cast<uint16_t*>(k_nope_[l].contents);
-        auto* val = static_cast<uint16_t*>(v_cache_[l].contents);
         auto* rope = static_cast<uint16_t*>(k_rope_[l].contents);
-        ok = std::fread(key, sizeof(uint16_t),
-                        uint64_t(h.pos) * key_width, f) ==
-             uint64_t(h.pos) * key_width;
-        if (ok) ok = std::fread(val, sizeof(uint16_t),
-                                 uint64_t(h.pos) * val_width, f) ==
-                     uint64_t(h.pos) * val_width;
+        if (compact_mla_) {
+            auto* latent = static_cast<uint16_t*>(c_kv_[l].contents);
+            ok = std::fread(latent, sizeof(uint16_t),
+                            uint64_t(h.pos) * cfg_.kv_lora_rank, f) ==
+                 uint64_t(h.pos) * cfg_.kv_lora_rank;
+        } else {
+            auto* key = static_cast<uint16_t*>(k_nope_[l].contents);
+            auto* val = static_cast<uint16_t*>(v_cache_[l].contents);
+            ok = std::fread(key, sizeof(uint16_t), uint64_t(h.pos) * key_width, f) ==
+                 uint64_t(h.pos) * key_width;
+            if (ok) ok = std::fread(val, sizeof(uint16_t),
+                                     uint64_t(h.pos) * val_width, f) ==
+                        uint64_t(h.pos) * val_width;
+        }
         if (ok) ok = std::fread(rope, sizeof(uint16_t),
                                  uint64_t(h.pos) * cfg_.rope_dim, f) ==
                      uint64_t(h.pos) * cfg_.rope_dim;
