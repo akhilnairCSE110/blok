@@ -41,6 +41,9 @@ void Metal::init(const char* kernel_path) {
 #else
     opts.fastMathEnabled = NO;
 #endif
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+    opts.languageVersion = MTLLanguageVersion4_0;
+#endif
     library_ = (__bridge_retained void*)[DEV newLibraryWithSource:source
                                                           options:opts
                                                             error:&err];

@@ -95,6 +95,8 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--trace", action="store_true", help="log per-layer numerical telemetry")
     parser.add_argument("--profile-layers", action="store_true",
                         help="log per-layer GPU and NVMe attribution")
+    parser.add_argument("--profile-ops", action="store_true",
+                        help="split profiled stages and log per-operation GPU timing")
     parser.add_argument("--mla", action="store_true",
                         help="use explicit compact MLA mode for long context")
     parser.add_argument("--validate-mla", action="store_true",
@@ -163,6 +165,9 @@ def run(args: argparse.Namespace) -> int:
         env["METALBLOK_TRACE"] = "1"
     if args.profile_layers:
         env["METALBLOK_PROFILE_LAYERS"] = "1"
+    if args.profile_ops:
+        env["METALBLOK_PROFILE_LAYERS"] = "1"
+        env["METALBLOK_PROFILE_OPS"] = "1"
     if args.validate_mla:
         if not args.mla:
             raise Error("--validate-mla requires --mla")

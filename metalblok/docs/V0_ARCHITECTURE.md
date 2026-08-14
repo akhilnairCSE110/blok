@@ -111,6 +111,9 @@ must include repack/storage bytes and parity. With current GPU time already
 mostly hidden under a much longer SSD span, an unmeasured accelerator rewrite
 is lower leverage than removing model bytes or I/O stalls.
 
+The durable TensorOps, Metal 4, Metal I/O, tiling, and profiling research notes
+are in [M5 TensorOps and Metal I/O engineering notes](M5_TENSOROPS_AND_METAL_IO.md).
+
 ## 3. Frozen model geometry
 
 | Symbol | Meaning | Value |

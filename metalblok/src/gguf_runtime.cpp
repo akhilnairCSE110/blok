@@ -152,6 +152,8 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
     pos_ = 0;
     trace_ = std::getenv("METALBLOK_TRACE") != nullptr;
     profile_layers_ = std::getenv("METALBLOK_PROFILE_LAYERS") != nullptr;
+    profile_ops_ = std::getenv("METALBLOK_PROFILE_OPS") != nullptr;
+    profile_layers_ |= profile_ops_;
     compact_mla_ = std::getenv("METALBLOK_MLA") != nullptr;
     validate_mla_ = std::getenv("METALBLOK_VALIDATE_MLA") != nullptr;
     if (validate_mla_ && !compact_mla_) die("MLA validation requires compact MLA");
@@ -517,7 +519,10 @@ void GgufRuntime::alloc_activations_() {
     kva_b_     = fp32(B * (Lk + Dr));
     kvlat_b_   = fp32(B * Lk);
     kvfull_b_  = fp32(B * HE * (Dn + Dv));
-    if (compact_mla_) olat_b_ = fp32(B * HE * Lk);
+    if (compact_mla_) {
+        olat_b_ = fp32(B * HE * Lk);
+        if (validate_mla_) olat_candidate_ = fp32(B * HE * Lk);
+    }
     ofull_b_   = fp32(B * HE * Dv);
     attnout_b_ = fp32(B * H);
     fg_b_      = fp32(B * F_max);
@@ -803,6 +808,16 @@ void GgufRuntime::dispatch_projection_batch_(const Projection& projection,
         return;
     }
     const uint32_t K = projection.K, N = projection.N;
+    const char* qmm = nullptr;
+    if (projection.entry->type == GGML_Q4_K) qmm = "qmm_q4_K_f32_m32n32k128";
+    if (projection.entry->type == GGML_Q5_K) qmm = "qmm_q5_K_f32_m32n32k128";
+    if (projection.entry->type == GGML_Q6_K) qmm = "qmm_q6_K_f32_m32n32k128";
+    if (count == kPrefillBatch && qmm) {
+        mtl_->dispatch2d(qmm,
+                         {projection.buffer, x, y},
+                         {{&K,4},{&N,4},{&count,4}}, N / 32, count / 32, 128);
+        return;
+    }
     if (projection.entry->type == GGML_IQ1_S) {
         mtl_->dispatch2d("gemv_iq1_s_f32_b",
                          {projection.buffer, x, y, iq1s_grid_b_},
@@ -1301,6 +1316,7 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
 
 void GgufRuntime::attention_batch_compact_(uint32_t L, uint32_t count) {
     const long long started = prof::now_us();
+    const long long gpu_before = mtl_->step_gpu_us;
     const int dispatches_before = mtl_->step_dispatches;
     const auto& w = lw_[L];
     const uint32_t H = cfg_.hidden, Dn = cfg_.key_length - cfg_.rope_dim;
@@ -1312,13 +1328,33 @@ void GgufRuntime::attention_batch_compact_(uint32_t L, uint32_t count) {
     auto row = [](const MtlBuf& b, uint32_t i, size_t n) {
         return view(b, size_t(i) * n * sizeof(float), n * sizeof(float));
     };
+    long long op_started = started, op_gpu = gpu_before;
+    int op_dispatches = dispatches_before;
+    auto profile_op = [&](const char* name, bool final = false) {
+        if (!profile_ops_) return false;
+        if (final) mtl_->commit_and_wait(); else mtl_->flush();
+        const long long now = prof::now_us();
+        prof::log("profile-op layer=%u stage=attention op=%s tokens=%u "
+                  "wall_us=%lld gpu_us=%lld dispatches=%d", L, name, count,
+                  now - op_started, mtl_->step_gpu_us - op_gpu,
+                  mtl_->step_dispatches - op_dispatches);
+        op_started = now;
+        op_gpu = mtl_->step_gpu_us;
+        op_dispatches = mtl_->step_dispatches;
+        return final;
+    };
 
     mtl_->begin();
     rmsnorm_f32(*mtl_, x_b_, w.attn_norm, xn_b_, H, eps, count);
+    profile_op("input_norm");
     dispatch_projection_batch_(w.q_a, xn_b_, qa_b_, count);
+    profile_op("q_a");
     rmsnorm_f32(*mtl_, qa_b_, w.q_a_norm, qan_b_, Hi, eps, count);
+    profile_op("q_a_norm");
     dispatch_projection_batch_(w.q_b, qan_b_, qf_b_, count);
+    profile_op("q_b");
     dispatch_projection_batch_(w.kv_a, xn_b_, kva_b_, count);
+    profile_op("kv_a");
     for (uint32_t i = 0; i < count; ++i) {
         const uint32_t position = pos_ + i;
         mtl_->dispatch("mla_q_split_rope_r1",
@@ -1337,34 +1373,51 @@ void GgufRuntime::attention_batch_compact_(uint32_t L, uint32_t count) {
                        {{&Lk,4},{&Dr,4},{&position,4},{&ms,4},{&eps,4},{&theta,4}},
                        1, TG_RED, true);
     }
-    if (pos_ + count < 1024) {
-        mtl_->dispatch2d("mla_attn_prefill_r1_q4",
-                         {qeff_b_, qr_b_, c_kv_[L], k_rope_[L], olat_b_},
-                         {{&HE,4},{&count,4},{&pos_,4},{&ms,4},{&scale,4}},
-                         HE, (count + 3) / 4, TG_RED);
-    } else for (uint32_t i = 0; i < count; ++i) {
+    profile_op("mla_prepare");
+    for (uint32_t i = 0; i < count; ++i) {
         const uint32_t T = pos_ + i + 1;
-        constexpr uint32_t blocks = 32;
-        if (validate_mla_ && T == 1024)
+        if (T < 1024) {
             mtl_->dispatch("mla_attn_decode_f32",
                            {row(qeff_b_, i, size_t(HE) * Lk),
                             row(qr_b_, i, size_t(HE) * Dr), c_kv_[L],
-                            k_rope_[L], o_lat_ref_, scores_},
+                            k_rope_[L], row(olat_b_, i, size_t(HE) * Lk), scores_},
                            {{&HE,4},{&Lk,4},{&Dr,4},{&layer,4},{&T,4},{&ms,4},{&scale,4}},
                            HE, TG_RED, true);
-        mtl_->dispatch2d("mla_attn_online_r1_pass1",
-                         {row(qeff_b_, i, size_t(HE) * Lk),
-                          row(qr_b_, i, size_t(HE) * Dr), c_kv_[L], k_rope_[L],
-                          attn_partials_, attn_stats_},
-                         {{&T,4},{&ms,4},{&scale,4}}, blocks, HE, 32);
-        mtl_->dispatch("mla_attn_online_r1_pass2",
-                       {attn_partials_, attn_stats_, row(olat_b_, i, size_t(HE) * Lk)},
-                       {}, HE, 32, true);
-        if (validate_mla_ && T == 1024) {
-            mtl_->flush();
-            validate_mla_output_(L, T, o_lat_ref_,
-                                 row(olat_b_, i, size_t(HE) * Lk));
+        } else {
+            constexpr uint32_t blocks = 32;
+            if (validate_mla_ && T == 1024)
+                mtl_->dispatch("mla_attn_decode_f32",
+                               {row(qeff_b_, i, size_t(HE) * Lk),
+                                row(qr_b_, i, size_t(HE) * Dr), c_kv_[L],
+                                k_rope_[L], o_lat_ref_, scores_},
+                               {{&HE,4},{&Lk,4},{&Dr,4},{&layer,4},{&T,4},{&ms,4},{&scale,4}},
+                               HE, TG_RED, true);
+            mtl_->dispatch2d("mla_attn_online_r1_pass1",
+                             {row(qeff_b_, i, size_t(HE) * Lk),
+                              row(qr_b_, i, size_t(HE) * Dr), c_kv_[L], k_rope_[L],
+                              attn_partials_, attn_stats_},
+                             {{&T,4},{&ms,4},{&scale,4}}, blocks, HE, 32);
+            mtl_->dispatch("mla_attn_online_r1_pass2",
+                           {attn_partials_, attn_stats_, row(olat_b_, i, size_t(HE) * Lk)},
+                           {}, HE, 32, true);
+            if (validate_mla_ && T == 1024) {
+                mtl_->flush();
+                validate_mla_output_(L, T, o_lat_ref_,
+                                     row(olat_b_, i, size_t(HE) * Lk));
+            }
         }
+    }
+    profile_op("causal_attention");
+    if (validate_mla_ && L == 0 && pos_ + count < 1024) {
+        mtl_->dispatch2d("mla_attn_prefill_r1_q4",
+                         {qeff_b_, qr_b_, c_kv_[L], k_rope_[L], olat_candidate_},
+                         {{&HE,4},{&count,4},{&pos_,4},{&ms,4},{&scale,4}},
+                         HE, (count + 3) / 4, TG_RED);
+        mtl_->flush();
+        for (uint32_t i = 0; i < count; ++i)
+            validate_mla_output_(L, pos_ + i + 1,
+                row(olat_b_, i, size_t(HE) * Lk),
+                row(olat_candidate_, i, size_t(HE) * Lk));
     }
     for (uint32_t i = 0; i < count; ++i) {
         mtl_->dispatch("mla_q6_kv_b_value_r1",
@@ -1372,13 +1425,19 @@ void GgufRuntime::attention_batch_compact_(uint32_t L, uint32_t count) {
                         row(ofull_b_, i, size_t(HE) * Dv)},
                        {{&Lk,4},{&Dn,4},{&Dv,4}}, HE * Dv, 32, true);
     }
+    profile_op("kv_b_value");
     dispatch_projection_batch_(w.attn_output, ofull_b_, attnout_b_, count);
+    profile_op("output_projection");
     axpy_f32(*mtl_, x_b_, attnout_b_, 1.0f, count * H);
-    mtl_->commit_and_wait();
+    if (!profile_op("residual", true)) mtl_->commit_and_wait();
     if (profile_layers_)
         prof::log("prefill-stage layer=%u name=attention tokens=%u wall_us=%lld "
-                  "gpu_us=%lld dispatches=%d", L, count, prof::now_us() - started,
-                  mtl_->last_gpu_us(), mtl_->step_dispatches - dispatches_before);
+                  "gpu_us=%lld dispatches=%d types=%s,%s,%s,%s", L, count,
+                  prof::now_us() - started, mtl_->step_gpu_us - gpu_before,
+                  mtl_->step_dispatches - dispatches_before,
+                  ggml_type_name(w.q_a.entry->type), ggml_type_name(w.q_b.entry->type),
+                  ggml_type_name(w.kv_a.entry->type),
+                  ggml_type_name(w.attn_output.entry->type));
 }
 
 void GgufRuntime::validate_mla_output_(uint32_t layer, uint32_t context,
@@ -1478,25 +1537,51 @@ void GgufRuntime::attention_batch_(uint32_t L, uint32_t count) {
 
 void GgufRuntime::dense_batch_(uint32_t L, uint32_t count) {
     const long long started = prof::now_us();
+    const long long gpu_before = mtl_->step_gpu_us;
     const int dispatches_before = mtl_->step_dispatches;
     const auto& w = lw_[L];
     const uint32_t H = cfg_.hidden, F = w.ffn_gate.N;
+    long long op_started = started, op_gpu = gpu_before;
+    int op_dispatches = dispatches_before;
+    auto profile_op = [&](const char* name, bool final = false) {
+        if (!profile_ops_) return false;
+        if (final) mtl_->commit_and_wait(); else mtl_->flush();
+        const long long now = prof::now_us();
+        prof::log("profile-op layer=%u stage=dense op=%s tokens=%u wall_us=%lld "
+                  "gpu_us=%lld dispatches=%d", L, name, count,
+                  now - op_started, mtl_->step_gpu_us - op_gpu,
+                  mtl_->step_dispatches - op_dispatches);
+        op_started = now;
+        op_gpu = mtl_->step_gpu_us;
+        op_dispatches = mtl_->step_dispatches;
+        return final;
+    };
     mtl_->begin();
     rmsnorm_f32(*mtl_, x_b_, w.ffn_norm, xn_b_, H, cfg_.rms_eps, count);
+    profile_op("input_norm");
     dispatch_projection_batch_(w.ffn_gate, xn_b_, fg_b_, count);
+    profile_op("gate");
     dispatch_projection_batch_(w.ffn_up, xn_b_, fu_b_, count);
+    profile_op("up");
     swiglu_f32(*mtl_, fg_b_, fu_b_, fa_b_, count * F);
+    profile_op("swiglu");
     dispatch_projection_batch_(w.ffn_down, fa_b_, fo_b_, count);
+    profile_op("down");
     axpy_f32(*mtl_, x_b_, fo_b_, 1.0f, count * H);
-    mtl_->commit_and_wait();
+    if (!profile_op("residual", true)) mtl_->commit_and_wait();
     if (profile_layers_)
         prof::log("prefill-stage layer=%u name=dense tokens=%u wall_us=%lld "
-                  "gpu_us=%lld dispatches=%d", L, count, prof::now_us() - started,
-                  mtl_->last_gpu_us(), mtl_->step_dispatches - dispatches_before);
+                  "gpu_us=%lld dispatches=%d types=%s,%s,%s", L, count,
+                  prof::now_us() - started, mtl_->step_gpu_us - gpu_before,
+                  mtl_->step_dispatches - dispatches_before,
+                  ggml_type_name(w.ffn_gate.entry->type),
+                  ggml_type_name(w.ffn_up.entry->type),
+                  ggml_type_name(w.ffn_down.entry->type));
 }
 
 void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
     const long long fixed_started = prof::now_us();
+    const long long fixed_gpu_before = mtl_->step_gpu_us;
     const int fixed_dispatches = mtl_->step_dispatches;
     const auto& w = lw_[L];
     const uint32_t H = cfg_.hidden, Fe = cfg_.expert_ffn;
@@ -1505,10 +1590,27 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
     auto row = [](const MtlBuf& b, uint32_t i, size_t n) {
         return view(b, size_t(i) * n * sizeof(float), n * sizeof(float));
     };
+    long long op_started = fixed_started, op_gpu = fixed_gpu_before;
+    int op_dispatches = fixed_dispatches;
+    auto profile_op = [&](const char* name, bool final = false) {
+        if (!profile_ops_) return false;
+        if (final) mtl_->commit_and_wait(); else mtl_->flush();
+        const long long now = prof::now_us();
+        prof::log("profile-op layer=%u stage=moe-fixed op=%s tokens=%u wall_us=%lld "
+                  "gpu_us=%lld dispatches=%d", L, name, count,
+                  now - op_started, mtl_->step_gpu_us - op_gpu,
+                  mtl_->step_dispatches - op_dispatches);
+        op_started = now;
+        op_gpu = mtl_->step_gpu_us;
+        op_dispatches = mtl_->step_dispatches;
+        return final;
+    };
 
     mtl_->begin();
     rmsnorm_f32(*mtl_, x_b_, w.ffn_norm, xn_b_, H, cfg_.rms_eps, count);
+    profile_op("input_norm");
     dispatch_projection_batch_(w.router, xn_b_, rlog_b_, count);
+    profile_op("router");
     const float route_scale = cfg_.expert_weights_scale;
     const uint32_t route_norm = cfg_.expert_weights_norm;
     const uint32_t groups = cfg_.n_expert_groups, top_groups = cfg_.n_limited_groups;
@@ -1519,13 +1621,17 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
                         view(rwts_b_, size_t(i) * K * 4, size_t(K) * 4)},
                        {{&Ne,4},{&K,4},{&groups,4},{&top_groups,4},
                         {&route_scale,4},{&route_norm,4}}, 1, 1, true);
+    profile_op("topk");
     dispatch_projection_batch_(w.ffn_gate, xn_b_, fg_b_, count);
+    profile_op("shared_gate");
     dispatch_projection_batch_(w.ffn_up, xn_b_, fu_b_, count);
+    profile_op("shared_up");
     swiglu_f32(*mtl_, fg_b_, fu_b_, fa_b_, count * Fs);
+    profile_op("shared_swiglu");
     dispatch_projection_batch_(w.ffn_down, fa_b_, fo_b_, count);
-    mtl_->commit_and_wait();
+    if (!profile_op("shared_down", true)) mtl_->commit_and_wait();
     const long long fixed_wall_us = prof::now_us() - fixed_started;
-    const long long fixed_gpu_us = mtl_->last_gpu_us();
+    const long long fixed_gpu_us = mtl_->step_gpu_us - fixed_gpu_before;
     const int fixed_dispatch_count = mtl_->step_dispatches - fixed_dispatches;
 
     constexpr size_t assignments = size_t(kPrefillBatch) * 256;
@@ -1576,13 +1682,19 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
     long long pipeline_wait_us = 0, pipeline_gpu_us = 0;
     queue_group(0, 0);
     for (uint32_t base = 0; base < active_count; base += 8) {
+        const long long group_started = prof::now_us();
         const uint32_t bank = (base / 8) & 1u;
         const uint32_t group_count = std::min(8u, active_count - base);
+        uint32_t group_assignments = 0;
+        for (uint32_t j = 0; j < group_count; ++j)
+            group_assignments += counts[active[base + j]];
         const long long wait_started = prof::now_us();
         for (uint32_t j = 0; j < group_count * 3; ++j)
             wait_weight_(loaded[bank][j]);
-        pipeline_wait_us += prof::now_us() - wait_started;
+        const long long group_wait_us = prof::now_us() - wait_started;
+        pipeline_wait_us += group_wait_us;
         if (base + 8 < active_count) queue_group(base + 8, bank ^ 1u);
+        const int group_dispatches_before = mtl_->step_dispatches;
         mtl_->begin();
         for (uint32_t j = 0; j < group_count; ++j) {
             const uint32_t expert = active[base + j], n = counts[expert];
@@ -1609,6 +1721,11 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
                                  {down.buffer, fa_b_, routed_b_, iq1s_grid_b_},
                                  {{slots.data() + offset, size_t(n) * 4},
                                   {&Fe,4},{&H,4}}, H / 4, n, 32);
+            } else if (down.entry->type == GGML_IQ2_XXS) {
+                mtl_->dispatch2d("expert_down_iq2_xxs_b_r4",
+                                 {down.buffer, fa_b_, routed_b_, iq2xxs_grid_b_},
+                                 {{slots.data() + offset, size_t(n) * 4},
+                                  {&Fe,4},{&H,4}}, H / 4, n, 32);
             } else {
                 for (uint32_t item = 0; item < n; ++item)
                     dispatch_weight_(down, row(fa_b_, item, Fe),
@@ -1617,6 +1734,16 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
         }
         mtl_->commit_and_wait();
         pipeline_gpu_us += mtl_->last_gpu_us();
+        if (profile_ops_)
+            prof::log("profile-op layer=%u stage=moe-routed op=expert-group "
+                      "group=%u experts=%u assignments=%u model_bytes=%llu "
+                      "wall_us=%lld wait_us=%lld gpu_us=%lld dispatches=%u",
+                      L, base / 8, group_count, group_assignments,
+                      (unsigned long long)(group_count *
+                          (gate_stride + up_stride + down_stride)),
+                      prof::now_us() - group_started,
+                      group_wait_us, mtl_->last_gpu_us(),
+                      mtl_->step_dispatches - group_dispatches_before);
         for (uint32_t j = 0; j < group_count * 3; ++j)
             release_weight_(loaded[bank][j]);
     }
@@ -1627,10 +1754,18 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
     const long long merge_gpu_us = mtl_->last_gpu_us();
     prof::log("prefill-moe layer=%u tokens=%u expert_union=%u selections=%u "
               "fixed_wall_us=%lld fixed_gpu_us=%lld fixed_dispatches=%d "
-              "pipeline_wait_us=%lld pipeline_gpu_us=%lld merge_gpu_us=%lld",
+              "pipeline_wait_us=%lld pipeline_gpu_us=%lld merge_gpu_us=%lld "
+              "fixed_types=%s,%s,%s,%s routed_types=%s,%s,%s",
               L, count, active_count, count * K,
               fixed_wall_us, fixed_gpu_us, fixed_dispatch_count,
-              pipeline_wait_us, pipeline_gpu_us, merge_gpu_us);
+              pipeline_wait_us, pipeline_gpu_us, merge_gpu_us,
+              ggml_type_name(w.router.entry->type),
+              ggml_type_name(w.ffn_gate.entry->type),
+              ggml_type_name(w.ffn_up.entry->type),
+              ggml_type_name(w.ffn_down.entry->type),
+              ggml_type_name(gm_->find(gate_name)->type),
+              ggml_type_name(gm_->find(up_name)->type),
+              ggml_type_name(gm_->find(down_name)->type));
 }
 
 void GgufRuntime::prefill_chunk_(const uint32_t* ids, uint32_t count) {

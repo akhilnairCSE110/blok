@@ -178,6 +178,7 @@ private:
     uint64_t     seed_ = 3407;
     bool         trace_ = false;
     bool         profile_layers_ = false;
+    bool         profile_ops_ = false;
     bool         compact_mla_ = false;
     bool         validate_mla_ = false;
 
@@ -225,7 +226,8 @@ private:
     // DeepSeek-R1 layer-major prefill tile. Tokens selecting the same expert
     // share one exact weight load within the tile.
     MtlBuf x_b_, xn_b_, qa_b_, qan_b_, qf_b_, qn_b_, qr_b_;
-    MtlBuf kva_b_, kvlat_b_, kvfull_b_, qeff_b_, olat_b_, ofull_b_, attnout_b_;
+    MtlBuf kva_b_, kvlat_b_, kvfull_b_, qeff_b_, olat_b_, olat_candidate_;
+    MtlBuf ofull_b_, attnout_b_;
     MtlBuf fg_b_, fu_b_, fa_b_, fo_b_, rlog_b_, ridx_b_, rwts_b_, routed_b_;
 
     // KV cache + scores scratch.

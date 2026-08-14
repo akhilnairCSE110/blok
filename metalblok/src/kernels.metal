@@ -20,7 +20,9 @@
 
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
+using namespace mpp::tensor_ops;
 
 // (TG_GEMV is set on the host side via dispatchThreadgroups; the kernels
 //  read `threads_per_threadgroup` so they don't need a duplicate constant.)
@@ -1722,49 +1724,6 @@ kernel void gemv_q6_K_f32_r4(
     if (lane == 0) y[row] = value;
 }
 
-// Prefill submission variants. Each (prompt,row) threadgroup executes the
-// identical dot product and reduction as its decode counterpart; the 2-D grid
-// lets Metal schedule adjacent prompt rows against the same resident weights.
-kernel void gemv_q6_K_f32_b(
-    device const uchar* W [[buffer(0)]],
-    device const float* x [[buffer(1)]],
-    device float* y [[buffer(2)]],
-    constant uint& K [[buffer(3)]],
-    constant uint& N [[buffer(4)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]]) {
-    constexpr uint tgs = 32;
-    const uint row = group.x, batch = group.y;
-    const uint nblk = K / 256;
-    device const uchar* Wrow = W + (size_t)row * nblk * 210;
-    device const float* xb = x + (size_t)batch * K;
-    threadgroup float scratch[32];
-    const float value = tg_reduce_sum(q6_k_partial(Wrow, xb, nblk, tid, tgs),
-                                      tid, tgs, scratch);
-    if (tid == 0) y[(size_t)batch * N + row] = value;
-}
-
-kernel void gemv_q6_K_f32_r4_b(
-    device const uchar* W [[buffer(0)]],
-    device const float* x [[buffer(1)]],
-    device float* y [[buffer(2)]],
-    constant uint& K [[buffer(3)]],
-    constant uint& N [[buffer(4)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]]) {
-    const uint lane = tid & 7u;
-    const uint row = group.x * 4u + (tid >> 3);
-    const uint batch = group.y;
-    constexpr uint nblk = 8;
-    device const uchar* Wrow = W + (size_t)row * nblk * 210;
-    device const float* xb = x + (size_t)batch * K;
-    float value = q6_k_partial(Wrow, xb, nblk, lane, 8);
-    value += simd_shuffle_down(value, 4);
-    value += simd_shuffle_down(value, 2);
-    value += simd_shuffle_down(value, 1);
-    if (lane == 0) y[(size_t)batch * N + row] = value;
-}
-
 // Read one coefficient from a Q6_K row without expanding the tensor.  The
 // R1 KV-B matrix is fixed at K=Lk=512, so its two absorbed MLA products can
 // operate on the original 0.82-byte/weight representation held in UMA.
@@ -1785,6 +1744,54 @@ inline float q6_k_value(device const uchar* row, uint column) {
                                                               quarter * 2 + (lane >> 4)];
     const ushort dh = ((device const ushort*)(blk + 208))[0];
     return float(as_type<half>(dh)) * float(scale) * float(q);
+}
+
+kernel void qmm_q6_K_f32_m32n32k128(
+    device const uchar* W [[buffer(0)]],
+    device float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& B [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    constexpr int TM = 32, TN = 32, TK = 128;
+    threadgroup float weight_tile[TK * TN];
+    using device_tensor = tensor<device float, dextents<int, 2>, tensor_inline>;
+    using group_tensor = tensor<threadgroup float, dextents<int, 2>, tensor_inline>;
+    device_tensor input(x, dextents<int, 2>(int(K), int(B)),
+                        array<int, 2>({1, int(K)}));
+    device_tensor output(y, dextents<int, 2>(int(N), int(B)),
+                         array<int, 2>({1, int(N)}));
+    const int out_col = int(group.x) * TN;
+    const int out_row = int(group.y) * TM;
+    auto output_tile = output.slice<TN, TM>(out_col, out_row);
+    constexpr auto descriptor = matmul2d_descriptor(
+        TM, TN, TK, false, false, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<4>> operation;
+    auto first_input = input.slice<TK, TM>(0, out_row);
+    group_tensor weights(weight_tile, dextents<int, 2>(TN, TK),
+                         array<int, 2>({1, TN}));
+    auto accumulator = operation.get_destination_cooperative_tensor<
+        decltype(first_input), decltype(weights), float>();
+    #pragma clang loop unroll(full)
+    for (ushort i = 0; i < accumulator.get_capacity(); ++i)
+        accumulator[i] = 0.0f;
+    const uint row_bytes = (K >> 8) * 210;
+    for (uint k0 = 0; k0 < K; k0 += TK) {
+        for (uint i = tid; i < TK * TN; i += 128) {
+            const uint k = i / TN;
+            const uint n = i - k * TN;
+            weight_tile[i] = q6_k_value(W + (size_t)(out_col + n) * row_bytes,
+                                        k0 + k);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto input_tile = input.slice<TK, TM>(int(k0), out_row);
+        operation.run(input_tile, weights, accumulator);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    accumulator.store(output_tile);
 }
 
 // q_eff[h,k] = sum_d W_kv_b[h,d,k] * q_nope[h,d].  Reading the transposed
@@ -1861,18 +1868,9 @@ inline void k_get_scale_min_k4(int j, device const uchar* q,
     }
 }
 
-kernel void gemv_q4_K_f32(
-    device const uchar*  W       [[buffer(0)]],   // 144 * nblk per row
-    device const float*  x       [[buffer(1)]],
-    device       float*  y       [[buffer(2)]],
-    constant uint&       K       [[buffer(3)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tgs [[threads_per_threadgroup]])
-{
-    const uint nblk = K / 256;
-    device const uchar* Wrow = W + (size_t)row * nblk * 144;
-
+inline float q4_k_partial(device const uchar* Wrow,
+                          device const float* x,
+                          uint nblk, uint tid, uint tgs) {
     float acc = 0.0f;
     for (uint b = tid; b < nblk; b += tgs) {
         device const uchar* blk = Wrow + (size_t)b * 144;
@@ -1908,9 +1906,90 @@ kernel void gemv_q4_K_f32(
             acc += local;
         }
     }
+    return acc;
+}
+
+inline float q4_k_value(device const uchar* row, uint column) {
+    device const uchar* blk = row + (size_t)(column >> 8) * 144;
+    const uint index = column & 255u;
+    const uint strip = index >> 6;
+    const uint lane = index & 31u;
+    const uint high = (index >> 5) & 1u;
+    uchar scale, minimum;
+    k_get_scale_min_k4(2 * strip + high, blk + 4, scale, minimum);
+    const uchar packed = blk[16 + strip * 32 + lane];
+    const uint q = high ? packed >> 4 : packed & 15u;
+    const float d = float(as_type<half>(((device const ushort*)blk)[0]));
+    const float dmin = float(as_type<half>(((device const ushort*)(blk + 2))[0]));
+    return d * float(scale) * float(q) - dmin * float(minimum);
+}
+
+// DeepSeek fixed-projection prefill: C[B,N] = X[B,K] W[N,K]^T.
+// The native Q4_K tile is expanded only into 16 KiB of threadgroup memory,
+// consumed immediately by MPP TensorOps, and overwritten for the next K tile.
+// All extents are exact for the accepted 128-row V0 tile and model geometry.
+kernel void qmm_q4_K_f32_m32n32k128(
+    device const uchar* W [[buffer(0)]],
+    device float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& B [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    constexpr int TM = 32, TN = 32, TK = 128;
+    threadgroup float weight_tile[TK * TN];
+    using device_tensor = tensor<device float, dextents<int, 2>, tensor_inline>;
+    using group_tensor = tensor<threadgroup float, dextents<int, 2>, tensor_inline>;
+    device_tensor input(x, dextents<int, 2>(int(K), int(B)),
+                        array<int, 2>({1, int(K)}));
+    device_tensor output(y, dextents<int, 2>(int(N), int(B)),
+                         array<int, 2>({1, int(N)}));
+    const int out_col = int(group.x) * TN;
+    const int out_row = int(group.y) * TM;
+    auto output_tile = output.slice<TN, TM>(out_col, out_row);
+    constexpr auto descriptor = matmul2d_descriptor(
+        TM, TN, TK, false, false, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<4>> operation;
+    auto first_input = input.slice<TK, TM>(0, out_row);
+    group_tensor weights(weight_tile, dextents<int, 2>(TN, TK),
+                         array<int, 2>({1, TN}));
+    auto accumulator = operation.get_destination_cooperative_tensor<
+        decltype(first_input), decltype(weights), float>();
+    #pragma clang loop unroll(full)
+    for (ushort i = 0; i < accumulator.get_capacity(); ++i)
+        accumulator[i] = 0.0f;
+    const uint row_bytes = (K >> 8) * 144;
+    for (uint k0 = 0; k0 < K; k0 += TK) {
+        for (uint i = tid; i < TK * TN; i += 128) {
+            const uint k = i / TN;
+            const uint n = i - k * TN;
+            weight_tile[i] = q4_k_value(W + (size_t)(out_col + n) * row_bytes,
+                                        k0 + k);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto input_tile = input.slice<TK, TM>(int(k0), out_row);
+        operation.run(input_tile, weights, accumulator);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    accumulator.store(output_tile);
+}
+
+kernel void gemv_q4_K_f32(
+    device const uchar*  W       [[buffer(0)]],
+    device const float*  x       [[buffer(1)]],
+    device       float*  y       [[buffer(2)]],
+    constant uint&       K       [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]) {
+    const uint nblk = K / 256;
+    device const uchar* Wrow = W + (size_t)row * nblk * 144;
 
     threadgroup float scratch[32];
-    float v = tg_reduce_sum(acc, tid, tgs, scratch);
+    float v = tg_reduce_sum(q4_k_partial(Wrow, x, nblk, tid, tgs),
+                            tid, tgs, scratch);
     if (tid == 0) y[row] = v;
 }
 
@@ -2181,18 +2260,9 @@ kernel void moe_residual_merge_f32(
 //
 // CPU oracle: dequantize_q5_K_block in src/gguf_dequant.cpp.
 
-kernel void gemv_q5_K_f32(
-    device const uchar*  W       [[buffer(0)]],   // 176 * nblk per row
-    device const float*  x       [[buffer(1)]],
-    device       float*  y       [[buffer(2)]],
-    constant uint&       K       [[buffer(3)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tgs [[threads_per_threadgroup]])
-{
-    const uint nblk = K / 256;
-    device const uchar* Wrow = W + (size_t)row * nblk * 176;
-
+inline float q5_k_partial(device const uchar* Wrow,
+                          device const float* x,
+                          uint nblk, uint tid, uint tgs) {
     float acc = 0.0f;
     for (uint b = tid; b < nblk; b += tgs) {
         device const uchar* blk = Wrow + (size_t)b * 176;
@@ -2232,11 +2302,91 @@ kernel void gemv_q5_K_f32(
             u2 <<= 2;
         }
     }
+    return acc;
+}
+
+inline float q5_k_value(device const uchar* row, uint column) {
+    device const uchar* blk = row + (size_t)(column >> 8) * 176;
+    const uint index = column & 255u;
+    const uint strip = index >> 6;
+    const uint lane = index & 31u;
+    const uint high = (index >> 5) & 1u;
+    uchar scale, minimum;
+    k_get_scale_min_k4(2 * strip + high, blk + 4, scale, minimum);
+    const uchar packed = blk[48 + strip * 32 + lane];
+    const uint nibble = high ? packed >> 4 : packed & 15u;
+    const uint mask = 1u << (2 * strip + high);
+    const uint q = nibble + ((blk[16 + lane] & mask) ? 16u : 0u);
+    const float d = float(as_type<half>(((device const ushort*)blk)[0]));
+    const float dmin = float(as_type<half>(((device const ushort*)(blk + 2))[0]));
+    return d * float(scale) * float(q) - dmin * float(minimum);
+}
+
+kernel void qmm_q5_K_f32_m32n32k128(
+    device const uchar* W [[buffer(0)]],
+    device float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& B [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    constexpr int TM = 32, TN = 32, TK = 128;
+    threadgroup float weight_tile[TK * TN];
+    using device_tensor = tensor<device float, dextents<int, 2>, tensor_inline>;
+    using group_tensor = tensor<threadgroup float, dextents<int, 2>, tensor_inline>;
+    device_tensor input(x, dextents<int, 2>(int(K), int(B)),
+                        array<int, 2>({1, int(K)}));
+    device_tensor output(y, dextents<int, 2>(int(N), int(B)),
+                         array<int, 2>({1, int(N)}));
+    const int out_col = int(group.x) * TN;
+    const int out_row = int(group.y) * TM;
+    auto output_tile = output.slice<TN, TM>(out_col, out_row);
+    constexpr auto descriptor = matmul2d_descriptor(
+        TM, TN, TK, false, false, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<4>> operation;
+    auto first_input = input.slice<TK, TM>(0, out_row);
+    group_tensor weights(weight_tile, dextents<int, 2>(TN, TK),
+                         array<int, 2>({1, TN}));
+    auto accumulator = operation.get_destination_cooperative_tensor<
+        decltype(first_input), decltype(weights), float>();
+    #pragma clang loop unroll(full)
+    for (ushort i = 0; i < accumulator.get_capacity(); ++i)
+        accumulator[i] = 0.0f;
+    const uint row_bytes = (K >> 8) * 176;
+    for (uint k0 = 0; k0 < K; k0 += TK) {
+        for (uint i = tid; i < TK * TN; i += 128) {
+            const uint k = i / TN;
+            const uint n = i - k * TN;
+            weight_tile[i] = q5_k_value(W + (size_t)(out_col + n) * row_bytes,
+                                        k0 + k);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto input_tile = input.slice<TK, TM>(int(k0), out_row);
+        operation.run(input_tile, weights, accumulator);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    accumulator.store(output_tile);
+}
+
+kernel void gemv_q5_K_f32(
+    device const uchar*  W       [[buffer(0)]],
+    device const float*  x       [[buffer(1)]],
+    device       float*  y       [[buffer(2)]],
+    constant uint&       K       [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]) {
+    const uint nblk = K / 256;
+    device const uchar* Wrow = W + (size_t)row * nblk * 176;
 
     threadgroup float scratch[32];
-    float v = tg_reduce_sum(acc, tid, tgs, scratch);
+    float v = tg_reduce_sum(q5_k_partial(Wrow, x, nblk, tid, tgs),
+                            tid, tgs, scratch);
     if (tid == 0) y[row] = v;
 }
+
 
 // ---------------------------------------------------------------------------
 // GGUF iq2_xxs fused dequant-gemv.
@@ -2273,19 +2423,10 @@ constant uchar IQ2XXS_KSIGNS[128] = {
     240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
 };
 
-kernel void gemv_iq2_xxs_f32(
-    device const uchar*    W    [[buffer(0)]],   // 66 * nblk per row
-    device const float*    x    [[buffer(1)]],
-    device       float*    y    [[buffer(2)]],
-    device const ulong*    grid [[buffer(3)]],   // iq2xxs_grid[256]
-    constant uint&         K    [[buffer(4)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tgs [[threads_per_threadgroup]])
-{
-    const uint nblk = K / 256;
-    device const uchar* Wrow = W + (size_t)row * nblk * 66;
-
+inline float iq2_xxs_partial(device const uchar* Wrow,
+                             device const float* x,
+                             device const ulong* grid,
+                             uint nblk, uint tid, uint tgs) {
     float acc = 0.0f;
     for (uint b = tid; b < nblk; b += tgs) {
         device const uchar*  blk = Wrow + (size_t)b * 66;
@@ -2323,10 +2464,53 @@ kernel void gemv_iq2_xxs_f32(
             }
         }
     }
+    return acc;
+}
 
+kernel void gemv_iq2_xxs_f32(
+    device const uchar*    W    [[buffer(0)]],
+    device const float*    x    [[buffer(1)]],
+    device       float*    y    [[buffer(2)]],
+    device const ulong*    grid [[buffer(3)]],
+    constant uint&         K    [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]) {
+    const uint nblk = K / 256;
+    device const uchar* Wrow = W + (size_t)row * nblk * 66;
     threadgroup float scratch[32];
-    float v = tg_reduce_sum(acc, tid, tgs, scratch);
+    float v = tg_reduce_sum(iq2_xxs_partial(Wrow, x, grid, nblk, tid, tgs),
+                            tid, tgs, scratch);
     if (tid == 0) y[row] = v;
+}
+
+// Layers 3..8 use IQ2_XXS for routed down. Fe=2048 is eight blocks, so four
+// output rows occupy one SIMD-group exactly as in the proven IQ1_S mapping.
+kernel void expert_down_iq2_xxs_b_r4(
+    device const uchar* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    device const ulong* grid [[buffer(3)]],
+    constant uint* slots [[buffer(4)]],
+    constant uint& Fe [[buffer(5)]],
+    constant uint& H [[buffer(6)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    const uint lane = tid & 7u;
+    const uint row = group.x * 4u + (tid >> 3);
+    const uint item = group.y;
+    constexpr uint nblk = 8;
+    device const uchar* Wrow = W + (size_t)row * nblk * 66;
+    device const float* input = x + (size_t)item * Fe;
+    float value = iq2_xxs_partial(Wrow, input, grid, nblk, lane, 8);
+#pragma unroll
+    for (uint packed_row = 0; packed_row < 4; ++packed_row) {
+        const float packed = tid < 8
+            ? simd_shuffle(value, packed_row * 8 + tid) : 0.0f;
+        const float sum = simd_sum(packed);
+        if (tid == 0)
+            y[(size_t)slots[item] * H + group.x * 4 + packed_row] = sum;
+    }
 }
 
 // ---------------------------------------------------------------------------
