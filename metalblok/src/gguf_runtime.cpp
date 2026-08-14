@@ -154,6 +154,12 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
     profile_layers_ = std::getenv("METALBLOK_PROFILE_LAYERS") != nullptr;
     profile_ops_ = std::getenv("METALBLOK_PROFILE_OPS") != nullptr;
     profile_layers_ |= profile_ops_;
+    tensorops_ = std::getenv("METALBLOK_TENSOROPS") != nullptr;
+    if (const char* s = std::getenv("METALBLOK_EXPERT_TILE")) {
+        expert_tile_ = uint32_t(std::strtoul(s, nullptr, 10));
+        if (expert_tile_ != 1 && expert_tile_ != 4)
+            die("expert tile must be 1 or 4");
+    }
     compact_mla_ = std::getenv("METALBLOK_MLA") != nullptr;
     validate_mla_ = std::getenv("METALBLOK_VALIDATE_MLA") != nullptr;
     if (validate_mla_ && !compact_mla_) die("MLA validation requires compact MLA");
@@ -812,7 +818,7 @@ void GgufRuntime::dispatch_projection_batch_(const Projection& projection,
     if (projection.entry->type == GGML_Q4_K) qmm = "qmm_q4_K_f32_m32n32k128";
     if (projection.entry->type == GGML_Q5_K) qmm = "qmm_q5_K_f32_m32n32k128";
     if (projection.entry->type == GGML_Q6_K) qmm = "qmm_q6_K_f32_m32n32k128";
-    if (count == kPrefillBatch && qmm) {
+    if (tensorops_ && count == kPrefillBatch && qmm) {
         mtl_->dispatch2d(qmm,
                          {projection.buffer, x, y},
                          {{&K,4},{&N,4},{&count,4}}, N / 32, count / 32, 128);
@@ -821,6 +827,11 @@ void GgufRuntime::dispatch_projection_batch_(const Projection& projection,
     if (projection.entry->type == GGML_IQ1_S) {
         mtl_->dispatch2d("gemv_iq1_s_f32_b",
                          {projection.buffer, x, y, iq1s_grid_b_},
+                         {{&K,4},{&N,4}}, N, count, 32);
+        return;
+    }
+    if (projection.entry->type == GGML_F32) {
+        mtl_->dispatch2d("gemv_f32_f32_b", {projection.buffer, x, y},
                          {{&K,4},{&N,4}}, N, count, 32);
         return;
     }
@@ -1355,24 +1366,16 @@ void GgufRuntime::attention_batch_compact_(uint32_t L, uint32_t count) {
     profile_op("q_b");
     dispatch_projection_batch_(w.kv_a, xn_b_, kva_b_, count);
     profile_op("kv_a");
-    for (uint32_t i = 0; i < count; ++i) {
-        const uint32_t position = pos_ + i;
-        mtl_->dispatch("mla_q_split_rope_r1",
-                       {row(qf_b_, i, size_t(HE) * (Dn + Dr)),
-                        row(qn_b_, i, size_t(HE) * Dn),
-                        row(qr_b_, i, size_t(HE) * Dr)},
-                       {{&Dn,4},{&Dr,4},{&position,4},{&theta,4}},
-                       HE, TG_ELT, true);
-        mtl_->dispatch("mla_q6_kv_b_query_r1",
-                       {w.kv_b.buffer, row(qn_b_, i, size_t(HE) * Dn),
-                        row(qeff_b_, i, size_t(HE) * Lk)},
-                       {{&Lk,4},{&Dn,4},{&Dv,4}}, HE * Lk, 32, true);
-        mtl_->dispatch("mla_kv_norm_rope_store_r1",
-                       {row(kva_b_, i, Lk + Dr), w.kv_a_norm,
-                        c_kv_[L], k_rope_[L]},
-                       {{&Lk,4},{&Dr,4},{&position,4},{&ms,4},{&eps,4},{&theta,4}},
-                       1, TG_RED, true);
-    }
+    mtl_->dispatch2d("mla_q_split_rope_r1_b", {qf_b_, qn_b_, qr_b_},
+                     {{&Dn,4},{&Dr,4},{&HE,4},{&pos_,4},{&theta,4}},
+                     HE, count, TG_ELT);
+    mtl_->dispatch2d("mla_q6_kv_b_query_r1_b",
+                     {w.kv_b.buffer, qn_b_, qeff_b_},
+                     {{&Lk,4},{&Dn,4},{&Dv,4},{&HE,4}}, HE * Lk, count, 32);
+    mtl_->dispatch("mla_kv_norm_rope_store_r1_b",
+                   {kva_b_, w.kv_a_norm, c_kv_[L], k_rope_[L]},
+                   {{&Lk,4},{&Dr,4},{&pos_,4},{&ms,4},{&eps,4},{&theta,4}},
+                   count, TG_RED, true);
     profile_op("mla_prepare");
     for (uint32_t i = 0; i < count; ++i) {
         const uint32_t T = pos_ + i + 1;
@@ -1419,12 +1422,11 @@ void GgufRuntime::attention_batch_compact_(uint32_t L, uint32_t count) {
                 row(olat_b_, i, size_t(HE) * Lk),
                 row(olat_candidate_, i, size_t(HE) * Lk));
     }
-    for (uint32_t i = 0; i < count; ++i) {
+    for (uint32_t i = 0; i < count; ++i)
         mtl_->dispatch("mla_q6_kv_b_value_r1",
                        {w.kv_b.buffer, row(olat_b_, i, size_t(HE) * Lk),
                         row(ofull_b_, i, size_t(HE) * Dv)},
                        {{&Lk,4},{&Dn,4},{&Dv,4}}, HE * Dv, 32, true);
-    }
     profile_op("kv_b_value");
     dispatch_projection_batch_(w.attn_output, ofull_b_, attnout_b_, count);
     profile_op("output_projection");
@@ -1614,13 +1616,10 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
     const float route_scale = cfg_.expert_weights_scale;
     const uint32_t route_norm = cfg_.expert_weights_norm;
     const uint32_t groups = cfg_.n_expert_groups, top_groups = cfg_.n_limited_groups;
-    for (uint32_t i = 0; i < count; ++i)
-        mtl_->dispatch("router_topk_grouped_sigmoid_f32",
-                       {row(rlog_b_, i, Ne), w.router_bias,
-                        view(ridx_b_, size_t(i) * K * 4, size_t(K) * 4),
-                        view(rwts_b_, size_t(i) * K * 4, size_t(K) * 4)},
-                       {{&Ne,4},{&K,4},{&groups,4},{&top_groups,4},
-                        {&route_scale,4},{&route_norm,4}}, 1, 1, true);
+    mtl_->dispatch("router_topk_grouped_sigmoid_f32",
+                   {rlog_b_, w.router_bias, ridx_b_, rwts_b_},
+                   {{&Ne,4},{&K,4},{&groups,4},{&top_groups,4},
+                    {&route_scale,4},{&route_norm,4}}, count, 1, true);
     profile_op("topk");
     dispatch_projection_batch_(w.ffn_gate, xn_b_, fg_b_, count);
     profile_op("shared_gate");
@@ -1695,6 +1694,7 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
         pipeline_wait_us += group_wait_us;
         if (base + 8 < active_count) queue_group(base + 8, bank ^ 1u);
         const int group_dispatches_before = mtl_->step_dispatches;
+        const long long group_gpu_before = mtl_->step_gpu_us;
         mtl_->begin();
         for (uint32_t j = 0; j < group_count; ++j) {
             const uint32_t expert = active[base + j], n = counts[expert];
@@ -1702,11 +1702,18 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
             auto& gate = loaded[bank][j * 3];
             auto& up = loaded[bank][j * 3 + 1];
             auto& down = loaded[bank][j * 3 + 2];
+            const bool split = profile_ops_ && L == 3;
+            long long kernel_started = prof::now_us();
+            long long kernel_gpu = mtl_->step_gpu_us;
+            int kernel_dispatches = mtl_->step_dispatches;
             if (gate.entry->type == GGML_IQ1_S && up.entry->type == GGML_IQ1_S) {
-                mtl_->dispatch2d("expert_gate_up_swiglu_iq1_s_b",
+                const bool tile4 = expert_tile_ == 4 && n >= 4;
+                mtl_->dispatch2d(tile4 ? "expert_gate_up_swiglu_iq1_s_b4" :
+                                        "expert_gate_up_swiglu_iq1_s_b",
                                  {gate.buffer, up.buffer, xn_b_, fa_b_, iq1s_grid_b_},
                                  {{tokens.data() + offset, size_t(n) * 4},
-                                  {&H,4},{&Fe,4}}, Fe, n, 32);
+                                  {&n,4},{&H,4},{&Fe,4}}, Fe,
+                                 tile4 ? (n + 3) / 4 : n, 32);
             } else {
                 for (uint32_t item = 0; item < n; ++item) {
                     const auto input = row(xn_b_, tokens[offset + item], H);
@@ -1715,6 +1722,20 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
                     swiglu_f32(*mtl_, row(fg_b_, item, Fe), row(fu_b_, item, Fe),
                                row(fa_b_, item, Fe), Fe);
                 }
+            }
+            if (split) {
+                mtl_->flush();
+                prof::log("profile-op layer=%u stage=moe-routed op=gate-up "
+                          "expert=%u assignments=%u model_bytes=%llu wall_us=%lld "
+                          "gpu_us=%lld dispatches=%d type=%s", L, expert, n,
+                          (unsigned long long)(gate_stride + up_stride),
+                          prof::now_us() - kernel_started,
+                          mtl_->step_gpu_us - kernel_gpu,
+                          mtl_->step_dispatches - kernel_dispatches,
+                          ggml_type_name(gate.entry->type));
+                kernel_started = prof::now_us();
+                kernel_gpu = mtl_->step_gpu_us;
+                kernel_dispatches = mtl_->step_dispatches;
             }
             if (down.entry->type == GGML_IQ1_S) {
                 mtl_->dispatch2d("expert_down_iq1_s_b_r4",
@@ -1731,9 +1752,21 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
                     dispatch_weight_(down, row(fa_b_, item, Fe),
                                      row(routed_b_, slots[offset + item], H));
             }
+            if (split) {
+                mtl_->flush();
+                prof::log("profile-op layer=%u stage=moe-routed op=down "
+                          "expert=%u assignments=%u model_bytes=%llu wall_us=%lld "
+                          "gpu_us=%lld dispatches=%d type=%s", L, expert, n,
+                          (unsigned long long)down_stride,
+                          prof::now_us() - kernel_started,
+                          mtl_->step_gpu_us - kernel_gpu,
+                          mtl_->step_dispatches - kernel_dispatches,
+                          ggml_type_name(down.entry->type));
+            }
         }
         mtl_->commit_and_wait();
-        pipeline_gpu_us += mtl_->last_gpu_us();
+        const long long group_gpu_us = mtl_->step_gpu_us - group_gpu_before;
+        pipeline_gpu_us += group_gpu_us;
         if (profile_ops_)
             prof::log("profile-op layer=%u stage=moe-routed op=expert-group "
                       "group=%u experts=%u assignments=%u model_bytes=%llu "
@@ -1742,7 +1775,7 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
                       (unsigned long long)(group_count *
                           (gate_stride + up_stride + down_stride)),
                       prof::now_us() - group_started,
-                      group_wait_us, mtl_->last_gpu_us(),
+                      group_wait_us, group_gpu_us,
                       mtl_->step_dispatches - group_dispatches_before);
         for (uint32_t j = 0; j < group_count * 3; ++j)
             release_weight_(loaded[bank][j]);
@@ -1838,6 +1871,17 @@ void GgufRuntime::prefill_chunk_(const uint32_t* ids, uint32_t count) {
               mtl_->step_dispatches,
               static_cast<unsigned long long>(step_allocations_),
               static_cast<long long>(memory_delta));
+    if (profile_layers_)
+        for (const auto& lane : gm_->ring().lane_stats())
+            prof::log("profile-io shard=%u lane=%u bytes=%llu reads=%llu "
+                      "urgent_bytes=%llu urgent_reads=%llu service_us=%llu "
+                      "max_us=%llu", lane.shard, lane.lane,
+                      (unsigned long long)lane.bytes,
+                      (unsigned long long)lane.requests,
+                      (unsigned long long)lane.urgent_bytes,
+                      (unsigned long long)lane.urgent_requests,
+                      (unsigned long long)lane.service_us,
+                      (unsigned long long)lane.max_service_us);
 }
 
 // ---------------------------------------------------------------------------

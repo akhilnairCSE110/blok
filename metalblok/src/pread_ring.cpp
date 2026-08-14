@@ -24,8 +24,17 @@ bool PreadRing::open(const std::vector<std::string>& shard_paths) {
     }
 
     logical_shards_ = shard_paths.size();
+    if (const char* value = std::getenv("METALBLOK_IO_LANES")) {
+        char* end = nullptr;
+        const unsigned long lanes = std::strtoul(value, &end, 10);
+        if (!end || *end != '\0' || (lanes != 2 && lanes != 4 && lanes != 8)) {
+            last_error_ = "METALBLOK_IO_LANES must be 2, 4, or 8";
+            return false;
+        }
+        lanes_per_shard_ = lanes;
+    }
     lane_cursor_.assign(logical_shards_, 0);
-    shards_.reserve(logical_shards_ * kLanesPerShard);
+    shards_.reserve(logical_shards_ * lanes_per_shard_);
     auto fail = [&] {
         for (auto& lane : shards_) if (lane->fd >= 0) ::close(lane->fd);
         shards_.clear();
@@ -33,15 +42,18 @@ bool PreadRing::open(const std::vector<std::string>& shard_paths) {
         logical_shards_ = 0;
         return false;
     };
-    for (const auto& p : shard_paths) for (size_t lane = 0; lane < kLanesPerShard; ++lane) {
+    for (size_t shard = 0; shard < shard_paths.size(); ++shard)
+    for (size_t lane = 0; lane < lanes_per_shard_; ++lane) {
         auto s = std::make_unique<Shard>();
         s->owner = this;
-        s->path = p;
-        s->fd = ::open(p.c_str(), O_RDONLY);
+        s->shard_idx = uint32_t(shard);
+        s->lane_idx = uint32_t(lane);
+        s->path = shard_paths[shard];
+        s->fd = ::open(s->path.c_str(), O_RDONLY);
         if (s->fd < 0) {
             char buf[256];
             std::snprintf(buf, sizeof(buf),
-                          "open(%s) failed: %s", p.c_str(), std::strerror(errno));
+                          "open(%s) failed: %s", s->path.c_str(), std::strerror(errno));
             last_error_ = buf;
             return fail();
         }
@@ -51,7 +63,7 @@ bool PreadRing::open(const std::vector<std::string>& shard_paths) {
             char buf[256];
             std::snprintf(buf, sizeof(buf),
                           "fcntl(F_NOCACHE) failed on %s: %s",
-                          p.c_str(), std::strerror(errno));
+                          s->path.c_str(), std::strerror(errno));
             last_error_ = buf;
             ::close(s->fd);
             s->fd = -1;
@@ -100,8 +112,8 @@ void PreadRing::submit(uint32_t shard_idx,
         std::fprintf(stderr, "pread_ring: invalid shard %u\n", shard_idx);
         std::abort();
     }
-    const uint32_t lane = lane_cursor_[shard_idx]++ % kLanesPerShard;
-    Shard* s = shards_[shard_idx * kLanesPerShard + lane].get();
+    const uint32_t lane = lane_cursor_[shard_idx]++ % lanes_per_shard_;
+    Shard* s = shards_[shard_idx * lanes_per_shard_ + lane].get();
     const uint32_t queue = urgent ? 1u : 0u;
     // Wait for a free slot. Single-producer => only this thread writes head,
     // so head doesn't need atomic load with synchronization.
@@ -144,6 +156,14 @@ void PreadRing::reset_stats() {
     stat_max_service_ns_.store(0, std::memory_order_relaxed);
     stat_peak_outstanding_.store(stat_outstanding_.load(std::memory_order_relaxed),
                                  std::memory_order_relaxed);
+    for (const auto& lane : shards_) {
+        lane->stat_bytes.store(0, std::memory_order_relaxed);
+        lane->stat_requests.store(0, std::memory_order_relaxed);
+        lane->stat_urgent_bytes.store(0, std::memory_order_relaxed);
+        lane->stat_urgent_requests.store(0, std::memory_order_relaxed);
+        lane->stat_service_ns.store(0, std::memory_order_relaxed);
+        lane->stat_max_service_ns.store(0, std::memory_order_relaxed);
+    }
 }
 
 PreadRing::Stats PreadRing::stats() const {
@@ -157,6 +177,20 @@ PreadRing::Stats PreadRing::stats() const {
             stat_service_ns_.load(std::memory_order_relaxed) / 1000,
             stat_max_service_ns_.load(std::memory_order_relaxed) / 1000,
             stat_peak_outstanding_.load(std::memory_order_relaxed)};
+}
+
+std::vector<PreadRing::LaneStats> PreadRing::lane_stats() const {
+    std::vector<LaneStats> result;
+    result.reserve(shards_.size());
+    for (const auto& s : shards_)
+        result.push_back({s->shard_idx, s->lane_idx,
+            s->stat_bytes.load(std::memory_order_relaxed),
+            s->stat_requests.load(std::memory_order_relaxed),
+            s->stat_urgent_bytes.load(std::memory_order_relaxed),
+            s->stat_urgent_requests.load(std::memory_order_relaxed),
+            s->stat_service_ns.load(std::memory_order_relaxed) / 1000,
+            s->stat_max_service_ns.load(std::memory_order_relaxed) / 1000});
+    return result;
 }
 
 void PreadRing::worker_loop(Shard* s) {
@@ -217,13 +251,21 @@ void PreadRing::worker_loop(Shard* s) {
         const uint64_t finished = now_ns();
         const uint64_t service = finished - started;
         s->owner->stat_service_ns_.fetch_add(service, std::memory_order_relaxed);
+        s->stat_bytes.fetch_add(r.nbytes - left, std::memory_order_relaxed);
+        s->stat_requests.fetch_add(1, std::memory_order_relaxed);
+        s->stat_service_ns.fetch_add(service, std::memory_order_relaxed);
         uint64_t maximum = s->owner->stat_max_service_ns_.load(std::memory_order_relaxed);
         while (maximum < service && !s->owner->stat_max_service_ns_.compare_exchange_weak(
+                   maximum, service, std::memory_order_relaxed)) {}
+        maximum = s->stat_max_service_ns.load(std::memory_order_relaxed);
+        while (maximum < service && !s->stat_max_service_ns.compare_exchange_weak(
                    maximum, service, std::memory_order_relaxed)) {}
         if (queue) {
             s->owner->stat_urgent_bytes_.fetch_add(r.nbytes - left,
                                                    std::memory_order_relaxed);
             s->owner->stat_urgent_requests_.fetch_add(1, std::memory_order_relaxed);
+            s->stat_urgent_bytes.fetch_add(r.nbytes - left, std::memory_order_relaxed);
+            s->stat_urgent_requests.fetch_add(1, std::memory_order_relaxed);
         }
         uint64_t previous = s->owner->stat_last_ns_.load(std::memory_order_relaxed);
         while (previous < finished && !s->owner->stat_last_ns_.compare_exchange_weak(

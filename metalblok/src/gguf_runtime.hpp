@@ -173,12 +173,14 @@ private:
     Metal*       mtl_ = nullptr;
     GgufConfig   cfg_{};
     uint32_t     pos_ = 0;       // KV-cache position counter
+    uint32_t     expert_tile_ = 1;
     float        temperature_ = 0.0f;
     float        top_p_ = 0.95f;
     uint64_t     seed_ = 3407;
     bool         trace_ = false;
     bool         profile_layers_ = false;
     bool         profile_ops_ = false;
+    bool         tensorops_ = false;
     bool         compact_mla_ = false;
     bool         validate_mla_ = false;
 

@@ -311,6 +311,31 @@ kernel void mla_q_split_rope_r1(
     }
 }
 
+kernel void mla_q_split_rope_r1_b(
+    device const float* q_full [[buffer(0)]],
+    device float* q_nope_out [[buffer(1)]],
+    device float* q_rope_out [[buffer(2)]],
+    constant uint& Dn [[buffer(3)]],
+    constant uint& Dr [[buffer(4)]],
+    constant uint& HE [[buffer(5)]],
+    constant uint& pos [[buffer(6)]],
+    constant float& theta [[buffer(7)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    const uint h = group.x, token = group.y, position = pos + token;
+    device const float* qf = q_full + ((size_t)token * HE + h) * (Dn + Dr);
+    device float* qn = q_nope_out + ((size_t)token * HE + h) * Dn;
+    device float* qr = q_rope_out + ((size_t)token * HE + h) * Dr;
+    for (uint i = tid; i < Dn; i += 256) qn[i] = qf[i];
+    for (uint i = tid; i < Dr / 2; i += 256) {
+        const float angle = deepseek_r1_yarn_angle(position, i, Dr, theta);
+        const float c = cos(angle), s = sin(angle);
+        const float a = qf[Dn + 2u * i], b = qf[Dn + 2u * i + 1u];
+        qr[2u * i] = a * c - b * s;
+        qr[2u * i + 1u] = b * c + a * s;
+    }
+}
+
 kernel void mla_kv_split_rope_neox(
     device const float* kv_a         [[buffer(0)]],   // [Lk + Dr]
     device const float* kv_a_norm    [[buffer(1)]],   // [Lk] gain
@@ -413,6 +438,39 @@ kernel void mla_kv_norm_rope_store_r1(
         float angle = deepseek_r1_yarn_angle(pos, pair, Dr, theta);
         float c = cos(angle), s = sin(angle);
         float a = kv_a[Lk + 2u * pair], b = kv_a[Lk + 2u * pair + 1u];
+        rope[2u * pair] = half(a * c - b * s);
+        rope[2u * pair + 1u] = half(b * c + a * s);
+    }
+}
+
+kernel void mla_kv_norm_rope_store_r1_b(
+    device const float* kv_a [[buffer(0)]],
+    device const float* kv_a_norm [[buffer(1)]],
+    device half* c_kv_cache [[buffer(2)]],
+    device half* k_rope_cache [[buffer(3)]],
+    constant uint& Lk [[buffer(4)]],
+    constant uint& Dr [[buffer(5)]],
+    constant uint& pos [[buffer(6)]],
+    constant uint& max_seq [[buffer(7)]],
+    constant float& eps [[buffer(8)]],
+    constant float& theta [[buffer(9)]],
+    uint token [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]) {
+    const uint position = pos + token;
+    device const float* input = kv_a + (size_t)token * (Lk + Dr);
+    threadgroup float scratch[32];
+    float acc = 0.0f;
+    for (uint i = tid; i < Lk; i += tgs) acc += input[i] * input[i];
+    const float inv = rsqrt(tg_reduce_sum(acc, tid, tgs, scratch) / float(Lk) + eps);
+    device half* latent = c_kv_cache + (size_t)position * Lk;
+    for (uint i = tid; i < Lk; i += tgs)
+        latent[i] = half(input[i] * inv * kv_a_norm[i]);
+    device half* rope = k_rope_cache + (size_t)position * Dr;
+    for (uint pair = tid; pair < Dr / 2; pair += tgs) {
+        const float angle = deepseek_r1_yarn_angle(position, pair, Dr, theta);
+        const float c = cos(angle), s = sin(angle);
+        const float a = input[Lk + 2u * pair], b = input[Lk + 2u * pair + 1u];
         rope[2u * pair] = half(a * c - b * s);
         rope[2u * pair + 1u] = half(b * c + a * s);
     }
@@ -989,11 +1047,15 @@ kernel void router_topk_grouped_sigmoid_f32(
     constant uint&  top_groups    [[buffer(7)]],
     constant float& scale         [[buffer(8)]],
     constant uint&  norm          [[buffer(9)]],
+    uint token [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
     if (tid != 0) return;
     if (N > 256 || K > 16 || n_groups > 8 || n_groups == 0 ||
         (N % n_groups) != 0 || top_groups > n_groups) return;
+    logits += (size_t)token * N;
+    idx += (size_t)token * K;
+    wts += (size_t)token * K;
 
     float prob[256];
     float corrected[256];
@@ -1821,6 +1883,29 @@ kernel void mla_q6_kv_b_query_r1(
     if (tid == 0) y[output] = result;
 }
 
+kernel void mla_q6_kv_b_query_r1_b(
+    device const uchar* W [[buffer(0)]],
+    device const float* q [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant uint& Lk [[buffer(3)]],
+    constant uint& Dn [[buffer(4)]],
+    constant uint& Dv [[buffer(5)]],
+    constant uint& HE [[buffer(6)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    const uint output = group.x, token = group.y;
+    const uint head = output / Lk, latent = output - head * Lk;
+    const uint row_bytes = (Lk >> 8) * 210;
+    device const float* qh = q + ((size_t)token * HE + head) * Dn;
+    const uint row0 = head * (Dn + Dv);
+    float acc = 0.0f;
+    for (uint d = tid; d < Dn; d += 32)
+        acc += q6_k_value(W + (size_t)(row0 + d) * row_bytes, latent) * qh[d];
+    threadgroup float scratch[32];
+    const float result = tg_reduce_sum(acc, tid, 32, scratch);
+    if (tid == 0) y[(size_t)token * HE * Lk + output] = result;
+}
+
 // o_full[h,d] = sum_k W_kv_b[h,Dn+d,k] * o_lat[h,k].
 kernel void mla_q6_kv_b_value_r1(
     device const uchar* W      [[buffer(0)]],
@@ -2164,8 +2249,9 @@ kernel void expert_gate_up_swiglu_iq1_s_b(
     device float* y [[buffer(3)]],
     device const ulong* grid [[buffer(4)]],
     constant uint* tokens [[buffer(5)]],
-    constant uint& H [[buffer(6)]],
-    constant uint& Fe [[buffer(7)]],
+    constant uint& count [[buffer(6)]],
+    constant uint& H [[buffer(7)]],
+    constant uint& Fe [[buffer(8)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]) {
     constexpr uint tgs = 32;
@@ -2180,6 +2266,90 @@ kernel void expert_gate_up_swiglu_iq1_s_b(
                                           nblk, tid, tgs), tid, tgs, scratch);
     if (tid == 0) y[(size_t)item * Fe + row] =
         (gate / (1.0f + exp(-gate))) * up;
+}
+
+inline float4 iq1s_partial_b4(device const uchar* Wrow,
+                              device const float* x0,
+                              device const float* x1,
+                              device const float* x2,
+                              device const float* x3,
+                              device const ulong* grid,
+                              uint nblk, uint tid) {
+    float4 acc = 0.0f;
+    for (uint b = tid; b < nblk; b += 32) {
+        device const uchar* blk = Wrow + (size_t)b * 50;
+        const float d = float(as_type<half>(((device const ushort*)blk)[0]));
+        device const uchar* qs = blk + 2;
+        device const ushort* qh = (device const ushort*)(blk + 34);
+        const size_t xb = (size_t)b * 256;
+        for (uint sub = 0; sub < 8; ++sub) {
+            const ushort q = qh[sub];
+            const float dl = d * float(2u * uint((q >> 12) & 7u) + 1u);
+            const float delta = (q & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
+            for (uint g = 0; g < 4; ++g) {
+                const uint idx = uint(qs[sub * 4 + g]) |
+                    (uint((q >> (3 * g)) & 7u) << 8);
+                const ulong code = grid[idx];
+                const size_t base = xb + sub * 32 + g * 8;
+                float4 local = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < 8; ++j) {
+                    const float weight =
+                        float(int(char((code >> (8 * j)) & 0xff))) + delta;
+                    local += weight * float4(x0[base + j], x1[base + j],
+                                              x2[base + j], x3[base + j]);
+                }
+                acc += dl * local;
+            }
+        }
+    }
+    return acc;
+}
+
+kernel void expert_gate_up_swiglu_iq1_s_b4(
+    device const uchar* Wg [[buffer(0)]],
+    device const uchar* Wu [[buffer(1)]],
+    device const float* x [[buffer(2)]],
+    device float* y [[buffer(3)]],
+    device const ulong* grid [[buffer(4)]],
+    constant uint* tokens [[buffer(5)]],
+    constant uint& count [[buffer(6)]],
+    constant uint& H [[buffer(7)]],
+    constant uint& Fe [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    const uint row = group.x, item = group.y * 4;
+    const uint i1 = min(item + 1, count - 1);
+    const uint i2 = min(item + 2, count - 1);
+    const uint i3 = min(item + 3, count - 1);
+    device const float* x0 = x + (size_t)tokens[item] * H;
+    device const float* x1 = x + (size_t)tokens[i1] * H;
+    device const float* x2 = x + (size_t)tokens[i2] * H;
+    device const float* x3 = x + (size_t)tokens[i3] * H;
+    const uint nblk = H / 256;
+    const size_t stride = (size_t)nblk * 50;
+    const float4 gate_partial = iq1s_partial_b4(
+        Wg + row * stride, x0, x1, x2, x3, grid, nblk, tid);
+    threadgroup float scratch[32];
+    float4 gate;
+    gate.x = tg_reduce_sum(gate_partial.x, tid, 32, scratch);
+    gate.y = tg_reduce_sum(gate_partial.y, tid, 32, scratch);
+    gate.z = tg_reduce_sum(gate_partial.z, tid, 32, scratch);
+    gate.w = tg_reduce_sum(gate_partial.w, tid, 32, scratch);
+    const float4 up_partial = iq1s_partial_b4(
+        Wu + row * stride, x0, x1, x2, x3, grid, nblk, tid);
+    float4 up;
+    up.x = tg_reduce_sum(up_partial.x, tid, 32, scratch);
+    up.y = tg_reduce_sum(up_partial.y, tid, 32, scratch);
+    up.z = tg_reduce_sum(up_partial.z, tid, 32, scratch);
+    up.w = tg_reduce_sum(up_partial.w, tid, 32, scratch);
+    if (tid == 0) {
+        const float4 value = (gate / (1.0f + exp(-gate))) * up;
+        y[(size_t)item * Fe + row] = value.x;
+        if (item + 1 < count) y[(size_t)(item + 1) * Fe + row] = value.y;
+        if (item + 2 < count) y[(size_t)(item + 2) * Fe + row] = value.z;
+        if (item + 3 < count) y[(size_t)(item + 3) * Fe + row] = value.w;
+    }
 }
 
 kernel void expert_down_iq1_s_b(
@@ -2387,7 +2557,6 @@ kernel void gemv_q5_K_f32(
     if (tid == 0) y[row] = v;
 }
 
-
 // ---------------------------------------------------------------------------
 // GGUF iq2_xxs fused dequant-gemv.
 //
@@ -2547,6 +2716,26 @@ kernel void gemv_f32_f32(
     threadgroup float scratch[32];
     float v = tg_reduce_sum(acc, tid, tgs, scratch);
     if (tid == 0) y[row] = v;
+}
+
+// Exact batched router projection. Each (token,row) threadgroup executes the
+// same 32-lane dot/reduction tree as gemv_f32_f32; only dispatch encoding is
+// shared across the 128-token prefill tile.
+kernel void gemv_f32_f32_b(
+    device const float* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    device const float* wr = W + (size_t)group.x * K;
+    device const float* xr = x + (size_t)group.y * K;
+    float acc = 0.0f;
+    for (uint i = tid; i < K; i += 32) acc += wr[i] * xr[i];
+    threadgroup float scratch[32];
+    const float v = tg_reduce_sum(acc, tid, 32, scratch);
+    if (tid == 0) y[(size_t)group.y * N + group.x] = v;
 }
 
 kernel void gemv_f32_f32_grouped(
