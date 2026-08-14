@@ -18,6 +18,7 @@
 #include <atomic>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -104,11 +105,14 @@ private:
     void verify_tensor_table_(const GgufModel& gm) const;
     void alloc_activations_();
     void alloc_kv_cache_();
+    void ensure_kv_capacity_(uint32_t required);
+    void evict_fixed_cache_();
     void load_resident_norms_();
     void load_fixed_projections_();
     void begin_stage_layer_(uint32_t layer, uint32_t slot);
     void wait_stage_layer_(uint32_t layer, uint32_t slot);
     void alloc_expert_slots_();
+    void evict_expert_cache_();
     void build_grids_();
 
     // -----------------------------------------------------------------------
@@ -197,6 +201,7 @@ private:
     std::vector<LayerResident> lw_;
     Projection output_projection_;
     MtlBuf fixed_cache_;
+    std::vector<Projection*> fixed_cached_;
     uint64_t fixed_cache_budget_ = 0;
     std::array<MtlBuf, 2> layer_stage_{};
     std::array<std::array<std::atomic<bool>, 9>, 2> layer_ready_{};
@@ -207,6 +212,14 @@ private:
     std::array<std::atomic<bool>, kExpertSlots> expert_ready_{};
     uint32_t expert_slot_cursor_ = 0;
     size_t expert_slot_bytes_ = 0;
+    struct ExpertCacheSlot {
+        uint32_t expert = UINT32_MAX;
+        MtlBuf weight[3]{};
+        std::atomic<bool> ready[3]{};
+    };
+    MtlBuf expert_cache_storage_;
+    std::unique_ptr<ExpertCacheSlot[]> expert_cache_;
+    uint32_t expert_cache_ways_ = 0;
 
     // Global resident output norm (f32).
     MtlBuf output_norm_b_;
@@ -238,6 +251,7 @@ private:
     std::vector<MtlBuf> v_cache_; // each [max_seq, HE, Dv] f16
     std::vector<MtlBuf> c_kv_;    // --mla: each [max_seq, Lk] f16
     std::vector<MtlBuf> k_rope_;  // each [max_seq, Dr]     f16
+    uint32_t kv_capacity_ = 0;    // physical positions; grows to max_seq
     MtlBuf scores_;         // [HE, max_seq]             f32
     MtlBuf attn_partials_;  // --mla long path: [HE, 32, Lk] f32
     MtlBuf attn_stats_;     // --mla long path: [HE, 32, 2]  f32
@@ -254,6 +268,9 @@ private:
     uint64_t step_model_bytes_ = 0;
     uint64_t step_reads_ = 0;
     uint64_t step_allocations_ = 0;
+    uint64_t step_expert_cache_hits_ = 0;
+    uint64_t step_expert_cache_misses_ = 0;
+    uint64_t step_expert_cache_bytes_saved_ = 0;
     long long step_io_wait_us_ = 0;
 
     void build_absorbed_kv_();

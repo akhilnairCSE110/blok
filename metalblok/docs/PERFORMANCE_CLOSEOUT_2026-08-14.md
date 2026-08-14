@@ -211,14 +211,63 @@ The routed layer-3 split established the next compute target:
 No rejected kernel remains on the default path. Strict token/logit behavior is
 the gate, followed by end-to-end wall time—not dispatch count in isolation.
 
+## Decode closeout
+
+The decode baseline and accepted run both resumed the exact position-128 MLA
+state and requested 32 emitted tokens (31 new forward advances). The generated
+bytes and all 32 token IDs were identical. The accepted log is
+`runs/run-20260814-041610-10547.log`; its reference is
+`runs/run-20260814-040853-10093.log`.
+
+| Metric | decode reference | accepted decode | delta |
+|---|---:|---:|---:|
+| end-to-end wall | 63.217 s | 26.038 s | -58.81% |
+| 31-step decode wall | 61.925 s | 23.052 s | -62.77% |
+| decode throughput | 0.501 step/s | 1.345 step/s | +168.64% (2.68x) |
+| mean step latency | 1,997.580 ms | 743.607 ms | -62.77% |
+| p50 / p95 latency | 1,986.912 / 2,128.610 ms | 714.815 / 762.775 ms | -64.02% / -64.17% |
+| summed GPU / step | 516.551 ms | 268.277 ms | -48.06% |
+| exposed I/O wait / step | 474.233 ms | 380.542 ms | -19.76% |
+| model and NVMe bytes / step | 9.770 GB | 4.035 GB | -58.70% |
+| NVMe reads / step | 1,507 | 1,393 | -7.56% |
+| command buffers / dispatches / step | 236 / 2,192 | 236 / 2,192 | unchanged |
+| hot allocations | 0 | 0 | unchanged |
+| pageouts, whole run | 2,604 | 1,403 | -46.12% |
+| VM compressions / decompressions | 20,632,449 / 20,596,885 | 190,449 / 818,207 | -99.08% / -96.03% |
+
+Two exact memory changes produced the result:
+
+1. Physical compact-KV capacity starts at 2,048 positions and doubles only
+   when required, while the logical/state limit remains 131,072. Every growth
+   copies the exact committed prefix. The accepted run therefore exposed
+   0.144 GB of physical MLA KV instead of binding the 9.211 GB limit at every
+   layer.
+2. The freed short-context headroom holds all 485 deterministic fixed
+   projections (8.976 GB). That removes 5.735 GB of SSD reads per decode step.
+   The cache is evicted if later KV growth would violate the four-GB growth
+   reserve, and full-size streaming slabs remain allocated for that fallback.
+
+Per-token profiling now also records exact routed-expert cache hits, misses,
+and bytes avoided. This cache is disabled by default: four ways saved 0.628
+GB/step at a 15.68% hit rate but reached only 1.374 step/s and did not improve
+end-to-end wall; eight ways saved 0.931 GB/step at 23.24% hits but reached only
+1.353 step/s. It remains available through `METALBLOK_EXPERT_CACHE_WAYS=1..8`
+for controlled workload-specific experiments.
+
+A full 31-step grouped-expert experiment was also completed, then removed.
+It reduced dispatches from 2,192 to 1,636 per step and GPU time by 2.09%, but
+decode fell to 1.330 step/s, p50/p95 rose to 717.737/767.175 ms, end-to-end
+wall rose to 26.887 s, and logits drifted. The likely cause was replacing the
+original fused `y += alpha * dot` rounding with a stored product followed by
+a separate ordered add. Identical token text did not override the numerical
+and wall-time rejection gates; no grouped kernel remains.
+
 ## Remaining bottlenecks
 
-**Next-session priority: maximize steady-state decode tokens/second.** The
-accepted closeout run measured prefill only, so the next performance baseline
-must execute a sufficiently long multi-token decode, report warmup separately,
-and optimize median steady-state output-token latency while preserving greedy
-token/logit parity. No decode tokens/second claim is valid until that run is
-captured.
+**Next-session priority remains steady-state decode tokens/second.** It now has
+a real 31-step baseline and accepted parity run. The strict path still moves
+4.035 GB of exact router-selected expert records per output step, so future
+work must reduce or hide that traffic without predicting or skipping experts.
 
 On the strict accepted path, routed expert GPU work remains roughly 12.7
 seconds per tile. Fixed Q4/Q5/Q6 projections remain scalar-order GEMV and cost

@@ -247,6 +247,13 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
     const uint64_t expert_batch = largest_transient * cfg_.n_experts_active * 3;
     const uint64_t base_estimated = fixed + kv + absorbed + scores + expert_batch +
                                     batch_scratch + runtime_margin;
+    const uint32_t initial_capacity = std::min(
+        cfg_.max_seq, compact_mla_ ? 2048u : 64u);
+    const uint64_t initial_kv = uint64_t(cfg_.n_layers) * initial_capacity *
+                                kv_width * 2ULL;
+    const uint64_t initial_scores = uint64_t(cfg_.n_heads) * initial_capacity * 4ULL;
+    const uint64_t initial_estimated = base_estimated - kv - scores +
+                                       initial_kv + initial_scores;
     const uint64_t host_reserve = cfg_.max_seq <= 2048 ? 1ULL << 30 : 2ULL << 30;
     const auto memory = mem::snapshot();
     // In compact mode the Q6_K absorption removes 3.25 GB of avoidable
@@ -262,22 +269,25 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
     }
     const uint64_t cache_guard = 2ULL << 30;
     const uint64_t cache_headroom = memory.available >
-        base_estimated + host_reserve + cache_guard
-        ? memory.available - base_estimated - host_reserve - cache_guard : 0;
+        initial_estimated + host_reserve + cache_guard
+        ? memory.available - initial_estimated - host_reserve - cache_guard : 0;
     fixed_cache_budget_ = std::min(desired_cache, cache_headroom);
-    const uint64_t estimated = base_estimated + fixed_cache_budget_;
+    const uint64_t estimated = initial_estimated + fixed_cache_budget_;
     prof::log("memory-ledger: mode=%s output=%.2fGB layer_slabs=%.2fGB fixed_cache=%.2fGB "
-        "kv=%.2fGB absorbed=%.2fGB expert_batch=%.2fMB batch=%.2fMB margin=%.2fMB "
+        "kv_initial=%.2fGB kv_limit=%.2fGB absorbed=%.2fGB "
+        "expert_batch=%.2fMB batch=%.2fMB margin=%.2fMB "
         "fixed_set=%.2fGB estimated=%.2fGB available=%.2fGB reserve=%.2fGB "
         "cache_guard=%.2fGB",
               compact_mla_ ? "mla" : "expanded", output_head / 1e9,
-              2 * layer_stage / 1e9, fixed_cache_budget_ / 1e9, kv / 1e9,
+              2 * layer_stage / 1e9, fixed_cache_budget_ / 1e9,
+              initial_kv / 1e9, kv / 1e9,
               absorbed / 1e9, expert_batch / 1e6,
               batch_scratch / 1e6,
               runtime_margin / 1e6, fixed_payload / 1e9,
               estimated / 1e9, memory.available / 1e9,
               host_reserve / 1e9, cache_guard / 1e9);
-    if (memory.available < estimated + host_reserve) {
+    if (memory.available < base_estimated + host_reserve ||
+        memory.available < estimated + host_reserve) {
         std::fprintf(stderr,
             "metalblok: memory safety gate refused startup: need %.2f GB "
             "runtime + %.2f GB host reserve; %.2f GB available\n",
@@ -553,28 +563,96 @@ void GgufRuntime::alloc_kv_cache_() {
         v_cache_.resize(cfg_.n_layers);
     }
     k_rope_.resize(cfg_.n_layers);
-    const size_t key_bytes = (size_t)cfg_.max_seq * HE * Dn * 2;
-    const size_t val_bytes = (size_t)cfg_.max_seq * HE * Dv * 2;
-    const size_t rope_bytes = (size_t)cfg_.max_seq * Dr * 2;
+    kv_capacity_ = std::min(cfg_.max_seq, compact_mla_ ? 2048u : 64u);
+    const size_t key_bytes = (size_t)kv_capacity_ * HE * Dn * 2;
+    const size_t val_bytes = (size_t)kv_capacity_ * HE * Dv * 2;
+    const size_t rope_bytes = (size_t)kv_capacity_ * Dr * 2;
     for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
         if (compact_mla_) c_kv_[L] = mtl_->alloc_lazy(
-            (size_t)cfg_.max_seq * cfg_.kv_lora_rank * 2);
+            (size_t)kv_capacity_ * cfg_.kv_lora_rank * 2);
         else {
             k_nope_[L] = mtl_->alloc_lazy(key_bytes);
             v_cache_[L] = mtl_->alloc_lazy(val_bytes);
         }
         k_rope_[L] = mtl_->alloc_lazy(rope_bytes);
     }
-    scores_ = mtl_->alloc((size_t)HE * cfg_.max_seq * 4);
+    scores_ = mtl_->alloc((size_t)HE * kv_capacity_ * 4);
     if (compact_mla_)
-        prof::log("gguf_runtime: MLA cache latent=%.3fGB rope=%.3fGB scores=%.2fMB",
-                  uint64_t(cfg_.max_seq) * cfg_.kv_lora_rank * 2 * cfg_.n_layers / 1e9,
+        prof::log("gguf_runtime: MLA cache physical=%u limit=%u latent=%.3fGB "
+                  "rope=%.3fGB scores=%.2fMB",
+                  kv_capacity_, cfg_.max_seq,
+                  uint64_t(kv_capacity_) * cfg_.kv_lora_rank * 2 * cfg_.n_layers / 1e9,
                   rope_bytes * cfg_.n_layers / 1e9, scores_.length / 1e6);
     else
         prof::log("gguf_runtime: exact KV cache k=%.3fGB v=%.3fGB rope=%.2fMB scores=%.2fMB",
                   key_bytes * cfg_.n_layers / 1e9,
                   val_bytes * cfg_.n_layers / 1e9,
                   rope_bytes * cfg_.n_layers / 1e6, scores_.length / 1e6);
+}
+
+void GgufRuntime::ensure_kv_capacity_(uint32_t required) {
+    if (required <= kv_capacity_) return;
+    if (required > cfg_.max_seq) die("KV capacity exceeded max_seq");
+    uint32_t next = kv_capacity_;
+    while (next < required)
+        next = next > cfg_.max_seq / 2 ? cfg_.max_seq : next * 2;
+
+    const uint32_t HE = cfg_.n_heads;
+    const uint32_t Dn = cfg_.key_length - cfg_.rope_dim;
+    const uint32_t Dv = cfg_.value_length;
+    const uint32_t Dr = cfg_.rope_dim;
+    const uint64_t width = compact_mla_
+        ? uint64_t(cfg_.kv_lora_rank) + Dr
+        : uint64_t(HE) * (Dn + Dv) + Dr;
+    const uint64_t growth = uint64_t(next - kv_capacity_) *
+        (uint64_t(cfg_.n_layers) * width * 2 + uint64_t(HE) * 4);
+    const auto memory = mem::snapshot();
+    if (expert_cache_storage_.obj && memory.available < growth + (4ULL << 30))
+        evict_expert_cache_();
+    if (fixed_cache_.obj && mem::snapshot().available < growth + (4ULL << 30))
+        evict_fixed_cache_();
+    auto grow = [&](MtlBuf& old, size_t width) {
+        MtlBuf replacement = mtl_->alloc_lazy(size_t(next) * width * 2);
+        std::memcpy(replacement.contents, old.contents,
+                    size_t(pos_) * width * 2);
+        mtl_->release(old);
+        old = replacement;
+    };
+    for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
+        if (compact_mla_) grow(c_kv_[L], cfg_.kv_lora_rank);
+        else {
+            grow(k_nope_[L], uint64_t(HE) * Dn);
+            grow(v_cache_[L], uint64_t(HE) * Dv);
+        }
+        grow(k_rope_[L], Dr);
+    }
+    MtlBuf new_scores = mtl_->alloc(size_t(HE) * next * 4);
+    mtl_->release(scores_);
+    scores_ = new_scores;
+    prof::log("gguf_runtime: KV physical capacity grew %u -> %u positions "
+              "(committed=%u)", kv_capacity_, next, pos_);
+    kv_capacity_ = next;
+}
+
+void GgufRuntime::evict_expert_cache_() {
+    if (!expert_cache_storage_.obj) return;
+    const double gb = expert_cache_storage_.length / 1e9;
+    expert_cache_.reset();
+    expert_cache_ways_ = 0;
+    mtl_->release(expert_cache_storage_);
+    prof::log("gguf_runtime: evicted %.3fGB routed-expert cache for KV growth", gb);
+}
+
+void GgufRuntime::evict_fixed_cache_() {
+    if (!fixed_cache_.obj) return;
+    const double gb = fixed_cache_.length / 1e9;
+    for (Projection* projection : fixed_cached_) {
+        projection->buffer = {};
+        projection->resident = false;
+    }
+    fixed_cached_.clear();
+    mtl_->release(fixed_cache_);
+    prof::log("gguf_runtime: evicted %.3fGB fixed cache for KV growth", gb);
 }
 
 uint64_t GgufRuntime::cpu_dequant_to_f16_(const GgufTensorEntry& e, uint16_t* dst) {
@@ -911,6 +989,7 @@ void GgufRuntime::load_fixed_projections_() {
             auto& projection = *candidates[i];
             projection.buffer = view(fixed_cache_, offset, projection.entry->nbytes);
             projection.resident = true;
+            fixed_cached_.push_back(&projection);
             ready[i].store(false, std::memory_order_relaxed);
             gm_->ring().submit(projection.entry->shard, projection.entry->abs_offset,
                                projection.entry->nbytes, projection.buffer.contents,
@@ -919,28 +998,15 @@ void GgufRuntime::load_fixed_projections_() {
         }
         for (size_t i = 0; i < cache_count; ++i) PreadRing::wait(&ready[i]);
     }
-    // Cache selection can make the conservative pre-ledger slab size obsolete.
-    // Allocate only what the largest remaining streamed layer actually needs.
-    uint64_t streamed_layer = 0;
-    for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
-        const auto& layer = lw_[L];
-        uint64_t bytes = 0;
-        for (const Projection* projection : {
-                 &layer.q_a, &layer.q_b, &layer.kv_a, &layer.kv_b,
-                 &layer.attn_output, &layer.ffn_gate, &layer.ffn_up,
-                 &layer.ffn_down, &layer.router})
-            if (projection->entry && !projection->resident &&
-                (!compact_mla_ || projection != &layer.kv_b))
-                bytes += align16k(projection->entry->nbytes);
-        streamed_layer = std::max(streamed_layer, bytes);
-    }
-    streamed_layer = std::max<uint64_t>(streamed_layer, 16384);
-    for (auto& slab : layer_stage_) slab = mtl_->alloc(streamed_layer);
+    // Keep slabs large enough for the uncached path so KV growth can evict
+    // the fixed cache without reallocating or changing the execution graph.
+    largest_layer = std::max<uint64_t>(largest_layer, 16384);
+    for (auto& slab : layer_stage_) slab = mtl_->alloc(largest_layer);
     output_projection_ = load_projection_("output.weight", H, cfg_.vocab);
     prof::log("gguf_runtime: fixed tier output=%.3fGB cache=%.3fGB/%zu projections "
               "layer_slabs=2x%.3fGB",
               output_projection_.buffer.length / 1e9, cache_bytes / 1e9, cache_count,
-              streamed_layer / 1e9);
+              largest_layer / 1e9);
 }
 
 void GgufRuntime::begin_stage_layer_(uint32_t L, uint32_t slot) {
@@ -1004,6 +1070,57 @@ void GgufRuntime::alloc_expert_slots_() {
     prof::log("gguf_runtime: expert arena %u x %.3f MB = %.3f MB",
               kDecodeExpertSlots, largest / 1e6,
               kDecodeExpertSlots * largest / 1e6);
+
+    if (!compact_mla_) return;
+    uint32_t ways = 0;
+    if (const char* value = std::getenv("METALBLOK_EXPERT_CACHE_WAYS")) {
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 10);
+        if (!end || *end != '\0' || parsed > cfg_.n_experts_active)
+            die("METALBLOK_EXPERT_CACHE_WAYS must be in [0,8]");
+        ways = static_cast<uint32_t>(parsed);
+    }
+    if (!ways) return;
+    const auto align16k = [](uint64_t n) { return (n + 16383) & ~uint64_t(16383); };
+    uint64_t bytes = 0;
+    for (uint32_t L = cfg_.n_dense_layers; L < cfg_.n_layers; ++L)
+        for (const char* suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight",
+                                   "ffn_down_exps.weight"}) {
+            std::snprintf(name, sizeof(name), "blk.%u.%s", L, suffix);
+            bytes += ways * align16k(gm_->find(name)->nbytes / cfg_.n_experts);
+        }
+    const uint64_t reserve = 4ULL << 30;
+    const auto memory = mem::snapshot();
+    if (memory.available <= bytes + reserve) {
+        prof::log("gguf_runtime: routed-expert cache disabled: need %.3fGB + "
+                  "4.295GB reserve, available %.3fGB", bytes / 1e9,
+                  memory.available / 1e9);
+        return;
+    }
+    expert_cache_storage_ = mtl_->alloc_lazy(bytes);
+    expert_cache_ways_ = ways;
+    expert_cache_ = std::make_unique<ExpertCacheSlot[]>(
+        size_t(cfg_.n_layers - cfg_.n_dense_layers) * ways);
+    uint64_t offset = 0;
+    for (uint32_t L = cfg_.n_dense_layers; L < cfg_.n_layers; ++L) {
+        uint64_t stride[3];
+        uint32_t tensor = 0;
+        for (const char* suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight",
+                                   "ffn_down_exps.weight"}) {
+            std::snprintf(name, sizeof(name), "blk.%u.%s", L, suffix);
+            stride[tensor++] = gm_->find(name)->nbytes / cfg_.n_experts;
+        }
+        for (uint32_t slot = 0; slot < ways; ++slot) {
+            auto& cached = expert_cache_[size_t(L - cfg_.n_dense_layers) * ways + slot];
+            for (uint32_t j = 0; j < 3; ++j) {
+                cached.weight[j] = view(expert_cache_storage_, offset, stride[j]);
+                cached.ready[j].store(false, std::memory_order_relaxed);
+                offset += align16k(stride[j]);
+            }
+        }
+    }
+    prof::log("gguf_runtime: routed-expert cache ways=%u capacity=%.3fGB",
+              ways, bytes / 1e9);
 }
 
 // ---------------------------------------------------------------------------
@@ -1067,7 +1184,7 @@ void GgufRuntime::mla_attn_compact_(uint32_t L) {
     const uint32_t H = cfg_.hidden, Dn = cfg_.key_length - cfg_.rope_dim;
     const uint32_t Dr = cfg_.rope_dim, Dv = cfg_.value_length;
     const uint32_t HE = cfg_.n_heads, Lk = cfg_.kv_lora_rank, Hi = cfg_.q_lora_rank;
-    const uint32_t layer = 0, ms = cfg_.max_seq, T = pos_ + 1;
+    const uint32_t layer = 0, ms = kv_capacity_, T = pos_ + 1;
     const uint32_t position = pos_;
     const float theta = cfg_.rope_freq_base, eps = cfg_.rms_eps;
     const float scale = cfg_.yarn_mscale / std::sqrt(float(Dn + Dr));
@@ -1125,7 +1242,7 @@ void GgufRuntime::mla_attn_(uint32_t L) {
     const uint32_t Dr = cfg_.rope_dim;
     const uint32_t Dv = cfg_.value_length;
     const uint32_t HE = cfg_.n_heads, Lk = cfg_.kv_lora_rank, Hi = cfg_.q_lora_rank;
-    uint32_t pos_u = pos_, cache_layer = 0, ms = cfg_.max_seq, T = pos_ + 1;
+    uint32_t pos_u = pos_, cache_layer = 0, ms = kv_capacity_, T = pos_ + 1;
     float th  = cfg_.rope_freq_base;
     float eps = cfg_.rms_eps;
     float scale = (1.0f / std::sqrt((float)(Dn + Dr))) * cfg_.yarn_mscale;
@@ -1244,13 +1361,75 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
 
     // Queue all 24 exact expert slices. The shard worker reads while the GPU
     // evaluates the always-active shared expert.
-    expert_slot_cursor_ = 0;
     std::vector<LoadedWeight> experts;
     experts.reserve(K * 3);
-    for (uint32_t k = 0; k < K; ++k) {
-        experts.push_back(load_weight_(n_gate, H, Fe, idxs[k], st_gate));
-        experts.push_back(load_weight_(n_up, H, Fe, idxs[k], st_up));
-        experts.push_back(load_weight_(n_down, Fe, H, idxs[k], st_down));
+    uint32_t layer_hits = 0;
+    if (expert_cache_ways_) {
+        auto* cache = expert_cache_.get() +
+            size_t(L - cfg_.n_dense_layers) * expert_cache_ways_;
+        const GgufTensorEntry* entries[3] = {
+            gm_->find(n_gate), gm_->find(n_up), gm_->find(n_down)};
+        const uint64_t strides[3] = {st_gate, st_up, st_down};
+        const uint32_t Ks[3] = {H, H, Fe};
+        const uint32_t Ns[3] = {Fe, Fe, H};
+        bool pinned[8]{};
+        int selected_slot[8];
+        for (uint32_t k = 0; k < K; ++k) {
+            selected_slot[k] = -1;
+            for (uint32_t slot = 0; slot < expert_cache_ways_; ++slot)
+                if (cache[slot].expert == idxs[k]) {
+                    selected_slot[k] = static_cast<int>(slot);
+                    pinned[slot] = true;
+                    ++layer_hits;
+                    ++step_expert_cache_hits_;
+                    step_expert_cache_bytes_saved_ += st_gate + st_up + st_down;
+                    break;
+                }
+        }
+        expert_slot_cursor_ = 0;
+        uint32_t victim = 0;
+        for (uint32_t k = 0; k < K; ++k) {
+            if (selected_slot[k] >= 0) {
+                auto& slot = cache[selected_slot[k]];
+                for (uint32_t j = 0; j < 3; ++j)
+                    experts.push_back({slot.weight[j], entries[j], &slot.ready[j],
+                                       Ks[j], Ns[j]});
+                continue;
+            }
+            ++step_expert_cache_misses_;
+            while (victim < expert_cache_ways_ && pinned[victim]) ++victim;
+            if (victim < expert_cache_ways_) {
+                auto& slot = cache[victim];
+                pinned[victim] = true;
+                slot.expert = idxs[k];
+                const uint64_t offsets[3] = {
+                    entries[0]->abs_offset + uint64_t(idxs[k]) * st_gate,
+                    entries[1]->abs_offset + uint64_t(idxs[k]) * st_up,
+                    entries[2]->abs_offset + uint64_t(idxs[k]) * st_down,
+                };
+                for (uint32_t j = 0; j < 3; ++j) {
+                    slot.ready[j].store(false, std::memory_order_relaxed);
+                    gm_->ring().submit(entries[j]->shard, offsets[j], strides[j],
+                                       slot.weight[j].contents, &slot.ready[j], true);
+                    step_model_bytes_ += strides[j];
+                    ++step_reads_;
+                    experts.push_back({slot.weight[j], entries[j], &slot.ready[j],
+                                       Ks[j], Ns[j]});
+                }
+                ++victim;
+            } else {
+                experts.push_back(load_weight_(n_gate, H, Fe, idxs[k], st_gate));
+                experts.push_back(load_weight_(n_up, H, Fe, idxs[k], st_up));
+                experts.push_back(load_weight_(n_down, Fe, H, idxs[k], st_down));
+            }
+        }
+    } else {
+        expert_slot_cursor_ = 0;
+        for (uint32_t k = 0; k < K; ++k) {
+            experts.push_back(load_weight_(n_gate, H, Fe, idxs[k], st_gate));
+            experts.push_back(load_weight_(n_up, H, Fe, idxs[k], st_up));
+            experts.push_back(load_weight_(n_down, Fe, H, idxs[k], st_down));
+        }
     }
 
     mtl_->begin();
@@ -1312,9 +1491,11 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
     }
     if (profile_layers_)
         prof::log("moe-pipeline pos=%u layer=%u ready_after_shared=%u/24 "
+                  "cache_hits=%u cache_misses=%u "
                   "route_gpu_us=%lld shared_gpu_us=%lld group_size=4 "
                   "g0_wait_us=%lld g0_gpu_us=%lld g1_wait_us=%lld g1_gpu_us=%lld",
-                  pos_, L, ready_after_shared, route_gpu_us, shared_gpu_us,
+                  pos_, L, ready_after_shared, layer_hits, K - layer_hits,
+                  route_gpu_us, shared_gpu_us,
                   group_wait_us[0], group_gpu_us[0],
                   group_wait_us[1], group_gpu_us[1]);
     if (trace_ && L == 3) trace_buffer_("ffn_total", L, ffn_out_, H);
@@ -1328,7 +1509,7 @@ void GgufRuntime::attention_batch_compact_(uint32_t L, uint32_t count) {
     const uint32_t H = cfg_.hidden, Dn = cfg_.key_length - cfg_.rope_dim;
     const uint32_t Dr = cfg_.rope_dim, Dv = cfg_.value_length;
     const uint32_t HE = cfg_.n_heads, Lk = cfg_.kv_lora_rank, Hi = cfg_.q_lora_rank;
-    const uint32_t layer = 0, ms = cfg_.max_seq;
+    const uint32_t layer = 0, ms = kv_capacity_;
     const float theta = cfg_.rope_freq_base, eps = cfg_.rms_eps;
     const float scale = cfg_.yarn_mscale / std::sqrt(float(Dn + Dr));
     auto row = [](const MtlBuf& b, uint32_t i, size_t n) {
@@ -1478,7 +1659,7 @@ void GgufRuntime::attention_batch_(uint32_t L, uint32_t count) {
     const uint32_t H = cfg_.hidden, Dn = cfg_.key_length - cfg_.rope_dim;
     const uint32_t Dr = cfg_.rope_dim, Dv = cfg_.value_length;
     const uint32_t HE = cfg_.n_heads, Lk = cfg_.kv_lora_rank, Hi = cfg_.q_lora_rank;
-    const uint32_t cache_layer = 0, ms = cfg_.max_seq;
+    const uint32_t cache_layer = 0, ms = kv_capacity_;
     const float theta = cfg_.rope_freq_base, eps = cfg_.rms_eps;
     const float scale = cfg_.yarn_mscale / std::sqrt(float(Dn + Dr));
     auto row = [](const MtlBuf& b, uint32_t i, size_t n) {
@@ -1797,6 +1978,7 @@ void GgufRuntime::moe_batch_(uint32_t L, uint32_t count) {
 void GgufRuntime::prefill_chunk_(const uint32_t* ids, uint32_t count) {
     if (!count || count > kPrefillBatch || pos_ + count > cfg_.max_seq)
         die("invalid prefill tile");
+    ensure_kv_capacity_(pos_ + count);
     const long long started = prof::now_us();
     const uint64_t available_before = mem::snapshot().available;
     mtl_->reset_step_stats();
@@ -1884,6 +2066,7 @@ void GgufRuntime::prefill_chunk_(const uint32_t* ids, uint32_t count) {
 // argmax sample at pos_-1.
 // ---------------------------------------------------------------------------
 void GgufRuntime::forward_one_(uint32_t tok) {
+    ensure_kv_capacity_(pos_ + 1);
     const long long started = prof::now_us();
     const auto memory_before = mem::snapshot();
     mtl_->reset_step_stats();
@@ -1891,6 +2074,8 @@ void GgufRuntime::forward_one_(uint32_t tok) {
     step_model_bytes_ = 0;
     step_reads_ = 0;
     step_allocations_ = 0;
+    step_expert_cache_hits_ = step_expert_cache_misses_ = 0;
+    step_expert_cache_bytes_saved_ = 0;
     step_io_wait_us_ = 0;
 
     // 1. Embedding.
@@ -1967,7 +2152,9 @@ void GgufRuntime::forward_one_(uint32_t tok) {
         "metrics pos=%u wall_us=%lld gpu_us=%lld io_wait_us=%lld model_bytes=%llu "
         "nvme_bytes=%llu nvme_span_us=%llu nvme_gbps=%.3f useful_reads=%llu nvme_reads=%llu "
         "urgent_bytes=%llu urgent_reads=%llu io_service_us=%llu io_max_us=%llu io_peak=%llu "
-        "cmdbufs=%d dispatches=%d allocations=%llu kv_bytes=%llu available_delta=%lld "
+        "cmdbufs=%d dispatches=%d allocations=%llu expert_cache_hits=%llu "
+        "expert_cache_misses=%llu expert_cache_bytes_saved=%llu "
+        "kv_bytes=%llu available_delta=%lld "
         "pageouts=%llu compressions=%llu decompressions=%llu swapins=%llu swapouts=%llu",
         pos_, elapsed, mtl_->step_gpu_us, step_io_wait_us_,
         static_cast<unsigned long long>(step_model_bytes_),
@@ -1983,6 +2170,9 @@ void GgufRuntime::forward_one_(uint32_t tok) {
         mtl_->step_cmdbufs,
         mtl_->step_dispatches,
         static_cast<unsigned long long>(step_allocations_),
+        static_cast<unsigned long long>(step_expert_cache_hits_),
+        static_cast<unsigned long long>(step_expert_cache_misses_),
+        static_cast<unsigned long long>(step_expert_cache_bytes_saved_),
         static_cast<unsigned long long>(kv_bytes),
         static_cast<long long>(memory_delta),
         static_cast<unsigned long long>(memory_after.pageouts - memory_before.pageouts),
@@ -2219,6 +2409,7 @@ bool GgufRuntime::load_state(const std::string& path) {
               h.n_layers == cfg_.n_layers && h.max_seq == cfg_.max_seq &&
               h.kv_rank == cfg_.kv_lora_rank && h.rope_dim == cfg_.rope_dim &&
               h.pos <= cfg_.max_seq;
+    if (ok) ensure_kv_capacity_(h.pos);
     const uint64_t key_width = uint64_t(cfg_.n_heads) *
         (cfg_.key_length - cfg_.rope_dim);
     const uint64_t val_width = uint64_t(cfg_.n_heads) * cfg_.value_length;
