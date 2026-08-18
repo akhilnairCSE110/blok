@@ -1102,12 +1102,14 @@ void GgufRuntime::alloc_expert_slots_() {
               kDecodeExpertSlots, largest / 1e6,
               kDecodeExpertSlots * largest / 1e6);
 
-    if (!compact_mla_) return;
-    // Four ways is the measured long-decode optimum on the target M5: it
-    // preserves exact weights while avoiding enough repeated expert reads to
-    // improve steady-state latency without the bandwidth collapse seen at 8.
-    uint32_t ways = 4;
-    if (const char* value = std::getenv("METALBLOK_EXPERT_CACHE_WAYS")) {
+    const char* requested = std::getenv("METALBLOK_EXPERT_CACHE_WAYS");
+    // Compact MLA keeps the measured four-way default. Expanded mode stays
+    // unchanged unless the caller explicitly opts into an exact resident
+    // expert cache; this preserves the accepted V0 path by default.
+    if (!compact_mla_ && !requested) return;
+    uint32_t ways = compact_mla_ ? 4u : 0u;
+    if (requested) {
+        const char* value = requested;
         char* end = nullptr;
         const unsigned long parsed = std::strtoul(value, &end, 10);
         if (!end || *end != '\0' || parsed > 32)

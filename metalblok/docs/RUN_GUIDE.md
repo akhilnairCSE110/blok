@@ -148,6 +148,11 @@ recall/precision, predictor wall/GPU cost, router-verification lead,
 first-expert-use lead, and false/late traffic. The probe never issues
 speculative reads and cannot affect model output.
 
+`--expert-cache-ways N` enables the exact resident expert cache. Compact MLA
+defaults to the measured four-way cache; expanded V0 leaves it disabled unless
+this flag is supplied, preserving the accepted baseline by default. The
+runtime clamps the request to the measured UMA budget and reserve.
+
 There is deliberately no active expert-prefetch flag. The measured rank-one
 candidate improved raw wall time but failed the full-logit/checkpoint gate, so
 its implementation was removed rather than left as an attractive unsafe mode.
