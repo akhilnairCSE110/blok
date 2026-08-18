@@ -13,6 +13,32 @@ storage schedule, Metal schedule, state format, performance model, negative
 results, and the reasoning behind every material decision. Proposed future
 work is explicitly separated from implemented behavior.
 
+The word **V0** here means the accepted expanded-KV graph used by the completed
+1,000+1,000 proof. Later `--mla` work has a different state ABI and
+finite-precision graph. It is summarized in Section 17. A 131,072-position
+capacity admission is not a completed 128K-token prompt.
+
+## Architecture decision summary
+
+| Boundary | Chosen design | Contrary design | Reason |
+|---|---|---|---|
+| Runtime | Native C++/Objective-C++/MSL | llama.cpp, MLX, PyTorch, or a server wrapper | Own tensor lifetimes, GGUF offsets, reductions, I/O priority, and telemetry. |
+| Scope | One exact DeepSeek-R1 GGUF geometry | General model dispatch in V0 | Specialization removes branches and makes incompatible artifacts fail early. |
+| Residency | Stream compressed slices through bounded shared slabs | Load or dequantize all 140 GB | The checkpoint is 5.8x physical memory. |
+| MoE | Exact router, then eight experts | All 256 experts or predictor-selected compute | Only the trained router proves the other 248 coefficients are zero. |
+| Quantization | Decode inside each dot product | Materialize FP16 weights | Avoids another global pass and roughly 10x IQ1_S expansion. |
+| File path | Exact `pread`, `F_NOCACHE`, bounded lanes | Demand paging and readahead | Explicit knowledge is safer than page-cache heuristics under pressure. |
+| Layer pipeline | Stage fixed layer `L+1` during compute `L` | Read and compute serially | Fixed addresses are unconditional and safe to retime. |
+| MoE pipeline | Expert reads overlap shared-expert compute | Wait before all FFN compute | Both depend on routing but are independent until the sum. |
+| Prefill | Layer-major 128-token tiles | Complete token-major forwards | Reuse fixed and union-expert weights across prompt activations. |
+| State oracle | Expanded FP16 K/V | Assume absorbed MLA is bitwise equivalent | Quant decode and FP32/FP16 rounding make reassociation observable. |
+| Long context | Separate opt-in compact MLA ABI | Silently reinterpret expanded state | The 57x capacity gain and changed numerical graph both remain explicit. |
+| Accelerator | One Metal GPU graph | Per-layer ANE/Core ML handoff | No public raw-ANE kernel API; crossings add synchronization and traffic. |
+| Promotion | Full-logit, token, wall, bytes, and pressure gates | Accept local kernel speed | Locally faster experiments have changed logits or lost wall time. |
+
+Every choice follows from a capacity equation, dependency edge,
+finite-precision boundary, or retained measurement below.
+
 ## 1. Optimization objective and release ordering
 
 The objective is lexicographic, not a weighted average:
@@ -80,8 +106,9 @@ copy” means one shared allocation, not zero bytes moved.
 ### 2.3 Storage
 
 V0 controls file offsets and request ordering, not NAND pages, FTL placement,
-ECC, or NVMe firmware. Each shard is opened on eight measured independent
-lanes by default, with a bounded `--io-lanes {2,4,8}` control. Every lane uses:
+ECC, or NVMe firmware. The accepted proof used four readers per shard; the
+later strict profile selected the current eight-reader default. The bounded
+control is `--io-lanes {2,4,8}`. Every lane uses:
 
 ```text
 O_RDONLY
@@ -431,7 +458,8 @@ contention and the first/last bubbles.
 
 ### 8.3 Priority reader
 
-Each of the default 24 workers owns two SPSC queues:
+Each worker owns two SPSC queues. The accepted proof used 12 workers; the
+current measured default is 24:
 
 - background: unconditional next-layer fixed projections;
 - urgent: current router-selected gate/up/down slices.
@@ -509,7 +537,9 @@ address-translation overhead without changing useful bytes. V0 does not claim
 that improvement before a repacked artifact exists.
 
 Its temporal windowing idea maps to an expert cache across decode positions.
-That cache is deliberately absent from the release default. The 24 GB machine
+That cache is absent from the expanded-V0 default. The later compact mode uses
+a guarded four-way per-layer history cache after a measured A/B because its
+smaller state creates the required headroom. The 24 GB machine
 must already preserve 8.203 GB of exact KV address space, the resident output
 head, two layer slabs, scratch, and macOS headroom. A cache policy is useful
 only if
@@ -883,3 +913,55 @@ metrics, and limitations are in [the proof report](PROOF_1K_REPORT.md).
 The staged design for replacing expanded KV, full checkpoint rewrites, and
 token-by-token prefill at much larger scale is in the
 [million-token scale plan](MILLION_TOKEN_SCALE_PLAN.md).
+
+## 17. Post-V0 compact path and current boundary
+
+The current source contains two deliberately distinct state graphs:
+
+| Property | Default expanded graph | `--mla` compact graph |
+|---|---:|---:|
+| stored content/layer/position | 128x128 non-RoPE K, 128x128 V, 64 shared RoPE K | 512 normalized KV latent, 64 shared RoPE K |
+| bytes/position | 4,005,504 | 70,272 |
+| context 2,048 | 8.203 GB | 0.144 GB |
+| context 131,072 | impossible on 24 GB | 9.211 GB |
+| strongest evidence | full 1K input + 1K output | short capacity/performance probes |
+| equality claim | named accepted V0 anchors | real-number equivalence; not bitwise-expanded parity |
+
+The capacity ratio is
+
+\[
+\frac{4{,}005{,}504}{70{,}272}=57.
+\]
+
+Compact attention absorbs the content-key projection into the query and moves
+the value projection after the weighted latent sum:
+
+\[
+(q_h^n)^TW_h^Kc_j=(W_h^{K,T}q_h^n)^Tc_j,
+\qquad
+\sum_jp_{h,j}W_h^Vc_j=W_h^V\sum_jp_{h,j}c_j.
+\]
+
+For long histories, two-pass online softmax stores bounded partial `(max, sum,
+weighted latent)` state rather than materializing a score matrix. The rewrite
+is information-preserving in real arithmetic but moves quantized decode,
+FP32 reduction, and FP16 rounding boundaries. The 128-token probe at a
+131,072 capacity preserved token `33001` and close logits while reducing wall
+from 37.444 to 35.148 seconds. It did not execute a 128K prompt and did not
+establish bitwise full-vector equality with expanded mode.
+
+Compact mode also changes residency. With short physical KV allocation, all
+485 deterministic fixed projections occupied 8.976 GB in the measured run.
+Selected experts then dominated immutable traffic at 4.035 GB/token before
+history hits. A four-way exact per-layer LRU reduced a saved 31-step decode to
+3.387 GB/token and raised rate from 1.344 to 1.374 step/s. Eight ways moved
+only 3.073 GB/token but slowed to 1.353 step/s under memory pressure. Four ways
+is therefore the guarded compact default; hit rate alone is not the objective.
+
+`--tensorops` changed routing/logits and remains quarantined. Active expert
+prefetch improved raw timing but changed multi-step full-logit hashes, so the
+implementation and flag were removed; only its read-free profiler remains.
+`--parallel-gate-up` also requires a same-state full-logit and wall-time
+promotion run. Detailed evidence is in the
+[performance closeout](PERFORMANCE_CLOSEOUT_2026-08-14.md) and
+[lookahead record](VERIFIED_LOOKAHEAD_FIFO.md).

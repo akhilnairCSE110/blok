@@ -249,7 +249,7 @@ For fixed aligned record stride (S_e'), layer-local expert count (E), and expert
 O_{\ell,e}=O_0+(\ell E+e)S_e'.
 \]
 
-The router result therefore needs only ((\ell,e)) to generate an LBA. No filesystem name lookup or learned predictor is on this path.
+The router result therefore needs only \((\ell,e)\) to generate an LBA. No filesystem name lookup or learned predictor is on this path.
 
 ## 6. Exact expert-byte reductions
 
@@ -345,7 +345,7 @@ These 48× and 32× results are byte reductions for the routed bank. They are no
 
 ### 7.1 Projection path
 
-For normalized residual (ar x_t), MLA forms a compressed query and compressed KV state:
+For normalized residual \(\bar{x}_t\), MLA forms a compressed query and compressed KV state:
 
 \[
 c_t^Q=W^{DQ}\bar x_t,

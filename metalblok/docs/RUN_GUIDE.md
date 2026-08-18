@@ -126,14 +126,89 @@ For synchronization-heavy operation attribution:
 ```
 
 `--profile-ops` logs individual projection/attention/MoE boundaries and a
-representative per-expert gate/up/down split. It intentionally perturbs the
-command-buffer schedule and is for diagnosis, not headline throughput.
+representative per-expert gate/up/down split. Decode normally fuses attention
+and router in one command buffer; operation profiling inserts a boundary so
+their GPU time is attributed truthfully. It intentionally perturbs the Metal
+schedule and is for diagnosis, not headline throughput.
 `--profile-layers` also logs per-shard/per-reader I/O work. The measured M5
 default is eight readers per shard; compare safely with `--io-lanes 4`.
+
+`--profile-predictor` measures state-conditioned cross-layer lookahead. By
+default, each residual is tested with the real resident DeepSeek routers for
+the current and next three layers. Each target route is later compared with
+the authoritative post-attention route. `--predictor-depth 1..8` controls this
+diagnostic horizon. It adds work and is never a throughput run:
+
+```sh
+./run_blok.py "predictor trace" -n 32 --mla --profile-predictor
+```
+
+The analyzer reports every lookahead distance separately: top-8
+recall/precision, predictor wall/GPU cost, router-verification lead,
+first-expert-use lead, and false/late traffic. The probe never issues
+speculative reads and cannot affect model output.
+
+There is deliberately no active expert-prefetch flag. The measured rank-one
+candidate improved raw wall time but failed the full-logit/checkpoint gate, so
+its implementation was removed rather than left as an attractive unsafe mode.
+Use the analyzer to evaluate prediction coverage without issuing reads:
+
+```sh
+python3 scripts/analyze_expert_routes.py metalblok/runs/run-....log
+```
 
 `--tensorops` enables an experimental M5 MPP QMM prefill path. It is faster,
 but it reassociates FP32 reductions and has not passed strict logit/routing
 parity. Do not use it for strict acceptance runs.
+
+`--parallel-gate-up` executes each routed expert's independent IQ1_S gate and
+up dot products on two 32-lane SIMD groups. Each dot retains the accepted lane
+assignment and reduction order; routed down projections still accumulate in
+router-rank order. Compare it against the strict default on the target before
+promotion:
+
+```sh
+./run_blok.py "profile this" -n 32 --mla --parallel-gate-up --profile-layers
+```
+
+`--expert-cache-ways 0..32` controls the verified per-layer expert-history
+cache. The runtime clamps the request to the largest allocation that preserves
+its six-GiB reserve; `32` therefore means "use the safe available headroom, up
+to 32." Entries retain exact gate/up/down tensors from earlier routes and an
+authoritative router miss always falls back to SSD.
+
+`--expert-group-size 1|2|4|8` is the routed I/O/command scheduling knob.
+Smaller groups can start compute after fewer expert reads; larger groups reduce
+command-buffer boundaries. Expert rank and accumulation order do not change.
+The accepted default is `4`; tune only with parity-matched decode runs because
+the winning value depends on the measured SSD/GPU overlap.
+
+Compare completed experiments as a parity-gated performance/area/traffic
+frontier (the first log is the strict reference):
+
+```sh
+python3 scripts/synthesize_decode_config.py REF.log CANDIDATE*.log \
+  --max-cache-gb 6
+```
+
+This reports measured whole-decode tokens/s and end-to-end wall, p50/p95
+forward latency, GPU/I/O time, NVMe bytes, cache capacity, command work,
+allocations, and pageouts. Every new sample record contains a bitwise hash of
+the full logit vector; only matching hashes enter the strict frontier. Legacy
+logs are labeled `sample` and excluded unless the explicitly weaker
+`--allow-sample-parity` option is supplied.
+
+On the target, synthesize the default decode schedule automatically from one
+immutable golden checkpoint:
+
+```sh
+python3 scripts/tune_decode.py --state /path/to/golden.state -n 32
+```
+
+It uses APFS copy-on-write clones, runs `0:4,4:1,4:2,4:4,4:8,8:4` as
+`cache-ways:expert-group-size`, deletes only its temporary clones, then invokes
+the strict full-logit-hash frontier report. Override the search with, for
+example, `--configs 0:4,4:2,4:4 --max-cache-gb 3`.
 
 For numerical fingerprints and top logits:
 

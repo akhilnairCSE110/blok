@@ -182,6 +182,11 @@ and residuals. Sparse layer 3 additionally splits every active expert's
 gate/up and down work. Each routed group records assignments, unique model
 bytes, explicit I/O wait, GPU time, wall time, and dispatches.
 
+Decode's production command buffer fuses attention with the following router.
+`--profile-ops` inserts a diagnostic-only boundary between them; without that
+boundary, a completion timestamp describes the combined command buffer and
+cannot honestly be called router-only GPU time. Headline runs keep the fusion.
+
 `--profile-layers` now also prints one `profile-io` record per shard/lane with
 bytes, reads, urgent bytes/reads, summed service time, and maximum read time.
 Command-buffer GPU timestamps are real Metal timestamps; hardware cycle,
@@ -248,11 +253,14 @@ Two exact memory changes produced the result:
    reserve, and full-size streaming slabs remain allocated for that fallback.
 
 Per-token profiling now also records exact routed-expert cache hits, misses,
-and bytes avoided. This cache is disabled by default: four ways saved 0.628
-GB/step at a 15.68% hit rate but reached only 1.374 step/s and did not improve
-end-to-end wall; eight ways saved 0.931 GB/step at 23.24% hits but reached only
-1.353 step/s. It remains available through `METALBLOK_EXPERT_CACHE_WAYS=1..8`
-for controlled workload-specific experiments.
+and bytes avoided. Four ways saved 0.628 GB/step at a 15.68% hit rate and
+improved the 31-step decode from 1.345 to 1.374 step/s; the final steady step
+fell from 643 to 606 ms. It is therefore the guarded long-decode default. The
+32-token end-to-end result was effectively neutral (26.045 versus 26.038 s),
+so this is a decode-throughput choice, not a startup claim. Eight ways saved
+0.931 GB/step at 23.24% hits but fell to 1.353 step/s as memory pressure reduced
+effective I/O bandwidth. `METALBLOK_EXPERT_CACHE_WAYS=0..32` overrides the
+default; allocation preserves a six-GiB reserve and KV growth evicts it.
 
 A full 31-step grouped-expert experiment was also completed, then removed.
 It reduced dispatches from 2,192 to 1,636 per step and GPU time by 2.09%, but
@@ -300,3 +308,148 @@ git diff --check
 The acceptance model run is listed at the start of this document. No 32K or
 128K-token prompt was executed during this pass; `--context 131072` proves
 admission/allocation for that capacity, not end-to-end 128K prefill.
+
+## Verified-lookahead synthesis addendum
+
+The predictive-residency idea is now expressed as a resource-constrained
+dataflow schedule in `VERIFIED_LOOKAHEAD_FIFO.md`. Correctness is a hard
+constraint: only the authoritative post-attention top-8 route binds weights to
+compute. Predictions may affect residency but cannot affect expert IDs,
+coefficients, rank order, or logits.
+
+The implementation added:
+
+- a true bounded per-layer LRU history tier with current-token pinning and a
+  six-GiB OS/KV reserve;
+- capacities through 32 ways, automatically clamped to safe available memory;
+- all eight exact expert IDs in each sparse-layer profile record;
+- per-routed-group wait/GPU records under `--profile-ops` and a parity-safe
+  `--expert-group-size 1|2|4|8` scheduling parameter;
+- a diagnostic `--profile-predictor --predictor-depth 1..8` cross-layer sweep
+  using future layers' real resident DeepSeek routers on earlier residuals,
+  with exact overlap, predictor wall/GPU cost, router-verification lead, and
+  first-expert-use lead for every horizon;
+- an optional two-SIMD-group gate/up kernel behind `--parallel-gate-up`; the
+  strict serial kernel remains the default until target parity and wall tests;
+- an exact LRU/Belady trace analyzer with out-of-sample decay/recency predictor
+  tuning and explicit false-prefetch byte accounting;
+- a parity-gated synthesis report that compares whole-decode wall, end-to-end
+  wall, cache GB, NVMe bytes, GPU/I/O time, p50/p95, command work, allocations,
+  and pageouts on a non-dominated frontier;
+- a one-command target tuner that APFS-clones a golden checkpoint, runs a
+  compact cache/group schedule sweep, and invokes that strict frontier;
+- a full-logit bit hash emitted during the existing sampling scan, giving new
+  runs a bitwise output-vector equivalence gate without a second tensor pass.
+
+The existing 23-position trace gives a hard reality check:
+
+| policy | verified top-8 recall | speculative total traffic |
+|---|---:|---:|
+| previous token | 24.55% | 7.079 GB/token |
+| online frequency | 25.31% | 7.049 GB/token |
+| tuned decay/recency, held-out tail | 28.00% | 6.940 GB/token |
+| offline static top-8 | 35.26% | 6.647 GB/token |
+
+The traffic column is predicted bytes plus exact late-miss bytes. These simple
+predictors are therefore rejected for active prefetch: they would exceed the
+strict path's 4.035 GB/token. The state-conditioned predictor probe is the
+next admissible test. It does not issue speculative reads, so its measurement
+cannot silently degrade the accepted runtime.
+
+That target measurement is now complete. Run
+`run-20260814-165304-4377.log` covered 406 sparse-layer routes and 3,248 expert
+selections. Same-layer pre-attention prediction reached 81.19% top-8 recall;
+one-layer lookahead reached 68.17%. Ranked admission is much stronger: the
+rank-1 candidate measured 98.77% precision at horizon zero and 95.81% at
+horizon one, with 4.003 ms and 16.819 ms mean first-use lead respectively.
+Horizon-one rank one can move 0.483 GB/token earlier for 0.021 GB/token of
+false traffic. This is a timing opportunity, not a byte reduction: compulsory
+expert bytes still move once.
+
+The transfer-only experiment staged the rank-one candidate through the
+background queue while the authoritative router remained in control. The
+final controlled trial moved 0.500 GB/token usefully and 0.004 GB/token
+falsely, reducing mean I/O wait from 292.7 to 240.2 ms and raw decode wall
+from 20.990 to 20.540 seconds (1.429 to 1.461 step/s). It failed after 25
+matching full-logit vectors and produced a different checkpoint, so the
+active path and flags were removed. No predictor speedup is accepted.
+
+The same trace contains 4,769 distinct `(layer, expert)` pairs across 10,672
+selections, proving a 55.31% passive-cache ceiling over that short window.
+Thirty-two-way LRU reaches 46.23%; future-aware Belady reaches 55.18%. The gap
+quantifies eviction-policy opportunity, while the compulsory misses quantify
+what prediction can only move earlier rather than remove.
+
+The scheduling bound remains
+
+\[
+T_{token}\ge\max(T_{GPU},(1-h)D/R_s),
+\]
+
+with measured (D=4.035) GB, (R_s=6.388) GB/s, and
+(T_{GPU}=265) ms. Becoming compute-bound requires 58.1% byte hits. The I/O
+side of 5 token/s requires 68.3%, and the GPU side separately requires less
+than 200 ms. Even perfect expert residency is capped at 3.77 token/s by the
+current GPU time. This is the HLS `max(ResMII, RecMII)` lower bound applied to
+decode and prevents FIFO capacity from being mistaken for sustained bandwidth.
+
+The saved target cache sweep is the latest complete, like-for-like performance
+block. All three runs start from the same decode position and emit the same 31
+sampled tokens with the same logged winning/runner-up logits. These historical
+logs predate the new full-vector hash, so the report labels them `sample`; they
+are evidence for the cache decision, not the stronger acceptance gate now used
+for new work.
+
+| cache | decode | end-to-end | mean GPU | mean I/O wait | NVMe/token | hit rate |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 ways | 1.344 step/s | 26.038 s | 266.6 ms | 377.8 ms | 4.035 GB | 0.00% |
+| 4 ways | **1.374 step/s** | 26.045 s | 265.3 ms | 363.0 ms | 3.387 GB | 16.20% |
+| 8 ways | 1.353 step/s | 26.224 s | 266.9 ms | 368.1 ms | 3.073 GB | 24.02% |
+
+The four-way cache is the default because it wins decode wall; the eight-way
+cache moves fewer bytes but loses wall time under memory pressure. That is
+exactly why the synthesizer optimizes measured end-to-end timing rather than
+cache hit rate in isolation.
+
+Learned prediction is kept narrowly scoped. The transferable idea from
+[EAGLE-3](https://arxiv.org/abs/2503.01840) is multi-level feature fusion, not
+its speculative-token tree. The correctness boundary follows
+[SpecPrefetch](https://arxiv.org/abs/2607.24787): predictions may move weights,
+but the native DeepSeek router alone decides execution. A trained same-layer
+pre-attention head is justified by the direction in
+[Pre-Attention Expert Prediction](https://arxiv.org/abs/2511.10676), but its
+reported result is not claimed for this model. V0 first measures the already
+implemented zero-new-weight, model-native probe; no active read is issued until
+recall, false bytes, lead time, and full-decode wall all pass.
+
+No prefetch throughput improvement is claimed. The native C++ build,
+router/preflight tests, Python compilation, historical trace replays, PPA
+report, and whitespace audit pass. The exact target decision sequence is:
+
+```sh
+./run_blok.py "predictor trace" -n 32 --mla --profile-predictor
+python3 scripts/analyze_expert_routes.py metalblok/runs/run-....log
+
+cp STATE /tmp/blok-g1.state
+cp STATE /tmp/blok-g2.state
+cp STATE /tmp/blok-g4.state
+cp STATE /tmp/blok-g8.state
+
+./run_blok.py ignored --state /tmp/blok-g1.state --continue-decode --mla \
+  --expert-cache-ways 4 --expert-group-size 1 --profile-layers -n 32
+./run_blok.py ignored --state /tmp/blok-g2.state --continue-decode --mla \
+  --expert-cache-ways 4 --expert-group-size 2 --profile-layers -n 32
+./run_blok.py ignored --state /tmp/blok-g4.state --continue-decode --mla \
+  --expert-cache-ways 4 --expert-group-size 4 --profile-layers -n 32
+./run_blok.py ignored --state /tmp/blok-g8.state --continue-decode --mla \
+  --expert-cache-ways 4 --expert-group-size 8 --profile-layers -n 32
+
+python3 scripts/synthesize_decode_config.py STRICT.log GROUP*.log \
+  --max-cache-gb 6
+```
+
+Only a full-logit-hash-matched configuration with lower whole-decode wall can
+replace group size 4. The saved historical cache runs predate these hashes and
+are labeled `sample`; reproducing their earlier comparison requires the weaker
+`--allow-sample-parity`, while new acceptance runs do not. `unknown` numerical
+parity is never acceptance.

@@ -29,6 +29,8 @@ namespace blade {
 
 namespace {
 
+constexpr uint64_t kRuntimeMemoryReserve = 6ULL << 30;
+
 [[noreturn]] void die(const char* m) {
     std::fprintf(stderr, "gguf_runtime: %s\n", m);
     std::abort();
@@ -153,13 +155,38 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
     trace_ = std::getenv("METALBLOK_TRACE") != nullptr;
     profile_layers_ = std::getenv("METALBLOK_PROFILE_LAYERS") != nullptr;
     profile_ops_ = std::getenv("METALBLOK_PROFILE_OPS") != nullptr;
-    profile_layers_ |= profile_ops_;
+    profile_predictor_ = std::getenv("METALBLOK_PROFILE_PREDICTOR") != nullptr;
+    profile_layers_ |= profile_ops_ || profile_predictor_;
     tensorops_ = std::getenv("METALBLOK_TENSOROPS") != nullptr;
     compact_mla_ = std::getenv("METALBLOK_MLA") != nullptr;
     validate_mla_ = std::getenv("METALBLOK_VALIDATE_MLA") != nullptr;
+    parallel_gate_up_ = std::getenv("METALBLOK_PARALLEL_GATE_UP") != nullptr;
     if (validate_mla_ && !compact_mla_) die("MLA validation requires compact MLA");
     parse_config_(g);
     verify_tensor_table_(gm);
+    if (const char* value = std::getenv("METALBLOK_EXPERT_GROUP_SIZE")) {
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 10);
+        if (!end || *end != '\0' || (parsed != 1 && parsed != 2 &&
+                                      parsed != 4 && parsed != 8) ||
+            cfg_.n_experts_active % parsed)
+            die("METALBLOK_EXPERT_GROUP_SIZE must divide top-k and be 1,2,4,8");
+        expert_group_size_ = static_cast<uint32_t>(parsed);
+    }
+    if (profile_predictor_) {
+        if (const char* value = std::getenv("METALBLOK_PREDICTOR_DEPTH")) {
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            if (!end || *end != '\0' || parsed < 1 || parsed > 8)
+                die("METALBLOK_PREDICTOR_DEPTH must be in 1..8");
+            predictor_depth_ = static_cast<uint32_t>(parsed);
+        }
+        const size_t samples = size_t(cfg_.n_layers) * predictor_depth_;
+        predicted_routes_.resize(samples);
+        predictor_ready_us_.resize(samples);
+        predictor_wall_us_.resize(samples);
+        predictor_gpu_us_.resize(samples);
+    }
 
     // The direct native binary defaults to 64; the public runner always sets
     // this from --context before initialization.
@@ -303,9 +330,13 @@ void GgufRuntime::init(const Gguf& g, GgufModel& gm, Metal& mtl) {
     alloc_expert_slots_();
     build_grids_();
 
-    prof::log("gguf_runtime: init mode=%s n_layers=%u hidden=%u vocab=%u "
+    prof::log("gguf_runtime: init mode=%s gate_up=%s expert_group=%u "
+              "n_layers=%u hidden=%u vocab=%u "
               "n_experts=%u active=%u kv_lora=%u rope_dim=%u max_seq=%u rss=%zuMB",
-              compact_mla_ ? "mla" : "expanded", cfg_.n_layers, cfg_.hidden, cfg_.vocab,
+              compact_mla_ ? "mla" : "expanded",
+              parallel_gate_up_ ? "parallel" : "serial",
+              expert_group_size_,
+              cfg_.n_layers, cfg_.hidden, cfg_.vocab,
               cfg_.n_experts, cfg_.n_experts_active,
               cfg_.kv_lora_rank, cfg_.rope_dim, cfg_.max_seq, prof::rss_mb());
 }
@@ -607,9 +638,9 @@ void GgufRuntime::ensure_kv_capacity_(uint32_t required) {
     const uint64_t growth = uint64_t(next - kv_capacity_) *
         (uint64_t(cfg_.n_layers) * width * 2 + uint64_t(HE) * 4);
     const auto memory = mem::snapshot();
-    if (expert_cache_storage_.obj && memory.available < growth + (4ULL << 30))
+    if (expert_cache_storage_.obj && memory.available < growth + kRuntimeMemoryReserve)
         evict_expert_cache_();
-    if (fixed_cache_.obj && mem::snapshot().available < growth + (4ULL << 30))
+    if (fixed_cache_.obj && mem::snapshot().available < growth + kRuntimeMemoryReserve)
         evict_fixed_cache_();
     auto grow = [&](MtlBuf& old, size_t width) {
         MtlBuf replacement = mtl_->alloc_lazy(size_t(next) * width * 2);
@@ -1072,31 +1103,45 @@ void GgufRuntime::alloc_expert_slots_() {
               kDecodeExpertSlots * largest / 1e6);
 
     if (!compact_mla_) return;
-    uint32_t ways = 0;
+    // Four ways is the measured long-decode optimum on the target M5: it
+    // preserves exact weights while avoiding enough repeated expert reads to
+    // improve steady-state latency without the bandwidth collapse seen at 8.
+    uint32_t ways = 4;
     if (const char* value = std::getenv("METALBLOK_EXPERT_CACHE_WAYS")) {
         char* end = nullptr;
         const unsigned long parsed = std::strtoul(value, &end, 10);
-        if (!end || *end != '\0' || parsed > cfg_.n_experts_active)
-            die("METALBLOK_EXPERT_CACHE_WAYS must be in [0,8]");
+        if (!end || *end != '\0' || parsed > 32)
+            die("METALBLOK_EXPERT_CACHE_WAYS must be in [0,32]");
         ways = static_cast<uint32_t>(parsed);
     }
     if (!ways) return;
     const auto align16k = [](uint64_t n) { return (n + 16383) & ~uint64_t(16383); };
-    uint64_t bytes = 0;
+    uint64_t bytes_per_way = 0;
     for (uint32_t L = cfg_.n_dense_layers; L < cfg_.n_layers; ++L)
         for (const char* suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight",
                                    "ffn_down_exps.weight"}) {
             std::snprintf(name, sizeof(name), "blk.%u.%s", L, suffix);
-            bytes += ways * align16k(gm_->find(name)->nbytes / cfg_.n_experts);
+            bytes_per_way += align16k(gm_->find(name)->nbytes / cfg_.n_experts);
         }
-    const uint64_t reserve = 4ULL << 30;
+    const uint64_t reserve = kRuntimeMemoryReserve;
     const auto memory = mem::snapshot();
-    if (memory.available <= bytes + reserve) {
+    const uint32_t fitting = memory.available > reserve
+        ? static_cast<uint32_t>(std::min<uint64_t>(32,
+              (memory.available - reserve) / bytes_per_way))
+        : 0;
+    if (ways > fitting) {
+        prof::log("gguf_runtime: routed-expert cache clamped ways=%u->%u "
+                  "by %.3fGB available and %.3fGB reserve",
+                  ways, fitting, memory.available / 1e9, reserve / 1e9);
+        ways = fitting;
+    }
+    if (!ways) {
         prof::log("gguf_runtime: routed-expert cache disabled: need %.3fGB + "
-                  "4.295GB reserve, available %.3fGB", bytes / 1e9,
-                  memory.available / 1e9);
+                  "%.3fGB reserve, available %.3fGB", bytes_per_way / 1e9,
+                  reserve / 1e9, memory.available / 1e9);
         return;
     }
+    const uint64_t bytes = ways * bytes_per_way;
     expert_cache_storage_ = mtl_->alloc_lazy(bytes);
     expert_cache_ways_ = ways;
     expert_cache_ = std::make_unique<ExpertCacheSlot[]>(
@@ -1324,7 +1369,7 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
     mtl_->commit_and_wait();
     const long long route_gpu_us = mtl_->last_gpu_us();
 
-    if (trace_ && L == 3) {
+    if (trace_) {
         trace_buffer_("ffn_inp", L, x_, H);
         trace_buffer_("ffn_norm", L, x_norm_, H);
         trace_buffer_("router_logits", L, router_log_, Ne);
@@ -1332,6 +1377,30 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
 
     const uint32_t* idxs = (const uint32_t*)router_idx_.contents;
     const float*    wts  = (const float*)   router_wts_.contents;
+    if (profile_predictor_) {
+        const uint32_t max_distance = std::min(predictor_depth_ - 1, L);
+        for (uint32_t distance = 0; distance <= max_distance; ++distance) {
+            const size_t slot = size_t(L) * predictor_depth_ + distance;
+            if (!predictor_ready_us_[slot]) continue;
+            const auto& predicted = predicted_routes_[slot];
+            uint32_t overlap = 0;
+            for (uint32_t i = 0; i < K; ++i)
+                for (uint32_t j = 0; j < K; ++j)
+                    overlap += idxs[i] == predicted[j];
+            prof::log("predictor pos=%u layer=%u source_layer=%u "
+                      "lookahead_layers=%u source=pre-attention overlap=%u/8 "
+                      "predict_wall_us=%lld predict_gpu_us=%lld verify_lead_us=%lld "
+                      "predicted=%u,%u,%u,%u,%u,%u,%u,%u "
+                      "exact=%u,%u,%u,%u,%u,%u,%u,%u",
+                      pos_, L, L - distance, distance, overlap,
+                      predictor_wall_us_[slot], predictor_gpu_us_[slot],
+                      prof::now_us() - predictor_ready_us_[slot],
+                      predicted[0], predicted[1], predicted[2], predicted[3],
+                      predicted[4], predicted[5], predicted[6], predicted[7],
+                      idxs[0], idxs[1], idxs[2], idxs[3],
+                      idxs[4], idxs[5], idxs[6], idxs[7]);
+        }
+    }
     if (trace_) {
         for (uint32_t k = 0; k < K; ++k)
             prof::log("trace router pos=%u layer=%u rank=%u expert=%u weight=%.8g",
@@ -1372,7 +1441,7 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
         const uint64_t strides[3] = {st_gate, st_up, st_down};
         const uint32_t Ks[3] = {H, H, Fe};
         const uint32_t Ns[3] = {Fe, Fe, H};
-        bool pinned[8]{};
+        bool pinned[32]{};
         int selected_slot[8];
         for (uint32_t k = 0; k < K; ++k) {
             selected_slot[k] = -1;
@@ -1380,6 +1449,7 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
                 if (cache[slot].expert == idxs[k]) {
                     selected_slot[k] = static_cast<int>(slot);
                     pinned[slot] = true;
+                    cache[slot].last_used = uint64_t(pos_) + 1;
                     ++layer_hits;
                     ++step_expert_cache_hits_;
                     step_expert_cache_bytes_saved_ += st_gate + st_up + st_down;
@@ -1387,7 +1457,6 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
                 }
         }
         expert_slot_cursor_ = 0;
-        uint32_t victim = 0;
         for (uint32_t k = 0; k < K; ++k) {
             if (selected_slot[k] >= 0) {
                 auto& slot = cache[selected_slot[k]];
@@ -1397,11 +1466,29 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
                 continue;
             }
             ++step_expert_cache_misses_;
-            while (victim < expert_cache_ways_ && pinned[victim]) ++victim;
+            uint32_t victim = expert_cache_ways_;
+            uint64_t oldest = UINT64_MAX;
+            for (uint32_t slot = 0; slot < expert_cache_ways_; ++slot) {
+                if (pinned[slot]) continue;
+                if (cache[slot].expert != UINT32_MAX &&
+                    (!cache[slot].ready[0].load(std::memory_order_acquire) ||
+                     !cache[slot].ready[1].load(std::memory_order_acquire) ||
+                     !cache[slot].ready[2].load(std::memory_order_acquire)))
+                    continue;
+                if (cache[slot].expert == UINT32_MAX) {
+                    victim = slot;
+                    break;
+                }
+                if (cache[slot].last_used < oldest) {
+                    oldest = cache[slot].last_used;
+                    victim = slot;
+                }
+            }
             if (victim < expert_cache_ways_) {
                 auto& slot = cache[victim];
                 pinned[victim] = true;
                 slot.expert = idxs[k];
+                slot.last_used = uint64_t(pos_) + 1;
                 const uint64_t offsets[3] = {
                     entries[0]->abs_offset + uint64_t(idxs[k]) * st_gate,
                     entries[1]->abs_offset + uint64_t(idxs[k]) * st_up,
@@ -1416,7 +1503,6 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
                     experts.push_back({slot.weight[j], entries[j], &slot.ready[j],
                                        Ks[j], Ns[j]});
                 }
-                ++victim;
             } else {
                 experts.push_back(load_weight_(n_gate, H, Fe, idxs[k], st_gate));
                 experts.push_back(load_weight_(n_up, H, Fe, idxs[k], st_up));
@@ -1444,8 +1530,19 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
     uint32_t ready_after_shared = 0;
     for (const auto& expert : experts)
         ready_after_shared += expert.ready->load(std::memory_order_acquire);
-    long long group_wait_us[2]{}, group_gpu_us[2]{};
-    constexpr uint32_t group_size = 4;
+    if (profile_predictor_) {
+        const uint32_t max_distance = std::min(predictor_depth_ - 1, L);
+        for (uint32_t distance = 0; distance <= max_distance; ++distance) {
+            const size_t slot = size_t(L) * predictor_depth_ + distance;
+            if (predictor_ready_us_[slot])
+                prof::log("predictor-deadline pos=%u layer=%u source_layer=%u "
+                          "lookahead_layers=%u expert_use_lead_us=%lld",
+                          pos_, L, L - distance, distance,
+                          prof::now_us() - predictor_ready_us_[slot]);
+        }
+    }
+    long long group_wait_us[8]{}, group_gpu_us[8]{};
+    const uint32_t group_size = expert_group_size_;
     for (uint32_t base = 0; base < K; base += group_size) {
         const uint32_t group = base / group_size;
         const uint32_t end = std::min(K, base + group_size);
@@ -1463,9 +1560,11 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
             const auto& down = experts[k * 3 + 2];
             if (gate.entry->type == GGML_IQ1_S &&
                 up.entry->type == GGML_IQ1_S) {
-                mtl_->dispatch("expert_gate_up_swiglu_iq1_s",
+                mtl_->dispatch(parallel_gate_up_
+                                   ? "expert_gate_up_swiglu_iq1_s_parallel"
+                                   : "expert_gate_up_swiglu_iq1_s",
                                {gate.buffer, up.buffer, x_norm_, ffn_act_, iq1s_grid_b_},
-                               {{&H,4}}, Fe, 32, true);
+                               {{&H,4}}, Fe, parallel_gate_up_ ? 64 : 32, true);
             } else {
                 dispatch_weight_(gate, x_norm_, ffn_gate_);
                 dispatch_weight_(up, x_norm_, ffn_up_);
@@ -1488,16 +1587,31 @@ void GgufRuntime::ffn_moe_(uint32_t L) {
             release_weight_(experts[k * 3 + 1]);
             release_weight_(experts[k * 3 + 2]);
         }
+        if (profile_ops_)
+            prof::log("moe-group pos=%u layer=%u group=%u ranks=%u-%u "
+                      "wait_us=%lld gpu_us=%lld",
+                      pos_, L, group, base, end - 1,
+                      group_wait_us[group], group_gpu_us[group]);
     }
-    if (profile_layers_)
-        prof::log("moe-pipeline pos=%u layer=%u ready_after_shared=%u/24 "
+    if (profile_layers_) {
+        long long total_wait = 0, total_gpu = 0, max_wait = 0;
+        const uint32_t groups_count = K / group_size;
+        for (uint32_t group = 0; group < groups_count; ++group) {
+            total_wait += group_wait_us[group];
+            total_gpu += group_gpu_us[group];
+            max_wait = std::max(max_wait, group_wait_us[group]);
+        }
+        prof::log("moe-pipeline pos=%u layer=%u experts=%u,%u,%u,%u,%u,%u,%u,%u "
+                  "ready_after_shared=%u/24 "
                   "cache_hits=%u cache_misses=%u "
-                  "route_gpu_us=%lld shared_gpu_us=%lld group_size=4 "
-                  "g0_wait_us=%lld g0_gpu_us=%lld g1_wait_us=%lld g1_gpu_us=%lld",
-                  pos_, L, ready_after_shared, layer_hits, K - layer_hits,
-                  route_gpu_us, shared_gpu_us,
-                  group_wait_us[0], group_gpu_us[0],
-                  group_wait_us[1], group_gpu_us[1]);
+                  "route_cmdbuf_gpu_us=%lld route_includes_attention=%u "
+                  "shared_gpu_us=%lld group_size=%u groups=%u "
+                  "group_wait_us=%lld group_max_wait_us=%lld group_gpu_us=%lld",
+                  pos_, L, idxs[0], idxs[1], idxs[2], idxs[3], idxs[4], idxs[5],
+                  idxs[6], idxs[7], ready_after_shared, layer_hits, K - layer_hits,
+                  route_gpu_us, !profile_ops_, shared_gpu_us, group_size, groups_count,
+                  total_wait, max_wait, total_gpu);
+    }
     if (trace_ && L == 3) trace_buffer_("ffn_total", L, ffn_out_, H);
 }
 
@@ -2088,7 +2202,6 @@ void GgufRuntime::forward_one_(uint32_t tok) {
     for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
         const long long layer_started = prof::now_us();
         const long long io_wait_before = step_io_wait_us_;
-        const long long gpu_before = mtl_->step_gpu_us;
         const int cmdbufs_before = mtl_->step_cmdbufs;
         const int dispatches_before = mtl_->step_dispatches;
         const auto io_before = profile_layers_ ? gm_->ring().stats() : PreadRing::Stats{};
@@ -2098,15 +2211,62 @@ void GgufRuntime::forward_one_(uint32_t tok) {
         const long long fixed_done = prof::now_us();
         const long long fixed_wait = step_io_wait_us_;
         const auto fixed_io = profile_layers_ ? gm_->ring().stats() : PreadRing::Stats{};
+        long long predictor_wall = 0, predictor_gpu = 0;
+        if (profile_predictor_) {
+            const uint32_t depth = predictor_depth_;
+            const uint32_t end = std::min(cfg_.n_layers, L + depth);
+            for (uint32_t target = std::max(L, cfg_.n_dense_layers);
+                 target < end; ++target) {
+                const uint32_t distance = target - L;
+                const long long predict_started = prof::now_us();
+                const long long predict_gpu_before = mtl_->step_gpu_us;
+                const auto& w = lw_[target];
+                const uint32_t H = cfg_.hidden, Ne = cfg_.n_experts;
+                const uint32_t K = cfg_.n_experts_active;
+                const uint32_t groups = cfg_.n_expert_groups;
+                const uint32_t top_groups = cfg_.n_limited_groups;
+                const uint32_t norm = cfg_.expert_weights_norm;
+                const float scale = cfg_.expert_weights_scale;
+                mtl_->begin();
+                rmsnorm_f32(*mtl_, x_, w.ffn_norm, x_norm_, H, cfg_.rms_eps);
+                dispatch_projection_(w.router, x_norm_, router_log_);
+                mtl_->dispatch("router_topk_grouped_sigmoid_f32",
+                               {router_log_, w.router_bias, router_idx_, router_wts_},
+                               {{&Ne,4},{&K,4},{&groups,4},{&top_groups,4},
+                                {&scale,4},{&norm,4}}, 1, 1, true);
+                mtl_->commit_and_wait();
+                const long long ready = prof::now_us();
+                const long long wall = ready - predict_started;
+                const long long gpu = mtl_->step_gpu_us - predict_gpu_before;
+                const size_t slot = size_t(target) * predictor_depth_ + distance;
+                std::memcpy(predicted_routes_[slot].data(), router_idx_.contents, K * 4);
+                predictor_ready_us_[slot] = ready;
+                predictor_wall_us_[slot] = wall;
+                predictor_gpu_us_[slot] = gpu;
+                predictor_wall += wall;
+                predictor_gpu += gpu;
+            }
+        }
+        const long long attention_started = prof::now_us();
+        const long long attention_gpu_before = mtl_->step_gpu_us;
         mla_attn_(L);
+        // The production schedule deliberately fuses attention and router in
+        // one command buffer. Operation profiling inserts a diagnostic-only
+        // boundary so their GPU timestamps are attributable rather than
+        // falsely charging attention to the router commit.
+        if (profile_ops_) {
+            mtl_->commit_and_wait();
+            mtl_->begin();
+        }
         const long long attention_done = prof::now_us();
-        const long long attention_gpu = mtl_->step_gpu_us;
+        const long long attention_gpu_after = mtl_->step_gpu_us;
         if (L < cfg_.n_dense_layers) ffn_dense_(L); else ffn_moe_(L);
         if (profile_layers_) {
             const auto final_io = gm_->ring().stats();
             prof::log(
                 "layer-metrics pos=%u layer=%u wall_us=%lld fixed_wall_us=%lld "
                 "fixed_io_wait_us=%lld fixed_bytes=%llu fixed_reads=%llu "
+                "predictor_wall_us=%lld predictor_gpu_us=%lld "
                 "attention_wall_us=%lld attention_gpu_us=%lld ffn_wall_us=%lld "
                 "ffn_gpu_us=%lld expert_io_wait_us=%lld expert_bytes=%llu "
                 "expert_reads=%llu cmdbufs=%d dispatches=%d",
@@ -2114,9 +2274,11 @@ void GgufRuntime::forward_one_(uint32_t tok) {
                 fixed_done - layer_started, fixed_wait - io_wait_before,
                 static_cast<unsigned long long>(fixed_io.bytes - io_before.bytes),
                 static_cast<unsigned long long>(fixed_io.requests - io_before.requests),
-                attention_done - fixed_done, attention_gpu - gpu_before,
+                predictor_wall, predictor_gpu,
+                attention_done - attention_started,
+                attention_gpu_after - attention_gpu_before,
                 prof::now_us() - attention_done,
-                mtl_->step_gpu_us - attention_gpu,
+                mtl_->step_gpu_us - attention_gpu_after,
                 step_io_wait_us_ - fixed_wait,
                 static_cast<unsigned long long>(final_io.bytes - fixed_io.bytes),
                 static_cast<unsigned long long>(final_io.requests - fixed_io.requests),
@@ -2189,8 +2351,12 @@ uint32_t GgufRuntime::sample_logits_() {
         float best_value = -INFINITY;
         float second_value = -INFINITY;
         uint32_t nonfinite = 0;
+        uint64_t hash = 1469598103934665603ULL;
         for (uint32_t i = 0; i < cfg_.vocab; ++i) {
             const float value = raw[i];
+            uint32_t bits;
+            std::memcpy(&bits, raw + i, sizeof(bits));
+            hash = (hash ^ bits) * 1099511628211ULL;
             if (!std::isfinite(value)) { ++nonfinite; continue; }
             if (value > best_value) {
                 second_value = best_value;
@@ -2202,8 +2368,9 @@ uint32_t GgufRuntime::sample_logits_() {
         }
         if (nonfinite) die("nonfinite output logits");
         prof::log("sample pos=%u mode=greedy token=%u logit=%.6g "
-                  "runner_up=%.6g margin=%.6g nonfinite=0",
-                  pos_, best, best_value, second_value, best_value - second_value);
+                  "runner_up=%.6g margin=%.6g nonfinite=0 logits_hash=%016llx",
+                  pos_, best, best_value, second_value, best_value - second_value,
+                  static_cast<unsigned long long>(hash));
         if (trace_) {
             std::array<std::pair<float, uint32_t>, 8> top{};
             for (auto& item : top) item = {-INFINITY, 0};
@@ -2226,8 +2393,13 @@ uint32_t GgufRuntime::sample_logits_() {
     std::vector<Candidate> candidates;
     candidates.reserve(cfg_.vocab);
     float max_logit = -INFINITY;
-    for (uint32_t i = 0; i < cfg_.vocab; ++i)
+    uint64_t hash = 1469598103934665603ULL;
+    for (uint32_t i = 0; i < cfg_.vocab; ++i) {
         max_logit = std::max(max_logit, raw[i]);
+        uint32_t bits;
+        std::memcpy(&bits, raw + i, sizeof(bits));
+        hash = (hash ^ bits) * 1099511628211ULL;
+    }
     double sum = 0.0;
     for (uint32_t i = 0; i < cfg_.vocab; ++i) {
         const float p = std::exp((raw[i] - max_logit) / temperature_);
@@ -2251,8 +2423,9 @@ uint32_t GgufRuntime::sample_logits_() {
         cumulative += candidates[i].probability;
         if (target <= cumulative) { chosen = candidates[i].token; break; }
     }
-    prof::log("sample pos=%u temp=%.3f top_p=%.3f nucleus=%zu token=%u",
-              pos_, temperature_, top_p_, count, chosen);
+    prof::log("sample pos=%u temp=%.3f top_p=%.3f nucleus=%zu token=%u "
+              "logits_hash=%016llx", pos_, temperature_, top_p_, count, chosen,
+              static_cast<unsigned long long>(hash));
     if (trace_) {
         const size_t show = std::min<size_t>(8, candidates.size());
         for (size_t i = 0; i < show; ++i)

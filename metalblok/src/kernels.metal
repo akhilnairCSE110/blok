@@ -2195,6 +2195,32 @@ kernel void expert_gate_up_swiglu_iq1_s(
     }
 }
 
+// Gate and up are independent until SwiGLU. Two SIMD groups execute the same
+// 32-lane dot/reduction trees as the serial kernel concurrently; only their
+// final scalars cross a threadgroup barrier. This changes scheduling, not the
+// FP32 operation order within either projection.
+kernel void expert_gate_up_swiglu_iq1_s_parallel(
+    device const uchar* Wg [[buffer(0)]],
+    device const uchar* Wu [[buffer(1)]],
+    device const float* x [[buffer(2)]],
+    device float* y [[buffer(3)]],
+    device const ulong* grid [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    const uint lane = tid & 31u;
+    const uint projection = tid >> 5;
+    const uint nblk = K / 256;
+    const size_t stride = (size_t)nblk * 50;
+    device const uchar* weights = projection ? Wu : Wg;
+    float value = iq1s_partial(weights + row * stride, x, grid, nblk, lane, 32);
+    value = simd_sum(value);
+    threadgroup float dot[2];
+    if (lane == 0) dot[projection] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) y[row] = (dot[0] / (1.0f + exp(-dot[0]))) * dot[1];
+}
+
 // DeepSeek-R1 routed down projection plus weighted expert accumulation.
 kernel void expert_down_accum_iq1_s(
     device const uchar* W [[buffer(0)]],

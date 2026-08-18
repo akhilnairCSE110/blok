@@ -183,9 +183,13 @@ private:
     bool         trace_ = false;
     bool         profile_layers_ = false;
     bool         profile_ops_ = false;
+    bool         profile_predictor_ = false;
     bool         tensorops_ = false;
     bool         compact_mla_ = false;
     bool         validate_mla_ = false;
+    bool         parallel_gate_up_ = false;
+    uint32_t     expert_group_size_ = 4;
+    uint32_t     predictor_depth_ = 1;
 
     // Per-layer resident FP32 weights plus projection descriptors.
     struct LayerResident {
@@ -214,12 +218,17 @@ private:
     size_t expert_slot_bytes_ = 0;
     struct ExpertCacheSlot {
         uint32_t expert = UINT32_MAX;
+        uint64_t last_used = 0;
         MtlBuf weight[3]{};
         std::atomic<bool> ready[3]{};
     };
     MtlBuf expert_cache_storage_;
     std::unique_ptr<ExpertCacheSlot[]> expert_cache_;
     uint32_t expert_cache_ways_ = 0;
+    std::vector<std::array<uint32_t, 8>> predicted_routes_;
+    std::vector<long long> predictor_ready_us_;
+    std::vector<long long> predictor_wall_us_;
+    std::vector<long long> predictor_gpu_us_;
 
     // Global resident output norm (f32).
     MtlBuf output_norm_b_;

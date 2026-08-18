@@ -34,6 +34,8 @@ For persistent chat and interruption recovery, read the
 
 ## Architecture and evidence
 
+- [Documentation map](../docs/README.md): reading order, scope, authority, and
+  status of every Markdown record in the repository.
 - [Complete V0 architecture](docs/V0_ARCHITECTURE.md): deep mathematical,
   memory, NVMe, Metal, concurrency, KV, and performance rationale.
 - [Million-token scale plan](docs/MILLION_TOKEN_SCALE_PLAN.md): the paged
@@ -46,6 +48,9 @@ For persistent chat and interruption recovery, read the
 - [Strict M5 performance closeout](docs/PERFORMANCE_CLOSEOUT_2026-08-14.md):
   accepted exact speedups, operation/I/O profiles, rejected kernels, and the
   measured remaining wall-time floor.
+- [Verified lookahead and synthesis](docs/VERIFIED_LOOKAHEAD_FIFO.md): exact
+  cache/prefetch invariants, bandwidth bounds, chip-style scheduling, and the
+  automated parity-gated tuner.
 - [Tensor/hardware specification](docs/TENSOR_HARDWARE_SPEC.md): normative
   shapes, exact expanded-KV contract, buffer ownership, and kernels.
 - [Evidence ledger](docs/EVIDENCE_AND_REPRODUCIBILITY.md): commands, saved
@@ -64,3 +69,15 @@ ctest --test-dir metalblok/build --output-on-failure
 The standard build runtime-compiles `kernels.metal`; an offline `.metallib` is
 optional. `--preflight` reads allocation metadata rather than model payload and
 must report `all_resident=true` before inference.
+
+## Execution modes
+
+| Mode | State bytes/position | Status | Intended use |
+|---|---:|---|---|
+| default expanded K/V | 4,005,504 | accepted V0 oracle; completed 1K+1K | strict reproduction and comparison |
+| `--mla` compact latent/RoPE | 70,272 | implemented opt-in; short probes, not expanded-bitwise parity | long-context capacity and performance research |
+| `--tensorops` | same as selected mode | quarantined: faster prefill, routing/logit drift | diagnostic A/B only |
+| `--profile-predictor` | same as `--mla` | diagnostic only; issues no model reads | route/cache research |
+
+The model-native router is authoritative in every mode. Prediction is now
+trace-only; no speculative-transfer CLI is present.

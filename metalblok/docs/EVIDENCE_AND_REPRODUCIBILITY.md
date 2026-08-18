@@ -1,6 +1,6 @@
 # MetalBlok evidence and reproducibility ledger
 
-**Artifact date:** 2026-08-12
+**Artifact date:** 2026-08-17
 
 **Scope:** native Apple-Metal DeepSeek-R1 671B V0
 
@@ -162,6 +162,27 @@ plumbing were removed.
 This result demonstrates the release rule: operation fusion is useful only
 when the finite-precision boundary remains compatible. Associativity over real
 numbers cannot override measured FP32 divergence.
+
+### 2026-08-17 predictor and compact-repeatability gate
+
+The rank-one model-native route predictor was tested from the same compact
+checkpoint as a no-prefetch reference. It improved raw decode rate from 1.429
+to 1.461 step/s and reduced mean I/O wait from 292.7 to 240.2 ms/token, but
+the full-logit hashes diverged after 25 matched steps and the final checkpoint
+SHA-256 differed. The active read path and CLI were removed. Retained evidence:
+
+- reference: `run-20260817-220420-3862.log`;
+- rejected candidate: `run-20260817-221931-4952.log`;
+- analysis: `scripts/analyze_expert_routes.py` and
+  `scripts/synthesize_decode_config.py`.
+
+Two cache-off serialized trace runs matched 1,891 layer hashes, 30 logit
+hashes, and checkpoint SHA-256 `c597c204...`. Cache-on traces localized
+intermittent compact divergence to attention once context exceeded 32: one
+pair had identical layer-37 state at position 34, then different pre-FFN state
+at layer 38. Resource barriers and a compute-pass boundary did not fix it and
+were removed. Compact mode therefore remains opt-in; no predictor result is
+promoted over the accepted expanded V0.
 
 ## 8. Byte and request evidence
 

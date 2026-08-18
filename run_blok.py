@@ -97,10 +97,20 @@ def arguments() -> argparse.Namespace:
                         help="log per-layer GPU and NVMe attribution")
     parser.add_argument("--profile-ops", action="store_true",
                         help="split profiled stages and log per-operation GPU timing")
+    parser.add_argument("--profile-predictor", action="store_true",
+                        help="measure pre-attention route prediction; diagnostic only")
+    parser.add_argument("--predictor-depth", type=int, choices=range(1, 9), default=4,
+                        help="profile current through N-1 future layer routes (default 4)")
     parser.add_argument("--mla", action="store_true",
                         help="use explicit compact MLA mode for long context")
     parser.add_argument("--tensorops", action="store_true",
                         help="experimental faster prefill with reassociated TensorOps reductions")
+    parser.add_argument("--parallel-gate-up", action="store_true",
+                        help="run independent routed gate/up dots on two SIMD groups")
+    parser.add_argument("--expert-cache-ways", type=int, choices=range(33),
+                        help="per-layer exact expert-history entries (0-32; default 4)")
+    parser.add_argument("--expert-group-size", type=int, choices=(1, 2, 4, 8), default=4,
+                        help="routed-expert I/O/command scheduling group (default 4)")
     parser.add_argument("--io-lanes", type=int, choices=(2, 4, 8), default=8,
                         help="independent F_NOCACHE readers per model shard")
     parser.add_argument("--validate-mla", action="store_true",
@@ -172,8 +182,17 @@ def run(args: argparse.Namespace) -> int:
     if args.profile_ops:
         env["METALBLOK_PROFILE_LAYERS"] = "1"
         env["METALBLOK_PROFILE_OPS"] = "1"
+    if args.profile_predictor:
+        env["METALBLOK_PROFILE_LAYERS"] = "1"
+        env["METALBLOK_PROFILE_PREDICTOR"] = "1"
+        env["METALBLOK_PREDICTOR_DEPTH"] = str(args.predictor_depth)
     if args.tensorops:
         env["METALBLOK_TENSOROPS"] = "1"
+    if args.parallel_gate_up:
+        env["METALBLOK_PARALLEL_GATE_UP"] = "1"
+    if args.expert_cache_ways is not None:
+        env["METALBLOK_EXPERT_CACHE_WAYS"] = str(args.expert_cache_ways)
+    env["METALBLOK_EXPERT_GROUP_SIZE"] = str(args.expert_group_size)
     env["METALBLOK_IO_LANES"] = str(args.io_lanes)
     if args.validate_mla:
         if not args.mla:
